@@ -1,7 +1,8 @@
 import { startTransition, useEffect, useState } from 'react'
 import { getAudit, type AuditResponse } from '../../lib/api'
 import { DashboardShell } from '../../components/dashboard-shell'
-import { EmptyState, Panel, ToneBadge, formatPercent, formatTimestamp } from '../../components/ui'
+import { EmptyState, Panel, ToneBadge } from '../../components/ui'
+import { formatPercent, formatTimestamp } from '../../lib/format'
 
 export function AuditPage({ initialData }: { initialData?: AuditResponse }) {
   const [data, setData] = useState<AuditResponse | null>(initialData ?? null)

@@ -1,5 +1,6 @@
-import { useEffect, useState, type ReactNode } from 'react'
-import { ToneBadge, cx } from './ui'
+import { useState, type ReactNode } from 'react'
+import { ToneBadge } from './ui'
+import { cx } from '../lib/utils'
 
 type ShellProps = {
   active: 'overview' | 'accounts' | 'audit'
@@ -17,16 +18,14 @@ const navItems = [
 ] as const
 
 export function DashboardShell({ active, eyebrow, title, description, status, children }: ShellProps) {
-  const [suffix, setSuffix] = useState('')
-
-  useEffect(() => {
+  const [suffix] = useState(() => {
     if (typeof window === 'undefined') {
-      return
+      return ''
     }
     const params = new URLSearchParams(window.location.search)
     const token = params.get('token')
-    setSuffix(token ? `?token=${encodeURIComponent(token)}` : '')
-  }, [])
+    return token ? `?token=${encodeURIComponent(token)}` : ''
+  })
 
   return (
     <main className="min-h-screen px-4 py-5 sm:px-6 lg:px-8">

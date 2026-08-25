@@ -1,7 +1,8 @@
 import { startTransition, useEffect, useState } from 'react'
 import { getAccountDetail, type AccountDetail, type DecisionEvent } from '../../lib/api'
 import { DashboardShell } from '../../components/dashboard-shell'
-import { EmptyState, JsonPreview, Panel, ToneBadge, formatMoney, formatNumber, formatTimestamp } from '../../components/ui'
+import { EmptyState, JsonPreview, Panel, ToneBadge } from '../../components/ui'
+import { formatMoney, formatNumber, formatTimestamp } from '../../lib/format'
 
 export function AccountDetailPage({
   accountId,

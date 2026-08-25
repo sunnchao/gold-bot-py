@@ -7,7 +7,8 @@ import {
   type OverviewResponse
 } from '../../lib/api'
 import { DashboardShell } from '../../components/dashboard-shell'
-import { EmptyState, Panel, ToneBadge, formatMoney, formatTimestamp } from '../../components/ui'
+import { EmptyState, Panel, ToneBadge } from '../../components/ui'
+import { formatMoney, formatTimestamp } from '../../lib/format'
 
 export function OverviewPage({ initialData }: { initialData?: OverviewResponse }) {
   const [data, setData] = useState<OverviewResponse | null>(initialData ?? null)
@@ -21,7 +22,6 @@ export function OverviewPage({ initialData }: { initialData?: OverviewResponse }
     }
 
     let cancelled = false
-    setLoading(true)
     void getOverview()
       .then((next) => {
         if (cancelled) {

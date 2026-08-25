@@ -1,4 +1,5 @@
 import type { ReactNode } from 'react'
+import { cx } from '../lib/utils'
 
 type PanelProps = {
   title: string
@@ -14,10 +15,6 @@ const toneClasses: Record<string, string> = {
   orange: 'bg-orange-400/12 text-orange-100 ring-1 ring-orange-300/25',
   red: 'bg-rose-400/12 text-rose-100 ring-1 ring-rose-300/25',
   neutral: 'bg-stone-200/10 text-stone-100 ring-1 ring-white/10'
-}
-
-export function cx(...values: Array<string | false | null | undefined>) {
-  return values.filter(Boolean).join(' ')
 }
 
 export function Panel({ title, subtitle, className, children }: PanelProps) {
@@ -54,38 +51,6 @@ export function EmptyState({ title, detail }: { title: string; detail: string })
       <p className="mt-2 text-sm text-stone-500">{detail}</p>
     </div>
   )
-}
-
-export function formatMoney(value: number, currency = 'USD') {
-  return new Intl.NumberFormat('zh-CN', {
-    style: 'currency',
-    currency,
-    maximumFractionDigits: 2
-  }).format(value)
-}
-
-export function formatNumber(value: number) {
-  return new Intl.NumberFormat('zh-CN', {
-    maximumFractionDigits: 2
-  }).format(value)
-}
-
-export function formatPercent(value: number) {
-  return `${(value * 100).toFixed(2)}%`
-}
-
-export function formatTimestamp(value: string) {
-  if (!value) {
-    return '无'
-  }
-  const parsed = new Date(value)
-  if (Number.isNaN(parsed.getTime())) {
-    return value
-  }
-  return new Intl.DateTimeFormat('zh-CN', {
-    dateStyle: 'medium',
-    timeStyle: 'short'
-  }).format(parsed)
 }
 
 export function JsonPreview({ value }: { value: unknown }) {

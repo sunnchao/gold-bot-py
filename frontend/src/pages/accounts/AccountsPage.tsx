@@ -1,7 +1,8 @@
 import { startTransition, useEffect, useState } from 'react'
 import { getAccounts, type OverviewAccount } from '../../lib/api'
 import { DashboardShell } from '../../components/dashboard-shell'
-import { EmptyState, Panel, ToneBadge, formatMoney } from '../../components/ui'
+import { EmptyState, Panel, ToneBadge } from '../../components/ui'
+import { formatMoney } from '../../lib/format'
 
 export function AccountsPage() {
   const [accounts, setAccounts] = useState<OverviewAccount[]>([])
