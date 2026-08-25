@@ -182,6 +182,8 @@ def _as_blocks(items: Any, block_type: Any) -> list[Any]:
             result.append(item)
         elif isinstance(item, dict):
             result.append(block_type(text=item["text"], cacheable=bool(item.get("cacheable", True))))
+        elif hasattr(item, "text"):
+            result.append(block_type(text=str(item.text), cacheable=bool(getattr(item, "cacheable", True))))
     return result
 
 

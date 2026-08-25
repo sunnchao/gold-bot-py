@@ -432,6 +432,9 @@ class SchedulerService:
     async def _queue_ai_stop_loss_adjust(self, account_id: str, symbol: str) -> None:
         # 对 EA 上报持仓的全部品种生效(不再有 GB_AI_TRAIL_SYMBOLS 白名单):
         # 分析按 EA 端 /positions、/tick、/bars 载荷里的 symbol 字段执行。
+        positions = await self._get_positions(account_id, symbol)
+        if len(positions) == 0:
+            return
         ai_result = await self._latest_ai_result(account_id, symbol)
         if ai_result is None:
             self._log_ai_stop_loss_skip(account_id, symbol, "ai_result_missing")
@@ -460,7 +463,7 @@ class SchedulerService:
         decision_id = _ai_decision_id(ai_result)
         position_states = await self._load_position_states(account_id, symbol)
         states_by_ticket = {state.get("ticket"): state for state in position_states}
-        for position in await self._get_positions(account_id, symbol):
+        for position in positions:
             ticket = _number_field(position, "ticket")
             state = states_by_ticket.get(ticket)
             be_moved = state is not None and state.get("be_moved") is True

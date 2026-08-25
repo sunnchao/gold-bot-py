@@ -132,6 +132,29 @@ def test_detects_cache_strategy_from_model_name():
     assert claude_via_gateway.get_cache_strategy().get("type") == "auto_prefix"
 
 
+async def test_accepts_layer_objects_from_support_module_when_building_layered_messages():
+    """Runtime agents pass _support.SystemBlock/UserLayer objects, not llm_client-local classes."""
+    from backend.agents.agents._support import SystemBlock as SupportSystemBlock
+    from backend.agents.agents._support import UserLayer as SupportUserLayer
+
+    bodies: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        bodies.append(json.loads(request.content))
+        return json_response({"choices": [{"message": {"content": "ok"}}]})
+
+    client = LLMClient(default_config(), transport=httpx.MockTransport(handler))
+    await client.invoke_layered(
+        [SupportSystemBlock("system prompt", cacheable=True)],
+        [SupportUserLayer("live prompt", cacheable=False)],
+    )
+
+    assert bodies[0]["messages"] == [
+        {"role": "system", "content": "system prompt"},
+        {"role": "user", "content": "live prompt"},
+    ]
+
+
 async def test_builds_openai_layered_messages_and_reads_streaming_cache_usage():
     # TS: 'builds OpenAI layered messages and reads streaming cache usage'
     bodies: list[dict] = []

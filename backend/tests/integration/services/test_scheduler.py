@@ -800,6 +800,27 @@ async def test_queues_gbpjpy_ai_stop_loss_lock_profit_commands_with_atr_derived_
     assert abs(commands[0]["atr"] - 0.5) < 5e-11
 
 
+async def test_does_not_log_ai_stop_loss_skip_when_symbol_has_no_positions(capsys) -> None:
+    store = create_in_memory_store()
+    await store.set_runtime_mode(ACCOUNT, "cutover")
+    await save_tradeable_heartbeat(store)
+    await store.save_positions({"account_id": ACCOUNT, "symbol": "XAGUSD", "positions": []})
+    await store.save_ai_result(ACCOUNT, "XAGUSD", {"suggested_sl": 0, "trade_plan": {"decision_id": "observe"}})
+    scheduler = SchedulerService(
+        FakeAnalysis(lambda: {"replay": {"signal": None, "position_commands": None}}),
+        CommandLifecycleService(store),
+        None,
+        store,
+        lambda: "2026-04-13T08:02:00.000Z",
+    )
+
+    await scheduler.enqueue_position_review(ACCOUNT, "XAGUSD")
+
+    captured = capsys.readouterr()
+    assert "[AI] stop_loss_skip" not in captured.out
+    assert await store.list_commands(ACCOUNT) == []
+
+
 async def test_queues_ai_stop_loss_commands_for_any_symbol_reported_by_the_ea() -> None:
     """白名单已移除:AI 止损跟踪对 EA 上报品种(XAUUSD 等非金丝雀品种)一律生效。"""
     store = create_in_memory_store()
