@@ -1,0 +1,34 @@
+{
+  "fixture": "ea-order-result",
+  "oracle": {
+    "source": "internal/legacy/handlers_order_result.go",
+    "head": "912701d"
+  },
+  "request": {
+    "method": "POST",
+    "path": "/order_result",
+    "headers": {
+      "Content-Type": "application/json",
+      "X-API-Token": "fixture-user-token"
+    },
+    "body": {
+      "account_id": "90011087",
+      "command_id": "sig_2",
+      "result": "OK",
+      "ticket": 321,
+      "error": ""
+    }
+  },
+  "response": {
+    "status_code": 200,
+    "headers": {
+      "Content-Type": "application/json"
+    },
+    "body": {
+      "status": "OK"
+    }
+  },
+  "normalization": {
+    "side_effect": "Go persists command_results and updates delivered commands to acked/failed; unknown command IDs still return OK unless ApplyResult returns a non-sql.ErrNoRows error."
+  }
+}

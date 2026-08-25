@@ -1,0 +1,76 @@
+{
+  "fixture": "admin-audit",
+  "oracle": {
+    "source": "internal/api/handlers_cutover.go#audit",
+    "head": "912701d"
+  },
+  "request": {
+    "method": "GET",
+    "path": "/api/v1/audit",
+    "headers": {
+      "X-API-Token": "fixture-admin-token"
+    }
+  },
+  "response": {
+    "status_code": 200,
+    "headers": {
+      "Content-Type": "application/json"
+    },
+    "body": {
+      "events": [],
+      "generated_at": "2026-04-13T08:00:00Z",
+      "report": {
+        "checks": [
+          {
+            "detail": "Replay fixture has not been approved yet",
+            "label": "Replay Parity",
+            "tone": "orange",
+            "value": "pending"
+          },
+          {
+            "detail": "Waiting for mirrored production traffic",
+            "label": "Shadow Drift",
+            "tone": "orange",
+            "value": "pending"
+          },
+          {
+            "detail": "Live shadow traffic has not started yet",
+            "label": "Protocol Errors",
+            "tone": "amber",
+            "value": "0.00%"
+          }
+        ],
+        "command_drift_rate": 0,
+        "last_shadow_event_at": "0001-01-01T00:00:00Z",
+        "missing_capabilities": ["shadow_traffic"],
+        "protocol_error_rate": 0,
+        "ready": false,
+        "signal_drift_rate": 0
+      },
+      "status": "OK",
+      "summary": [
+        {
+          "detail": "Replay fixture has not been approved yet",
+          "label": "Replay Parity",
+          "tone": "orange",
+          "value": "pending"
+        },
+        {
+          "detail": "Waiting for mirrored production traffic",
+          "label": "Shadow Drift",
+          "tone": "orange",
+          "value": "pending"
+        },
+        {
+          "detail": "Live shadow traffic has not started yet",
+          "label": "Protocol Errors",
+          "tone": "amber",
+          "value": "0.00%"
+        }
+      ]
+    }
+  },
+  "normalization": {
+    "generated_at": "fixed representative handler timestamp"
+  }
+}

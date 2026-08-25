@@ -1,0 +1,35 @@
+{
+  "fixture": "ea-tick",
+  "oracle": {
+    "source": "internal/legacy/handlers_tick.go",
+    "head": "912701d"
+  },
+  "request": {
+    "method": "POST",
+    "path": "/tick",
+    "headers": {
+      "Content-Type": "application/json",
+      "X-API-Token": "fixture-user-token"
+    },
+    "body": {
+      "account_id": "90011087",
+      "symbol": "XAUUSD",
+      "bid": 3335.55,
+      "ask": 3335.75,
+      "spread": 0.2,
+      "time": "08:00:00"
+    }
+  },
+  "response": {
+    "status_code": 200,
+    "headers": {
+      "Content-Type": "application/json"
+    },
+    "body": {
+      "status": "OK"
+    }
+  },
+  "normalization": {
+    "floats": "prices rounded to 5 decimals max"
+  }
+}

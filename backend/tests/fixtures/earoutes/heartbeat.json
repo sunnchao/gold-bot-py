@@ -1,0 +1,40 @@
+{
+  "fixture": "ea-heartbeat",
+  "oracle": {
+    "source": "internal/legacy/handlers_heartbeat.go",
+    "head": "912701d"
+  },
+  "request": {
+    "method": "POST",
+    "path": "/heartbeat",
+    "headers": {
+      "Content-Type": "application/json",
+      "X-API-Token": "fixture-user-token"
+    },
+    "body": {
+      "account_id": "90011087",
+      "balance": 1000.5,
+      "equity": 1100.25,
+      "margin": 100,
+      "free_margin": 1000.25,
+      "server_time": "2026.04.13 08:00",
+      "market_open": true,
+      "is_trade_allowed": true,
+      "max_daily_loss": 5.0,
+      "ai_symbols": ["XAUUSD", "GBPJPY"]
+    }
+  },
+  "response": {
+    "status_code": 200,
+    "headers": {
+      "Content-Type": "application/json"
+    },
+    "body": {
+      "server_time": 1772342400,
+      "status": "OK"
+    }
+  },
+  "normalization": {
+    "response.body.server_time": "Go handler returns now().UTC().Unix(); fixture value is fixed for schema and parity tests"
+  }
+}

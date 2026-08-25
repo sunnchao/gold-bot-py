@@ -1,0 +1,39 @@
+{
+  "fixture": "admin-pending-signal",
+  "oracle": {
+    "source": "internal/api/handlers_arbitration.go#getPendingSignals",
+    "head": "912701d"
+  },
+  "request": {
+    "method": "GET",
+    "path": "/api/pending_signal/90011087/XAUUSD",
+    "headers": {
+      "X-API-Token": "fixture-user-token"
+    }
+  },
+  "response": {
+    "status_code": 200,
+    "headers": {
+      "Content-Type": "application/json"
+    },
+    "body": [
+      {
+        "account_id": "90011087",
+        "arbitration_reason": "",
+        "arbitration_result": "",
+        "created_at": "2026-04-13T08:00:00Z",
+        "expires_at": "2026-04-13T08:00:30Z",
+        "id": 1,
+        "indicators": "{\"adx\":31,\"rsi\":58}",
+        "score": 9,
+        "side": "buy",
+        "status": "pending",
+        "strategy": "pullback",
+        "symbol": "XAUUSD"
+      }
+    ]
+  },
+  "normalization": {
+    "id": "stable fixture placeholder"
+  }
+}

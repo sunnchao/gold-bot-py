@@ -1,0 +1,75 @@
+{
+  "fixture": "ea-poll",
+  "oracle": {
+    "source": "internal/legacy/handlers_poll.go",
+    "head": "912701d"
+  },
+  "cases": [
+    {
+      "name": "empty",
+      "request": {
+        "method": "POST",
+        "path": "/poll",
+        "headers": {
+          "Content-Type": "application/json",
+          "X-API-Token": "fixture-user-token"
+        },
+        "body": {
+          "account_id": "90011087"
+        }
+      },
+      "response": {
+        "status_code": 200,
+        "headers": {
+          "Content-Type": "application/json"
+        },
+        "body": {
+          "commands": [],
+          "count": 0,
+          "status": "OK"
+        }
+      }
+    },
+    {
+      "name": "queued-signal",
+      "request": {
+        "method": "POST",
+        "path": "/poll",
+        "headers": {
+          "Content-Type": "application/json",
+          "X-API-Token": "fixture-user-token"
+        },
+        "body": {
+          "account_id": "90011087"
+        }
+      },
+      "response": {
+        "status_code": 200,
+        "headers": {
+          "Content-Type": "application/json"
+        },
+        "body": {
+          "commands": [
+            {
+              "action": "SIGNAL",
+              "command_id": "sig_1",
+              "entry": 3345.5,
+              "score": 7,
+              "sl": 3338,
+              "strategy": "pullback",
+              "symbol": "XAUUSD",
+              "tp1": 3358,
+              "type": "BUY"
+            }
+          ],
+          "count": 1,
+          "status": "OK"
+        }
+      }
+    }
+  ],
+  "normalization": {
+    "delivery_side_effect": "Go marks pending commands delivered during successful /poll.",
+    "command_ids": "stable fixture placeholders"
+  }
+}

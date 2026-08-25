@@ -1,0 +1,120 @@
+{
+  "fixture": "admin-analysis-payload",
+  "oracle": {
+    "source": "internal/api/handlers_ai.go#aurex.BuildAnalysisPayload",
+    "head": "912701d"
+  },
+  "request": {
+    "method": "GET",
+    "path": "/api/analysis_payload/90011087",
+    "headers": {
+      "X-API-Token": "fixture-admin-token"
+    }
+  },
+  "response": {
+    "status_code": 200,
+    "headers": {
+      "Content-Type": "application/json"
+    },
+    "body": {
+      "account": {
+        "account_id": "90011087",
+        "balance": 1000.5,
+        "broker": "Demo Broker",
+        "connected": true,
+        "currency": "USD",
+        "equity": 1100.25,
+        "free_margin": 1000.25,
+        "leverage": 500,
+        "margin": 100,
+        "server_name": "Demo-1"
+      },
+      "bars": {
+        "H1": [
+          {
+            "time": "2026.04.13 07:00",
+            "open": 3331.25,
+            "high": 3337.1,
+            "low": 3330.9,
+            "close": 3335.75,
+            "volume": 120
+          }
+        ]
+      },
+      "harmonic_context": null,
+      "indicators": {
+        "H1": {
+          "adx": 71.5,
+          "atr": 2.67193,
+          "bars_count": 65,
+          "close": 3335.75,
+          "ema20": 3335.01,
+          "ema50": 3328.42,
+          "ema200": 0,
+          "fib_236": 3330.8,
+          "fib_382": 3327.5,
+          "fib_500": 3324.8,
+          "fib_618": 3322.1,
+          "fib_786": 3318.3,
+          "macd": 1.42,
+          "macd_hist": -0.82,
+          "macd_signal": 2.24,
+          "rsi": 64.7
+        }
+      },
+      "market": {
+        "ask": 3335.75,
+        "bid": 3335.55,
+        "spread": 0.2,
+        "symbol": "XAUUSD",
+        "time": "08:00:00"
+      },
+      "market_filters": {
+        "reason_codes": [],
+        "tradeable": true
+      },
+      "market_status": {
+        "is_trade_allowed": true,
+        "market_open": true,
+        "mt4_server_time": "2026.04.13 08:00",
+        "tradeable": true
+      },
+      "positions": [
+        {
+          "comment": "GB_pullback_S7",
+          "current_price": 3335.75,
+          "direction": "BUY",
+          "entry_price": 3330,
+          "hold_hours": 17546.44,
+          "hold_seconds": 63167200,
+          "lots": 0.1,
+          "magic": 20250231,
+          "pnl_percent": 17.2673,
+          "profit": 57.5,
+          "sl": 3320,
+          "strategy": "pullback",
+          "ticket": 123456,
+          "tp": 3355
+        }
+      ],
+      "status": "OK",
+      "strategy_mapping": {
+        "20250231": "pullback",
+        "20250232": "breakout_retest"
+      },
+      "timestamp": "2026-04-13T16:00:00+08:00",
+      "trend_context": {
+        "consensus_direction": "BULL",
+        "consensus_strength": 0.75,
+        "d1_direction": "NEUTRAL",
+        "h1_direction": "BULL",
+        "h4_direction": "BULL",
+        "m30_direction": "BULL"
+      }
+    }
+  },
+  "normalization": {
+    "arrays": "full Go replay fixture has 65 H1 bars; this contract sample is reduced for schema coverage.",
+    "timestamp": "fixed representative handler timestamp"
+  }
+}

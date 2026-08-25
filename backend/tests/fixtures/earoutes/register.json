@@ -1,0 +1,50 @@
+{
+  "fixture": "ea-register",
+  "oracle": {
+    "source": "internal/legacy/handlers_register.go",
+    "head": "912701d"
+  },
+  "request": {
+    "method": "POST",
+    "path": "/register",
+    "headers": {
+      "Content-Type": "application/json",
+      "X-API-Token": "fixture-user-token"
+    },
+    "body": {
+      "account_id": "90011087",
+      "broker": "Demo Broker",
+      "server_name": "Demo-1",
+      "account_name": "Primary",
+      "account_type": "demo",
+      "currency": "USD",
+      "leverage": 500,
+      "max_daily_loss": 5.0,
+      "strategy_mapping": {
+        "20250231": "pullback",
+        "20250232": "breakout_retest",
+        "20250233": "divergence",
+        "20250234": "breakout_pyramid",
+        "20250235": "counter_pullback",
+        "20250236": "range",
+        "20250237": "momentum_scalp",
+        "20250238": "ai_signal"
+      },
+      "ai_symbols": ["XAUUSD", "GBPJPY"]
+    }
+  },
+  "response": {
+    "status_code": 200,
+    "headers": {
+      "Content-Type": "application/json"
+    },
+    "body": {
+      "message": "registered",
+      "status": "OK"
+    }
+  },
+  "normalization": {
+    "tokens": "fixture placeholders only",
+    "timestamps": "none in response"
+  }
+}

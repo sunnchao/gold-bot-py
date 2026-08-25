@@ -1,0 +1,36 @@
+{
+  "fixture": "admin-accounts",
+  "oracle": {
+    "source": "internal/api/handlers_accounts.go#list",
+    "head": "912701d"
+  },
+  "request": {
+    "method": "GET",
+    "path": "/api/v1/accounts",
+    "headers": {
+      "X-API-Token": "fixture-admin-token"
+    }
+  },
+  "response": {
+    "status_code": 200,
+    "headers": {
+      "Content-Type": "application/json"
+    },
+    "body": {
+      "accounts": [
+        {
+          "account_id": "90011087",
+          "balance": 1000.5,
+          "broker": "Demo Broker",
+          "connected": true,
+          "equity": 1100.25,
+          "is_trade_allowed": true,
+          "market_open": true,
+          "positions": 1,
+          "server_name": "Demo-1"
+        }
+      ],
+      "status": "OK"
+    }
+  }
+}

@@ -1,0 +1,56 @@
+{
+  "signal": null,
+  "logs": [
+    {
+      "level": "info",
+      "strategy": "市场",
+      "msg": "Price=3335.75 | ATR=2.67 | RSI=64.7 | ADX=71.5 | EMA趋势(H1)=多头 | H4=强多头(ADX=100.0) | MACD柱=-0.82"
+    },
+    {
+      "level": "signal",
+      "strategy": "趋势回调",
+      "msg": "🟢 BUY 评分=6 | EMA20回调 dist=0.74 | ADX=71.5\u003e30"
+    },
+    {
+      "level": "info",
+      "strategy": "突破回踩",
+      "msg": "阻力=3340.18 支撑=3300.83 | 未突破 ⏭"
+    },
+    {
+      "level": "info",
+      "strategy": "RSI背离",
+      "msg": "RSI=64.7 | 无背离 ⏭"
+    },
+    {
+      "level": "info",
+      "strategy": "反转回调",
+      "msg": "无CHoCH信号 ⏭"
+    },
+    {
+      "level": "info",
+      "strategy": "突破加仓",
+      "msg": "BB=[3330.80, 3341.03] Price=3335.75 | 在通道内 ⏭"
+    },
+    {
+      "level": "info",
+      "strategy": "浮亏加仓",
+      "msg": "➕ 无同向浮亏持仓 ⏭"
+    },
+    {
+      "level": "info",
+      "strategy": "动量剥头皮",
+      "msg": "M5数据不足: 0/12 ⏭"
+    },
+    {
+      "level": "warn",
+      "strategy": "R:R过滤",
+      "msg": "⚠️ 信号 R:R=0.875 < 1.25 拒绝 ⏭"
+    },
+    {
+      "level": "info",
+      "strategy": "M15确认",
+      "msg": "⏭ pullback | M15未确认: RSI=77.2≥40"
+    }
+  ],
+  "position_commands": null
+}

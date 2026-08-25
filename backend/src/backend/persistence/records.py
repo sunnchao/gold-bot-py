@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import Any, Literal, TypedDict
+
 # 常量(与 shared-contracts/src/runtime.ts 逐字一致)
 # ---------------------------------------------------------------------------
 # 常量(与 shared-contracts/src/runtime.ts 逐字一致)

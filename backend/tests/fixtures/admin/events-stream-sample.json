@@ -1,0 +1,29 @@
+{
+  "fixture": "admin-events-stream-sample",
+  "oracle": {
+    "source": "internal/realtime/sse.go",
+    "head": "912701d"
+  },
+  "request": {
+    "method": "GET",
+    "path": "/api/v1/events/stream",
+    "headers": {
+      "Accept": "text/event-stream",
+      "X-API-Token": "fixture-admin-token"
+    }
+  },
+  "response": {
+    "status_code": 200,
+    "headers": {
+      "Cache-Control": "no-cache",
+      "Connection": "keep-alive",
+      "Content-Type": "text/event-stream"
+    },
+    "frames": [
+      "data: {\"event_id\":\"evt_1\",\"event_type\":\"heartbeat\",\"account_id\":\"90011087\",\"source\":\"test\",\"timestamp\":\"2026-04-13T08:00:00Z\",\"payload\":{\"status\":\"OK\"}}\n\n"
+    ]
+  },
+  "normalization": {
+    "stream": "SSE stays open until the request context is cancelled; sample records one data frame."
+  }
+}

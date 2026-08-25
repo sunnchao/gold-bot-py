@@ -1,0 +1,36 @@
+{
+  "fixture": "admin-ai-result",
+  "oracle": {
+    "source": "internal/api/handlers_ai.go#aiResult",
+    "head": "912701d"
+  },
+  "request": {
+    "method": "POST",
+    "path": "/api/ai_result/90011087",
+    "headers": {
+      "Content-Type": "application/json",
+      "X-API-Token": "fixture-user-token"
+    },
+    "body": {
+      "alert_reason": "volatility spike",
+      "combined_bias": "bearish",
+      "confidence": 87,
+      "exit_suggestion": "close_all",
+      "reasoning": "risk regime changed",
+      "risk_alert": true
+    }
+  },
+  "response": {
+    "status_code": 200,
+    "headers": {
+      "Content-Type": "application/json"
+    },
+    "body": {
+      "received": true,
+      "status": "OK"
+    }
+  },
+  "normalization": {
+    "side_effect": "This legacy AI risk-alert sample enqueues CLOSE_ALL for /poll when risk gate permits it."
+  }
+}

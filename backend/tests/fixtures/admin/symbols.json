@@ -1,0 +1,24 @@
+{
+  "fixture": "admin-symbols",
+  "oracle": {
+    "source": "internal/api/handlers_symbols.go#listSymbols",
+    "head": "912701d"
+  },
+  "request": {
+    "method": "GET",
+    "path": "/api/symbols/90011087",
+    "headers": {
+      "X-API-Token": "fixture-user-token"
+    }
+  },
+  "response": {
+    "status_code": 200,
+    "headers": {
+      "Content-Type": "application/json"
+    },
+    "body": ["XAUUSD", "GBPJPY"]
+  },
+  "normalization": {
+    "ordering": "Store-defined order; consumers must not attach strategy semantics to symbol order."
+  }
+}

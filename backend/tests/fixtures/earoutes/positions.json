@@ -1,0 +1,48 @@
+{
+  "fixture": "ea-positions",
+  "oracle": {
+    "source": "internal/legacy/handlers_positions.go",
+    "head": "912701d"
+  },
+  "request": {
+    "method": "POST",
+    "path": "/positions",
+    "headers": {
+      "Content-Type": "application/json",
+      "X-API-Token": "fixture-user-token"
+    },
+    "body": {
+      "account_id": "90011087",
+      "symbol": "XAUUSD",
+      "positions": [
+        {
+          "ticket": 123456,
+          "symbol": "XAUUSD",
+          "type": "BUY",
+          "lots": 0.1,
+          "open_price": 3330,
+          "sl": 3320,
+          "tp": 3355,
+          "profit": 57.5,
+          "open_time": 1712900000,
+          "comment": "GB_pullback_S7",
+          "magic": 20250231,
+          "strategy": "pullback"
+        }
+      ]
+    }
+  },
+  "response": {
+    "status_code": 200,
+    "headers": {
+      "Content-Type": "application/json"
+    },
+    "body": {
+      "count": 1,
+      "status": "OK"
+    }
+  },
+  "normalization": {
+    "strategy_resolution": "If position.strategy is empty, Go resolves it from strategy_mapping by magic when available."
+  }
+}

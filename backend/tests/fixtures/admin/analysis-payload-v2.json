@@ -1,0 +1,24 @@
+{
+  "fixture": "admin-analysis-payload-v2",
+  "oracle": {
+    "source": "internal/api/handlers_ai.go#analysisPayloadSymbol",
+    "head": "912701d"
+  },
+  "request": {
+    "method": "GET",
+    "path": "/api/v2/analysis_payload/90011087/XAUUSD",
+    "headers": {
+      "X-API-Token": "fixture-admin-token"
+    }
+  },
+  "response": {
+    "status_code": 200,
+    "headers": {
+      "Content-Type": "application/json"
+    },
+    "body_ref": "tests/fixtures/admin/analysis-payload.json#/response/body"
+  },
+  "normalization": {
+    "symbol": "v2 path symbol selects AccountState symbol; sample uses XAUUSD."
+  }
+}

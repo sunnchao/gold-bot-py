@@ -1,0 +1,66 @@
+{
+  "fixture": "admin-overview",
+  "oracle": {
+    "source": "internal/api/handlers_accounts.go#overview",
+    "head": "912701d"
+  },
+  "request": {
+    "method": "GET",
+    "path": "/api/v1/overview",
+    "headers": {
+      "X-API-Token": "fixture-admin-token"
+    }
+  },
+  "response": {
+    "status_code": 200,
+    "headers": {
+      "Content-Type": "application/json"
+    },
+    "body": {
+      "accounts": [
+        {
+          "account_id": "90011087",
+          "balance": 1000.5,
+          "broker": "Demo Broker",
+          "connected": true,
+          "equity": 1100.25,
+          "is_trade_allowed": true,
+          "market_open": true,
+          "positions": 1,
+          "server_name": "Demo-1"
+        }
+      ],
+      "cards": [
+        {
+          "detail": "SQLite + Go API online",
+          "title": "System Health",
+          "tone": "green",
+          "value": "Healthy"
+        },
+        {
+          "detail": "active terminals reporting",
+          "title": "Connected Accounts",
+          "tone": "amber",
+          "value": "1"
+        },
+        {
+          "detail": "market open and trading allowed",
+          "title": "Tradeable Accounts",
+          "tone": "blue",
+          "value": "1"
+        },
+        {
+          "detail": "Replay validated, shadow diff pending",
+          "title": "Cutover Health",
+          "tone": "orange",
+          "value": "Baseline Only"
+        }
+      ],
+      "generated_at": "2026-04-13T08:00:00Z",
+      "status": "OK"
+    }
+  },
+  "normalization": {
+    "generated_at": "fixed representative handler timestamp"
+  }
+}

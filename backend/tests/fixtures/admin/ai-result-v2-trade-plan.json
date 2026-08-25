@@ -1,0 +1,76 @@
+{
+  "fixture": "admin-ai-result-v2-trade-plan",
+  "oracle": {
+    "source": "internal/api/handlers_ai.go#aiResultSymbol",
+    "head": "912701d"
+  },
+  "request": {
+    "method": "POST",
+    "path": "/api/v2/ai_result/90011087/XAUUSD",
+    "headers": {
+      "Content-Type": "application/json",
+      "X-API-Token": "fixture-user-token"
+    },
+    "body": {
+      "bias": "bullish",
+      "confidence": 82,
+      "exit_suggestion": "hold",
+      "risk_alert": false,
+      "trade_plan": {
+        "account_id": "90011087",
+        "confidence": 82,
+        "conflicts": [],
+        "decision_id": "tpv1_abc123",
+        "entry_zone": {
+          "max": 3335.75,
+          "min": 3335.55
+        },
+        "expires_at": "2099-06-06T09:15:00Z",
+        "max_lots": 0.02,
+        "mode": "approve",
+        "narrative": "multi-timeframe bullish setup, waiting for Go risk gate",
+        "reason_codes": ["mode.approve", "side.buy"],
+        "schema_version": "trade_plan.v1",
+        "side": "buy",
+        "stop_loss": 3328,
+        "symbol": "XAUUSD",
+        "take_profit": [3350]
+      }
+    }
+  },
+  "response": {
+    "status_code": 200,
+    "headers": {
+      "Content-Type": "application/json"
+    },
+    "body": {
+      "decision": {
+        "confidence": 82,
+        "decision_id": "tpv1_abc123",
+        "mode": "approve",
+        "symbol": "XAUUSD"
+      },
+      "received": true,
+      "risk_gate": {
+        "allowed_lots": 0.02,
+        "audit_only": false,
+        "canProduceLiveCommands": false,
+        "decision_id": "tpv1_abc123",
+        "max_margin_lots": 0.74,
+        "max_risk_lots": 0.02,
+        "mode": "approve",
+        "reason_codes": ["lots.accepted"],
+        "requested_lots": 0.02,
+        "status": "accepted",
+        "symbol": "XAUUSD"
+      },
+      "status": "OK",
+      "trade_plan_validation": {
+        "valid": true
+      }
+    }
+  },
+  "normalization": {
+    "risk_gate": "Node evaluates deterministic risk gate fields used for AI trade_plan decisions; approve may enqueue only after the pending-command gate accepts."
+  }
+}

@@ -1,0 +1,43 @@
+{
+  "fixture": "ea-bars",
+  "oracle": {
+    "source": "internal/legacy/handlers_bars.go",
+    "head": "912701d"
+  },
+  "request": {
+    "method": "POST",
+    "path": "/bars",
+    "headers": {
+      "Content-Type": "application/json",
+      "X-API-Token": "fixture-user-token"
+    },
+    "body": {
+      "account_id": "90011087",
+      "symbol": "XAUUSD",
+      "timeframe": "H1",
+      "bars": [
+        {
+          "time": "2026.04.13 07:00",
+          "open": 3331.25,
+          "high": 3337.1,
+          "low": 3330.9,
+          "close": 3335.75,
+          "volume": 120
+        }
+      ]
+    }
+  },
+  "response": {
+    "status_code": 200,
+    "headers": {
+      "Content-Type": "application/json"
+    },
+    "body": {
+      "received": 1,
+      "status": "OK"
+    }
+  },
+  "normalization": {
+    "bars": "representative single-bar sample; replay fixtures hold full historical arrays"
+  }
+}
