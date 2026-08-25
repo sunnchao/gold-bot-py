@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 from fastapi.testclient import TestClient
 
 from backend.api.app import create_api_app
+from backend.api.routes.ai.index import _notify_ai_result
 from backend.persistence.store import EaStore, create_in_memory_store
 
 pytestmark = pytest.mark.contract
@@ -28,6 +31,33 @@ def make_app(**options) -> TestClient:
 
 def headers() -> dict:
     return {"X-API-Token": TOKEN}
+
+
+async def test_ai_result_notification_uses_dict_dependencies() -> None:
+    class RecordingFeishu:
+        def __init__(self) -> None:
+            self.calls: list[dict] = []
+
+        async def send(self, payload: dict) -> bool:
+            self.calls.append(payload)
+            return True
+
+    feishu = RecordingFeishu()
+    _notify_ai_result(
+        {"discord": None, "feishu": feishu},
+        ACCOUNT_ID,
+        "XAUUSD",
+        {"mode": "approve", "side": "buy", "confidence": 82},
+        "buy",
+    )
+    await asyncio.sleep(0)
+
+    assert feishu.calls == [
+        {
+            "title": "GOLD-BOT",
+            "content": "[GOLD-BOT] AI Signal: XAUUSD buy (mode=approve confidence=82.0 account=90011087)",
+        }
+    ]
 
 
 # ---------------------------------------------------------------- analysis_payload 路由

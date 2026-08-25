@@ -11,6 +11,7 @@
 import asyncio
 import json
 
+import backend.agents.agents.publisher as publisher_module
 from backend.agents.agents.publisher import (
     PublisherService,
     build_feishu_card,
@@ -116,6 +117,53 @@ class FakeFetchRecorder:
         if self._responses:
             return self._responses.pop(0)
         return FakeResponse({"code": 0, "msg": "ok"})
+
+
+async def test_uses_gb_feishu_environment_variables(monkeypatch):
+    monkeypatch.setenv("GB_FEISHU_WEBHOOK_URL", "https://feishu.example/gb-webhook")
+    monkeypatch.setenv("GB_FEISHU_SECRET", "gb-secret")
+    fetch = FakeFetchRecorder([FakeResponse({"code": 0, "msg": "ok"})])
+    service = PublisherService(FakeGoldbotApi(), fetch=fetch)
+
+    await service.send_feishu_card("acc-001", "XAUUSD", create_signal())
+
+    assert fetch.calls[0]["url"] == "https://feishu.example/gb-webhook"
+    body = json.loads(fetch.calls[0]["body"])
+    assert body["timestamp"]
+    assert body["sign"]
+
+
+async def test_default_fetch_posts_with_ten_second_timeout(monkeypatch):
+    calls = []
+
+    class HttpxResponse:
+        status_code = 200
+        is_success = True
+        text = '{"code":0,"msg":"ok"}'
+
+    class FakeAsyncClient:
+        def __init__(self, *, timeout):
+            assert timeout == 10.0
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def request(self, method, url, *, headers, content):
+            calls.append({"method": method, "url": url, "headers": headers, "content": content})
+            return HttpxResponse()
+
+    monkeypatch.setattr(publisher_module.httpx, "AsyncClient", FakeAsyncClient)
+    service = PublisherService(FakeGoldbotApi(), webhook_url="https://feishu.example/webhook")
+
+    await service.send_feishu_card("acc-001", "XAUUSD", create_signal())
+
+    assert calls[0]["method"] == "POST"
+    assert calls[0]["url"] == "https://feishu.example/webhook"
+    assert calls[0]["headers"] == {"Content-Type": "application/json"}
+    assert json.loads(calls[0]["content"])["msg_type"] == "interactive"
 
 
 async def test_serializes_concurrent_feishu_webhook_posts_in_this_process():

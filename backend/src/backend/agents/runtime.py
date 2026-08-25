@@ -20,7 +20,8 @@ __all__ = ["create_agent_workflow"]
 
 
 def create_agent_workflow(env: Mapping[str, str] | None = None) -> WorkflowService:
-    config: Any = AppConfigService(validate_config(env if env is not None else os.environ))
+    source = env if env is not None else os.environ
+    config: Any = AppConfigService(validate_config(source))
     goldbot_api: Any = GoldbotApiService(config)
     llm_client: Any = LlmClientService(config)
     analyst: Any = ComprehensiveAnalystService(
@@ -28,7 +29,11 @@ def create_agent_workflow(env: Mapping[str, str] | None = None) -> WorkflowServi
         trade_client=llm_client,
         trade_model=config.llm_trade_model,
     )
-    publisher: Any = PublisherService(goldbot_api)
+    publisher: Any = PublisherService(
+        goldbot_api,
+        webhook_url=source.get("GB_FEISHU_WEBHOOK_URL"),
+        secret=source.get("GB_FEISHU_SECRET"),
+    )
     bar_source: Any = BarSourceService(config, goldbot_api)
     nodes = WorkflowNodes(
         goldbot_api,

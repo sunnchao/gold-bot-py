@@ -1515,7 +1515,7 @@ def publish_ai_result_events(
     )
 
 
-def _notify_ai_result(state: Any, account_id: str, symbol: str, trade_plan: dict, side: str) -> None:
+def _notify_ai_result(state: dict, account_id: str, symbol: str, trade_plan: dict, side: str) -> None:
     plan_symbol = _string_field(trade_plan, "symbol") or symbol
     mode = _string_field(trade_plan, "mode")
     confidence = number_field(trade_plan, "confidence")
@@ -1526,10 +1526,12 @@ def _notify_ai_result(state: Any, account_id: str, symbol: str, trade_plan: dict
     import asyncio
 
     async def send() -> None:
-        if getattr(state, "discord", None) is not None:
-            await state.discord.send({"content": summary})
-        if getattr(state, "feishu", None) is not None:
-            await state.feishu.send({"title": "GOLD-BOT", "content": summary})
+        discord = state.get("discord")
+        if discord is not None:
+            await discord.send({"content": summary})
+        feishu = state.get("feishu")
+        if feishu is not None:
+            await feishu.send({"title": "GOLD-BOT", "content": summary})
 
     try:
         asyncio.get_running_loop().create_task(send())

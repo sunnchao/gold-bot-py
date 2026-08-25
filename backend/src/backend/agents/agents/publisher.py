@@ -4,11 +4,8 @@
 - build_feishu_card(account_id, symbol, result):飞书 interactive 卡片构造
 - PublisherService.postToGoldbot:金标 API 发布(通过注入的 goldbot_api stub 化)
 - PublisherService.sendFeishuCard:进程内串行化飞书 webhook 推送
-  (rate-limit 退避:2000/5000/10000ms),FEISHU_WEBHOOK_URL/SECRET 支持 env 注入
+  (rate-limit 退避:2000/5000/10000ms),GB_FEISHU_WEBHOOK_URL/GB_FEISHU_SECRET 支持 env 注入
 - PublisherService.publish:并发发布,全部失败才抛错
-
-网络路径全部 stub 化:goldbot_api 与 fetch 均可注入,默认实现直接抛
-NotImplementedError,避免任何真实外呼。
 """
 
 from __future__ import annotations
@@ -26,6 +23,8 @@ from dataclasses import fields, is_dataclass
 from datetime import datetime
 from typing import Any
 from zoneinfo import ZoneInfo
+
+import httpx
 
 from backend.agents.agents._support import get_logger
 
@@ -74,10 +73,15 @@ def _json_dict(value: Any) -> JSONDict:
     return payload if isinstance(payload, dict) else dict(payload)
 
 
-async def _default_fetch(*args: Any, **kwargs: Any) -> FetchResponse:
-    raise NotImplementedError(
-        "Publisher 的 fetch 网络路径已 stub 化;生产接入需注入 async fetch 回调"
-    )
+async def _default_fetch(
+    url: str,
+    *,
+    method: str = "POST",
+    headers: dict[str, str] | None = None,
+    body: str | None = None,
+) -> FetchResponse:
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        return await client.request(method, url, headers=headers, content=body)
 
 
 class GoldbotApi:
@@ -554,14 +558,18 @@ class PublisherService:
     async def _send_feishu_card_now(self, account_id: str, symbol: str, result: JSONDict) -> None:
         logger = get_logger()
         payload = _json_dict(result)
-        webhook_url = self._webhook_url if self._webhook_url is not None else os.environ.get("FEISHU_WEBHOOK_URL")
+        webhook_url = (
+            self._webhook_url
+            if self._webhook_url is not None
+            else os.environ.get("GB_FEISHU_WEBHOOK_URL")
+        )
         if not webhook_url:
-            logger.warn({}, "Publisher: FEISHU_WEBHOOK_URL not set, skipping Feishu notification")
+            logger.warn({}, "Publisher: GB_FEISHU_WEBHOOK_URL not set, skipping Feishu notification")
             return
 
         card = build_feishu_card(account_id, symbol, payload)
 
-        secret = self._secret if self._secret is not None else os.environ.get("FEISHU_WEBHOOK_SECRET")
+        secret = self._secret if self._secret is not None else os.environ.get("GB_FEISHU_SECRET")
         if secret:
             timestamp = str(int(time.time()))
             string_to_sign = f"{timestamp}\n{secret}"
@@ -592,7 +600,7 @@ class PublisherService:
                 except (TypeError, ValueError):
                     data = None
 
-            ok = bool(getattr(response, "ok", True))
+            ok = _response_ok(response)
             if (
                 data is not None
                 and is_feishu_frequency_limited(data)
@@ -614,7 +622,7 @@ class PublisherService:
                 continue
 
             if not ok:
-                raise RuntimeError(f"Feishu webhook failed: {getattr(response, 'status', '?')} {body or 'no body'}")
+                raise RuntimeError(f"Feishu webhook failed: {_response_status(response)} {body or 'no body'}")
 
             if data is None:
                 raise RuntimeError(f"Feishu webhook returned invalid JSON: {body or 'empty body'}")
@@ -672,4 +680,25 @@ async def _response_text(response: FetchResponse) -> str:
     text = getattr(response, "text", None)
     if callable(text):
         return await text()
+    if isinstance(text, str):
+        return text
     return str(response)
+
+
+def _response_ok(response: FetchResponse) -> bool:
+    ok = getattr(response, "ok", None)
+    if isinstance(ok, bool):
+        return ok
+    is_success = getattr(response, "is_success", None)
+    if isinstance(is_success, bool):
+        return is_success
+    status = _response_status(response)
+    return isinstance(status, int) and 200 <= status < 300
+
+
+def _response_status(response: FetchResponse) -> int | str:
+    status = getattr(response, "status", None)
+    if isinstance(status, int):
+        return status
+    status_code = getattr(response, "status_code", None)
+    return status_code if isinstance(status_code, int) else "?"

@@ -9,6 +9,7 @@ from backend.agents.runtime import create_agent_workflow
 from backend.api.app import create_api_app
 from backend.core.config import load_gold_bot_env
 from backend.core.database import create_store_from_env
+from backend.notifications import FeishuNotifier
 
 
 class HealthResponse(BaseModel):
@@ -36,6 +37,11 @@ async def trigger_llm_analysis(account_id: str, symbol: str, timeframe: str, bar
 app_options: dict[str, object] = {
     "store": store,
     "llm_analysis_trigger": trigger_llm_analysis,
+    "feishu": FeishuNotifier(
+        webhook_url=runtime_env.GB_FEISHU_WEBHOOK_URL,
+        secret=runtime_env.GB_FEISHU_SECRET,
+        log=print,
+    ),
 }
 if agent_token:
     app_options.update(
