@@ -20,9 +20,10 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 WORKDIR /code
 
 COPY backend/pyproject.toml backend/uv.lock backend/README.md ./
-RUN pip install --no-cache-dir uv && uv sync --frozen --no-dev
+RUN pip install --no-cache-dir uv && uv sync --frozen --no-dev --no-install-project
 
 COPY backend/src ./src
+RUN uv sync --frozen --no-dev
 COPY --from=frontend /app/dist /opt/dashboard
 COPY --from=frontend /app/dist /code/apps/app-web/dist
 

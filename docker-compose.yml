@@ -1,9 +1,9 @@
+# 默认拉取 GHCR 发布镜像。本地构建使用：
+# docker compose -f docker-compose.yml -f docker-compose.build.yml up --build
 services:
   backend:
-    build:
-      context: .
-      dockerfile: backend/Dockerfile
-    image: gold-bot-backend:local
+    image: ${GOLDBOT_BACKEND_IMAGE:-ghcr.io/sunnchao/gold-bot-py-backend:latest}
+    pull_policy: always
     container_name: gold-bot-backend
     env_file:
       - .env
@@ -41,10 +41,8 @@ services:
         condition: service_healthy
 
   frontend:
-    build:
-      context: ./frontend
-      dockerfile: Dockerfile
-    image: gold-bot-frontend:local
+    image: ${GOLDBOT_FRONTEND_IMAGE:-ghcr.io/sunnchao/gold-bot-py-frontend:latest}
+    pull_policy: always
     container_name: gold-bot-frontend
     ports:
       - "127.0.0.1:8080:80"

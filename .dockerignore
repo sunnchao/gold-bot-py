@@ -1,0 +1,16 @@
+.git
+.github
+.workbuddy
+.env
+.env.*
+!.env.example
+**/.DS_Store
+**/__pycache__
+backend/.mypy_cache
+backend/.pytest_cache
+backend/.ruff_cache
+backend/.venv
+backend/tests
+docs
+frontend/dist
+frontend/node_modules
