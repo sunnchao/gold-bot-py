@@ -17,7 +17,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, Request, Response
+from fastapi import FastAPI, Request, Response, WebSocket
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from backend.api.dashboard import static_dashboard_response
@@ -46,6 +46,10 @@ from backend.services.bar_close import BarCloseEventService
 from backend.shared_contracts import EA_COMPAT_ENDPOINTS, is_ea_compat_endpoint
 
 __all__ = ["create_api_app", "to_fastapi_response"]
+
+_WS_HEARTBEAT_INTERVAL = 30.0
+"""WebSocket 实时事件通道心跳间隔:无事件时发送 {\"type\": \"ping\"} 帧,
+兼作对端断开的及时探测(发送在连接关闭后抛错)。"""
 
 
 def _default_logger() -> Callable[[str], None]:
@@ -319,6 +323,7 @@ def _register_ea_endpoints(app: FastAPI) -> None:
                     "now_unix": app.state.now_unix,
                     "now_iso": app.state.now_iso,
                     "log": _logger_of(app.state),
+                    "events": app.state.events,
                     "on_bars_saved": app.state.on_bars_saved,
                     "on_bar_closed": app.state.on_bar_closed,
                     "on_positions_saved": app.state.on_positions_saved,
@@ -458,6 +463,49 @@ def _register_service_endpoints(app: FastAPI) -> None:
             return _sse_event_stream(app.state.events, queue)
 
         return StreamingResponse(stream(), headers=event_stream_headers())
+
+    @app.websocket("/api/v1/ws/events")
+    async def events_websocket(websocket: WebSocket) -> None:
+        """实时事件 WebSocket:admin 鉴权 + events hub 订阅转发。
+
+        - 浏览器 WebSocket 无法携带自定义 header,token 走 ?token= 查询参数
+          (extractAuthToken 本就支持 query token)
+        - 每帧一个 JSON 事件(与 SSE data 帧同形);无事件时按心跳间隔发送
+          {"type":"ping"} 保持连接,并借助发送失败及时感知对端断开
+        - 鉴权失败以 4401(invalid token)/4403(admin only)关闭
+        """
+        token = websocket.query_params.get("token")
+        valid_tokens = getattr(app.state, "valid_tokens", None)
+        admin_tokens = getattr(app.state, "admin_tokens", None) or set()
+        if token is None or valid_tokens is None or token not in valid_tokens:
+            await websocket.close(code=4401)
+            return
+        if token not in admin_tokens:
+            await websocket.close(code=4403)
+            return
+
+        events = getattr(app.state, "events", None)
+        if events is None:
+            await websocket.accept()
+            await websocket.send_json({"type": "error", "error": "events hub not configured"})
+            await websocket.close(code=1011)
+            return
+
+        await websocket.accept()
+        queue: asyncio.Queue[Any] = asyncio.Queue()
+        unsubscribe = events.subscribe(queue.put_nowait)
+        try:
+            while True:
+                try:
+                    event = await asyncio.wait_for(queue.get(), timeout=_WS_HEARTBEAT_INTERVAL)
+                except TimeoutError:
+                    await websocket.send_json({"type": "ping"})
+                    continue
+                await websocket.send_text(json.dumps(event))
+        except Exception:  # noqa: BLE001 — 对端断开/发送失败 → 退出转发循环
+            pass
+        finally:
+            unsubscribe()
 
     @app.get("/healthz")
     async def healthz() -> Response:

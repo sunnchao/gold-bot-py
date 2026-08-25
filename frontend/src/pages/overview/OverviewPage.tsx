@@ -1,9 +1,10 @@
 import { startTransition, useEffect, useState } from 'react'
-import { connectEventStream } from '../../lib/events'
+import { connectEventStream, type RealtimeStatus } from '../../lib/events'
 import {
   getOverview,
   resolveDashboardToken,
   type DashboardEvent,
+  type OverviewAccount,
   type OverviewResponse
 } from '../../lib/api'
 import { DashboardShell } from '../../components/dashboard-shell'
@@ -13,6 +14,7 @@ import { formatMoney, formatTimestamp } from '../../lib/format'
 export function OverviewPage({ initialData }: { initialData?: OverviewResponse }) {
   const [data, setData] = useState<OverviewResponse | null>(initialData ?? null)
   const [events, setEvents] = useState<DashboardEvent[]>([])
+  const [realtimeStatus, setRealtimeStatus] = useState<RealtimeStatus>('connecting')
   const [loading, setLoading] = useState(!initialData)
   const [error, setError] = useState('')
 
@@ -54,9 +56,14 @@ export function OverviewPage({ initialData }: { initialData?: OverviewResponse }
     if (!token) {
       return
     }
-    return connectEventStream(token, (event: DashboardEvent) => {
-      setEvents((current) => [event, ...current].slice(0, 8))
-    })
+    return connectEventStream(
+      token,
+      (event: DashboardEvent) => {
+        setEvents((current) => [event, ...current].slice(0, 8))
+        applyRealtimeEvent(setData, event)
+      },
+      setRealtimeStatus
+    )
   }, [])
 
   return (
@@ -138,7 +145,10 @@ export function OverviewPage({ initialData }: { initialData?: OverviewResponse }
           )}
         </Panel>
 
-        <Panel title="实时事件流" subtitle="通过 SSE 推送的事件，使用同一个管理 Token 认证。">
+        <Panel
+          title="实时事件流"
+          subtitle={`通过 WebSocket 推送的账户/分析/策略事件，使用同一个管理 Token 认证 · ${realtimeStatusLabel(realtimeStatus)}。`}
+        >
           {events.length > 0 ? (
             <div className="space-y-3">
               {events.map((event) => (
@@ -160,4 +170,76 @@ export function OverviewPage({ initialData }: { initialData?: OverviewResponse }
       </div>
     </DashboardShell>
   )
+}
+
+function realtimeStatusLabel(status: RealtimeStatus): string {
+  switch (status) {
+    case 'connected':
+      return 'WebSocket 已连接'
+    case 'disconnected':
+      return '连接断开，重连中'
+    default:
+      return '连接中'
+  }
+}
+
+/** 把实时事件补丁到总览账户表:account_update 更新资金/连接,positions_update 更新持仓数。 */
+function applyRealtimeEvent(
+  setData: (updater: (current: OverviewResponse | null) => OverviewResponse | null) => void,
+  event: DashboardEvent
+): void {
+  setData((current) => {
+    if (!current) {
+      return current
+    }
+    const payload = event.payload
+    if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
+      return current
+    }
+    const record = payload as Record<string, unknown>
+
+    if (event.event_type === 'account_update') {
+      const patched = current.accounts.map((account) =>
+        account.account_id === event.account_id ? patchAccount(account, record) : account
+      )
+      return accountListChanged(patched, current.accounts) ? { ...current, accounts: patched } : current
+    }
+
+    if (event.event_type === 'positions_update') {
+      const count = typeof record.count === 'number' && Number.isFinite(record.count) ? record.count : null
+      if (count == null) {
+        return current
+      }
+      const patched = current.accounts.map((account) =>
+        account.account_id === event.account_id ? { ...account, positions: count } : account
+      )
+      return accountListChanged(patched, current.accounts) ? { ...current, accounts: patched } : current
+    }
+
+    return current
+  })
+}
+
+function patchAccount(account: OverviewAccount, payload: Record<string, unknown>): OverviewAccount {
+  const patched: OverviewAccount = { ...account }
+  if (typeof payload.balance === 'number') {
+    patched.balance = payload.balance
+  }
+  if (typeof payload.equity === 'number') {
+    patched.equity = payload.equity
+  }
+  if (typeof payload.connected === 'boolean') {
+    patched.connected = payload.connected
+  }
+  if (typeof payload.market_open === 'boolean') {
+    patched.market_open = payload.market_open
+  }
+  if (typeof payload.is_trade_allowed === 'boolean') {
+    patched.is_trade_allowed = payload.is_trade_allowed
+  }
+  return patched
+}
+
+function accountListChanged(next: OverviewAccount[], previous: OverviewAccount[]): boolean {
+  return JSON.stringify(next) !== JSON.stringify(previous)
 }

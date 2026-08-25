@@ -178,11 +178,12 @@ export function resolveDashboardToken(): string {
   return ''
 }
 
-export function buildStreamURL(token: string): string {
+export function buildRealtimeURL(token: string): string {
   if (typeof window === 'undefined') {
     return ''
   }
-  const url = new URL('/api/v1/events/stream', window.location.origin)
+  const url = new URL('/api/v1/ws/events', window.location.origin)
+  url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:'
   if (token) {
     url.searchParams.set('token', token)
   }

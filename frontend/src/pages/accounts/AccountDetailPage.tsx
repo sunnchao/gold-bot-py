@@ -1,5 +1,11 @@
-import { startTransition, useEffect, useState } from 'react'
-import { getAccountDetail, type AccountDetail, type DecisionEvent } from '../../lib/api'
+import { startTransition, useEffect, useRef, useState } from 'react'
+import {
+  getAccountDetail,
+  resolveDashboardToken,
+  type AccountDetail,
+  type DecisionEvent
+} from '../../lib/api'
+import { connectEventStream } from '../../lib/events'
 import { DashboardShell } from '../../components/dashboard-shell'
 import { EmptyState, JsonPreview, Panel, ToneBadge } from '../../components/ui'
 import { formatMoney, formatNumber, formatTimestamp } from '../../lib/format'
@@ -13,6 +19,7 @@ export function AccountDetailPage({
 }) {
   const [data, setData] = useState<AccountDetail | null>(initialData ?? null)
   const [error, setError] = useState('')
+  const refreshSeq = useRef(0)
 
   useEffect(() => {
     if (!accountId || initialData) {
@@ -40,6 +47,37 @@ export function AccountDetailPage({
       cancelled = true
     }
   }, [accountId, initialData])
+
+  // WebSocket 实时订阅:该账户的账户/分析/策略事件到达时拉取最新详情。
+  useEffect(() => {
+    if (!accountId) {
+      return
+    }
+    const token = resolveDashboardToken()
+    if (!token) {
+      return
+    }
+    return connectEventStream(token, (event) => {
+      if (event.account_id !== accountId) {
+        return
+      }
+      const seq = refreshSeq.current + 1
+      refreshSeq.current = seq
+      void getAccountDetail(accountId)
+        .then((next) => {
+          if (refreshSeq.current !== seq) {
+            return
+          }
+          startTransition(() => {
+            setData(next)
+          })
+          setError('')
+        })
+        .catch(() => {
+          // 实时刷新失败保留当前数据;错误已由初始加载路径呈现
+        })
+    })
+  }, [accountId])
 
   return (
     <DashboardShell

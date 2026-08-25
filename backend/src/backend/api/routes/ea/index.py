@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import inspect
 import json
+import math
 import re
 from collections.abc import Callable
 from datetime import UTC, datetime
@@ -445,6 +446,71 @@ def sanitize_log_text(value: Any) -> str:
     return _LOG_CRLF_RE.sub(" ", text).strip()
 
 
+# ---------------------------------------------------------------- 实时事件(ea.ts)
+
+_EA_EVENT_SOURCE = "ea"
+
+
+def _ea_event_id(prefix: str) -> str:
+    """镜像 ai 路由的 evt_{prefix}_{ms} 事件 ID(毫秒时间戳)。"""
+    import time
+
+    return f"evt_{prefix}_{int(time.time() * 1000)}"
+
+
+def _ea_event_number(value: Any) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    number = float(value)
+    return number if math.isfinite(number) else None
+
+
+def _compact_position(position: Any, helpers: dict) -> dict:
+    """EA 持仓 → 实时事件用的紧凑摘要(全量数据仍走 REST 详情)。"""
+    if not isinstance(position, dict):
+        return {}
+    ticket = position.get("ticket")
+    lots = _ea_event_number(position.get("lots"))
+    open_price = _ea_event_number(position.get("open_price"))
+    profit = _ea_event_number(position.get("profit"))
+    sl = _ea_event_number(position.get("sl"))
+    tp = _ea_event_number(position.get("tp"))
+    return {
+        "ticket": ticket if isinstance(ticket, (int, float)) and not isinstance(ticket, bool) else None,
+        "symbol": helpers["string_field_or_empty"](position, "symbol"),
+        "strategy": resolve_position_strategy(position),
+        "side": str(helpers["string_field_or_empty"](position, "type")).strip().upper(),
+        "lots": lots,
+        "open_price": open_price,
+        "profit": profit,
+        "sl": sl,
+        "tp": tp,
+    }
+
+
+def _publish_ea_event(
+    events: Any,
+    *,
+    event_type: str,
+    account_id: str,
+    timestamp: str,
+    payload: dict,
+) -> None:
+    """向事件 hub 发布实时事件(未配置 hub 时静默跳过)。"""
+    if events is None:
+        return
+    events.publish(
+        {
+            "event_id": _ea_event_id(event_type),
+            "event_type": event_type,
+            "account_id": account_id,
+            "source": _EA_EVENT_SOURCE,
+            "timestamp": timestamp,
+            "payload": payload,
+        }
+    )
+
+
 # ---------------------------------------------------------------- 主路由(ea.ts)
 
 
@@ -480,6 +546,17 @@ async def handle_ea_route(
     if switch_path == "/register":
         await deps["store"].save_registration(parsed_body)
         _log_ea_lifecycle(deps.get("log"), "register", parsed_body)
+        # 策略映射(EA 上报时推送到实时流)
+        _publish_ea_event(
+            deps.get("events"),
+            event_type="strategy_update",
+            account_id=account_id,
+            timestamp=deps["now_iso"](),
+            payload={
+                "account_id": account_id,
+                "strategy_mapping": parsed_body.get("strategy_mapping") or {},
+            },
+        )
         return ok({"status": "OK", "message": "registered"})
     if switch_path == "/heartbeat":
         heartbeat_at = deps["now_iso"]()
@@ -488,6 +565,24 @@ async def handle_ea_route(
         parsed_body["updated_at"] = heartbeat_at
         await deps["store"].save_heartbeat(parsed_body)
         _log_ea_lifecycle(deps.get("log"), "heartbeat", parsed_body)
+        # 账户快照(EQ/余额/连接状态更新时推送到实时流)
+        _publish_ea_event(
+            deps.get("events"),
+            event_type="account_update",
+            account_id=account_id,
+            timestamp=heartbeat_at,
+            payload={
+                "account_id": account_id,
+                "balance": _ea_event_number(parsed_body.get("balance")),
+                "equity": _ea_event_number(parsed_body.get("equity")),
+                "margin": _ea_event_number(parsed_body.get("margin")),
+                "free_margin": _ea_event_number(parsed_body.get("free_margin")),
+                "connected": parsed_body.get("connected") is True,
+                "market_open": parsed_body.get("market_open") is True,
+                "is_trade_allowed": parsed_body.get("is_trade_allowed") is True,
+                "server_time": helpers["string_field_or_empty"](parsed_body, "server_time"),
+            },
+        )
         return ok({"status": "OK", "server_time": deps["now_unix"]()})
     if switch_path == "/tick":
         received_at = deps["now_iso"]()
@@ -524,6 +619,21 @@ async def handle_ea_route(
         on_positions_saved = deps.get("on_positions_saved")
         if on_positions_saved is not None:
             on_positions_saved(account_id, helpers["symbol_default"](parsed_body))
+        # 持仓快照(开/平仓时推送到实时流)
+        stored_positions = parsed_body.get("positions")
+        raw_positions = stored_positions if isinstance(stored_positions, list) else []
+        _publish_ea_event(
+            deps.get("events"),
+            event_type="positions_update",
+            account_id=account_id,
+            timestamp=deps["now_iso"](),
+            payload={
+                "account_id": account_id,
+                "symbol": helpers["symbol_default"](parsed_body),
+                "count": len(raw_positions),
+                "positions": [_compact_position(position, helpers) for position in raw_positions],
+            },
+        )
         return ok(
             {
                 "status": "OK",
