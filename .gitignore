@@ -16,3 +16,6 @@ frontend/dist/
 .DS_Store
 
 .idea
+.workbuddy/*
+
+docs/**/*

@@ -16,9 +16,9 @@ services:
       GB_EA_STORE_SQLITE_PATH: ${GB_EA_STORE_SQLITE_PATH:-/code/data/gold_bolt.sqlite}
       GB_ADMIN_TOKEN: ${GB_ADMIN_TOKEN:-${ADMIN_TOKEN:-}}
       GB_NODE_SHADOW_MODE: "false"
-      GB_REDIS_URL: redis://redis:6379
-      REDIS_URL: redis://redis:6379
-      GOLDBOT_API_URL: http://backend:8000
+      GB_REDIS_URL: redis://gold-bot-redis:6379
+      REDIS_URL: redis://gold-bot-redis:6379
+      GOLDBOT_API_URL: http://gold-bot-backend:8000
     ports:
       - "127.0.0.1:8880:8000"
     volumes:
@@ -36,9 +36,8 @@ services:
       start_period: 15s
       retries: 3
     restart: unless-stopped
-    depends_on:
-      redis:
-        condition: service_healthy
+    networks:
+      - gold-bot_default
 
   frontend:
     image: ${GOLDBOT_FRONTEND_IMAGE:-ghcr.io/sunnchao/gold-bot-py-frontend:latest}
@@ -50,6 +49,8 @@ services:
       backend:
         condition: service_healthy
     restart: unless-stopped
+    networks:
+      - gold-bot_default
 
   redis:
     image: redis:7-alpine
@@ -64,6 +65,8 @@ services:
     restart: unless-stopped
     volumes:
       - redis-data:/data
+    networks:
+      - gold-bot_default
 
   prometheus:
     image: prom/prometheus:latest
@@ -81,9 +84,8 @@ services:
     ports:
       - "127.0.0.1:9090:9090"
     restart: unless-stopped
-    depends_on:
-      backend:
-        condition: service_healthy
+    networks:
+      - gold-bot_default
 
   grafana:
     image: grafana/grafana:latest
@@ -100,10 +102,14 @@ services:
     ports:
       - "127.0.0.1:9092:3000"
     restart: unless-stopped
-    depends_on:
-      - prometheus
+    networks:
+      - gold-bot_default
 
 volumes:
   prometheus_data:
   grafana_data:
   redis-data:
+
+networks:
+  gold-bot_default:
+    driver: bridge
