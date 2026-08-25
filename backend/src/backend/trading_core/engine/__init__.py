@@ -1,0 +1,61 @@
+"""engine 子包(镜像 packages/trading-core/src/engine)。"""
+
+from __future__ import annotations
+
+from backend.trading_core.engine.config import (
+    FibExtensionTPConfig,
+    PullbackFibConfig,
+    StrategyConfig,
+    TrendConfig,
+    default_strategy_config,
+    default_trend_config,
+    eurusd_strategy_config,
+    gbpjpy_strategy_config,
+    gbpusd_strategy_config,
+    get_strategy_config_by_symbol,
+    gold_strategy_config,
+    jpy_cross_strategy_config,
+    oil_strategy_config,
+    silver_strategy_config,
+    us100_cash_strategy_config,
+    usdcad_strategy_config,
+)
+from backend.trading_core.engine.engine import (
+    StrategyBar,
+    StrategyDecision,
+    StrategyEngine,
+    StrategyInput,
+    StrategyLog,
+    StrategySignal,
+    analyze,
+    create_strategy_engine,
+    validate_strategy_name,
+)
+
+__all__ = [
+    "FibExtensionTPConfig",
+    "PullbackFibConfig",
+    "StrategyConfig",
+    "TrendConfig",
+    "default_strategy_config",
+    "default_trend_config",
+    "eurusd_strategy_config",
+    "gbpjpy_strategy_config",
+    "gbpusd_strategy_config",
+    "get_strategy_config_by_symbol",
+    "gold_strategy_config",
+    "jpy_cross_strategy_config",
+    "oil_strategy_config",
+    "silver_strategy_config",
+    "us100_cash_strategy_config",
+    "usdcad_strategy_config",
+    "StrategyBar",
+    "StrategyDecision",
+    "StrategyEngine",
+    "StrategyInput",
+    "StrategyLog",
+    "StrategySignal",
+    "analyze",
+    "create_strategy_engine",
+    "validate_strategy_name",
+]

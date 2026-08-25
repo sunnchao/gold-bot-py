@@ -1,0 +1,116 @@
+groups:
+  - name: gold_bot_critical
+    interval: 30s
+    rules:
+      # EA 心跳超时告警（关键）
+      - alert: EAHeartbeatTimeout
+        expr: time() - goldbot_ea_last_heartbeat_timestamp > 120
+        for: 1m
+        labels:
+          severity: critical
+          component: ea
+        annotations:
+          summary: "EA 心跳超时 (账户: {{ $labels.account_id }})"
+          description: "EA 已超过 2 分钟无心跳，当前延迟: {{ $value | humanizeDuration }}"
+
+      # 账户严重亏损告警
+      - alert: AccountCriticalDrawdown
+        expr: |
+          (goldbot_account_equity_usd - goldbot_account_balance_usd)
+          / goldbot_account_balance_usd < -0.1
+        for: 5m
+        labels:
+          severity: critical
+          component: risk
+        annotations:
+          summary: "账户回撤超过 10% (账户: {{ $labels.account_id }})"
+          description: "触发熔断，请立即检查。当前净值: ${{ $value }}"
+
+      # 数据库连接失败
+      - alert: DatabaseDown
+        expr: up{job="gold-bot"} == 0
+        for: 1m
+        labels:
+          severity: critical
+          component: database
+        annotations:
+          summary: "Gold Bot 服务不可用"
+          description: "服务已停止响应，请立即检查"
+
+  - name: gold_bot_warning
+    interval: 1m
+    rules:
+      # 账户轻度亏损告警
+      - alert: AccountDrawdown
+        expr: |
+          (goldbot_account_equity_usd - goldbot_account_balance_usd)
+          / goldbot_account_balance_usd < -0.05
+        for: 5m
+        labels:
+          severity: warning
+          component: risk
+        annotations:
+          summary: "账户回撤超过 5% (账户: {{ $labels.account_id }})"
+          description: "当前净值: ${{ with query \"goldbot_account_equity_usd{account_id='\" }}{{ . | first | value | humanize }}{{ end }}"
+
+      # HTTP 高延迟
+      - alert: HighHTTPLatency
+        expr: |
+          histogram_quantile(0.99,
+            sum by (path, le) (rate(goldbot_http_request_duration_seconds_bucket[5m]))
+          ) > 1
+        for: 5m
+        labels:
+          severity: warning
+          component: performance
+        annotations:
+          summary: "HTTP 延迟过高 (路径: {{ $labels.path }})"
+          description: "P99 延迟: {{ $value | humanizeDuration }}"
+
+      # 数据库连接池使用率高
+      - alert: DBConnectionPoolHigh
+        expr: |
+          goldbot_db_connections_in_use / goldbot_db_connections_open > 0.8
+        for: 2m
+        labels:
+          severity: warning
+          component: database
+        annotations:
+          summary: "数据库连接池使用率过高"
+          description: "当前使用率: {{ $value | humanizePercentage }}"
+
+      # 点差异常
+      - alert: HighSpread
+        expr: goldbot_spread_points > 10
+        for: 1m
+        labels:
+          severity: warning
+          component: market
+        annotations:
+          summary: "点差异常 ({{ $labels.symbol }})"
+          description: "当前点差: {{ $value }} 点，请检查市场状况"
+
+      # 订单失败率高
+      - alert: HighOrderFailureRate
+        expr: |
+          sum(rate(goldbot_orders_total{result="error"}[5m]))
+          / sum(rate(goldbot_orders_total[5m])) > 0.2
+        for: 5m
+        labels:
+          severity: warning
+          component: trading
+        annotations:
+          summary: "订单失败率过高"
+          description: "过去 5 分钟失败率: {{ $value | humanizePercentage }}"
+
+      # 信号速率异常低
+      - alert: LowSignalRate
+        expr: |
+          sum(rate(goldbot_signals_total[10m])) < 0.01
+        for: 10m
+        labels:
+          severity: warning
+          component: strategy
+        annotations:
+          summary: "信号生成速率异常低"
+          description: "过去 10 分钟几乎无信号生成，请检查策略引擎"

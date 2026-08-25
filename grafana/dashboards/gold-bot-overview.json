@@ -1,0 +1,156 @@
+{
+  "dashboard": {
+    "title": "Gold Bot - 系统概览",
+    "tags": ["gold-bot", "overview"],
+    "timezone": "browser",
+    "panels": [
+      {
+        "id": 1,
+        "title": "账户净值 (USD)",
+        "type": "timeseries",
+        "gridPos": {"h": 8, "w": 12, "x": 0, "y": 0},
+        "targets": [
+          {
+            "expr": "goldbot_account_equity_usd",
+            "legendFormat": "{{account_id}}"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": {
+            "unit": "currencyUSD",
+            "color": {"mode": "palette-classic"}
+          }
+        }
+      },
+      {
+        "id": 2,
+        "title": "持仓数量",
+        "type": "timeseries",
+        "gridPos": {"h": 8, "w": 12, "x": 12, "y": 0},
+        "targets": [
+          {
+            "expr": "sum by (account_id) (goldbot_account_positions)",
+            "legendFormat": "{{account_id}}"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": {
+            "unit": "short"
+          }
+        }
+      },
+      {
+        "id": 3,
+        "title": "浮动盈亏 (USD)",
+        "type": "timeseries",
+        "gridPos": {"h": 8, "w": 12, "x": 0, "y": 8},
+        "targets": [
+          {
+            "expr": "goldbot_account_floating_pl_usd",
+            "legendFormat": "{{account_id}}"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": {
+            "unit": "currencyUSD",
+            "color": {"mode": "thresholds"},
+            "thresholds": {
+              "mode": "absolute",
+              "steps": [
+                {"value": null, "color": "red"},
+                {"value": 0, "color": "green"}
+              ]
+            }
+          }
+        }
+      },
+      {
+        "id": 4,
+        "title": "信号生成速率 (5分钟)",
+        "type": "timeseries",
+        "gridPos": {"h": 8, "w": 12, "x": 12, "y": 8},
+        "targets": [
+          {
+            "expr": "rate(goldbot_signals_total[5m])",
+            "legendFormat": "{{strategy}} - {{side}}"
+          }
+        ]
+      },
+      {
+        "id": 5,
+        "title": "HTTP 请求速率",
+        "type": "timeseries",
+        "gridPos": {"h": 8, "w": 8, "x": 0, "y": 16},
+        "targets": [
+          {
+            "expr": "sum by (path, status) (rate(goldbot_http_requests_total[5m]))",
+            "legendFormat": "{{path}} ({{status}})"
+          }
+        ]
+      },
+      {
+        "id": 6,
+        "title": "HTTP 请求延迟 (P99)",
+        "type": "timeseries",
+        "gridPos": {"h": 8, "w": 8, "x": 8, "y": 16},
+        "targets": [
+          {
+            "expr": "histogram_quantile(0.99, sum by (path, le) (rate(goldbot_http_request_duration_seconds_bucket[5m])))",
+            "legendFormat": "{{path}}"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": {
+            "unit": "s"
+          }
+        }
+      },
+      {
+        "id": 7,
+        "title": "数据库连接池",
+        "type": "timeseries",
+        "gridPos": {"h": 8, "w": 8, "x": 16, "y": 16},
+        "targets": [
+          {
+            "expr": "goldbot_db_connections_open",
+            "legendFormat": "Open"
+          },
+          {
+            "expr": "goldbot_db_connections_in_use",
+            "legendFormat": "In Use"
+          }
+        ]
+      },
+      {
+        "id": 8,
+        "title": "EA 心跳状态",
+        "type": "stat",
+        "gridPos": {"h": 4, "w": 24, "x": 0, "y": 24},
+        "targets": [
+          {
+            "expr": "time() - goldbot_ea_last_heartbeat_timestamp",
+            "legendFormat": "{{account_id}}"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": {
+            "unit": "s",
+            "thresholds": {
+              "mode": "absolute",
+              "steps": [
+                {"value": null, "color": "green"},
+                {"value": 60, "color": "yellow"},
+                {"value": 120, "color": "red"}
+              ]
+            }
+          }
+        }
+      }
+    ],
+    "refresh": "10s",
+    "time": {
+      "from": "now-1h",
+      "to": "now"
+    }
+  }
+}

@@ -1,0 +1,84 @@
+[project]
+name = "backend"
+version = "0.1.0"
+description = "FastAPI backend for the full-stack application (gold-bot port)"
+readme = "README.md"
+authors = [
+    { name = "sunchaowang", email = "sunchaowang@outlook.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi[standard]>=0.141.1",
+    # M1 存储层:SQLAlchemy Core + SQLite async(DDL 由 migration 文件控制,不用 ORM 建表)
+    "sqlalchemy>=2.0",
+    "aiosqlite>=0.20",
+    # M0 配置层:pydantic-settings 替代 gold-bot 的 packages/config
+    "pydantic-settings>=2.6",
+    # M2 观测与 SSE
+    "prometheus-client>=0.21",
+    "sse-starlette>=2.1",
+    # M5 调度与队列:taskiq 替代 BullMQ、APScheduler 替代 Node cron
+    "taskiq>=0.12",
+    "apscheduler>=3.11",
+    "redis>=5.2",
+    # M7 AI 管线:LangGraph + OpenAI 兼容客户端(wochirou 网关)
+    "langgraph>=0.2",
+    "langchain-core>=0.3",
+    "langchain-openai>=0.3",
+    "greenlet>=3.5.5",
+]
+
+[project.scripts]
+backend = "backend.main:run"
+
+[build-system]
+requires = ["uv_build>=0.9.11,<0.10.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "httpx2>=2.12.0",
+    "pytest>=9.1.1",
+    # TDD 工具链(M0)
+    "pytest-asyncio>=0.25",
+    "pytest-cov>=6",
+    "ruff>=0.9",
+    "mypy>=1.14",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+addopts = "-m 'not slow'"
+asyncio_mode = "auto"
+markers = [
+    "contract: HTTP 契约测试(L2)",
+    "slow: 慢速测试,默认跳过(需 Postgres/Docker)",
+    "agent: AI Agent 测试(L5)",
+]
+
+[tool.coverage.run]
+source = ["backend"]
+branch = true
+
+[tool.coverage.report]
+fail_under = 90
+show_missing = true
+skip_covered = true
+
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "W"]
+
+[tool.ruff.lint.mccabe]
+max-complexity = 15
+
+[tool.mypy]
+python_version = "3.12"
+check_untyped_defs = true
+warn_unused_ignores = true
+no_implicit_optional = true
+plugins = ["pydantic.mypy"]

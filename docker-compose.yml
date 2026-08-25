@@ -1,0 +1,111 @@
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    image: gold-bot-backend:local
+    container_name: gold-bot-backend
+    env_file:
+      - .env
+    environment:
+      TZ: Asia/Shanghai
+      GB_APP_ENV: production
+      GB_APP_SERVER_HOST: 0.0.0.0
+      GB_APP_SERVER_PORT: 8000
+      GB_EA_STORE_POSTGRES_DSN: ${GB_EA_STORE_POSTGRES_DSN:-${DSN:-}}
+      GB_EA_STORE_SQLITE_PATH: ${GB_EA_STORE_SQLITE_PATH:-/code/data/gold_bolt.sqlite}
+      GB_ADMIN_TOKEN: ${GB_ADMIN_TOKEN:-${ADMIN_TOKEN:-}}
+      GB_NODE_SHADOW_MODE: "false"
+      GB_REDIS_URL: redis://redis:6379
+      REDIS_URL: redis://redis:6379
+      GOLDBOT_API_URL: http://backend:8000
+    ports:
+      - "127.0.0.1:8880:8000"
+    volumes:
+      - ./data:/code/data
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz')",
+        ]
+      interval: 30s
+      timeout: 5s
+      start_period: 15s
+      retries: 3
+    restart: unless-stopped
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    image: gold-bot-frontend:local
+    container_name: gold-bot-frontend
+    ports:
+      - "127.0.0.1:8080:80"
+    depends_on:
+      backend:
+        condition: service_healthy
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    container_name: gold-bot-redis
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      start_period: 5s
+      retries: 3
+    mem_limit: 256m
+    restart: unless-stopped
+    volumes:
+      - redis-data:/data
+
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: gold-bot-prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--storage.tsdb.retention.time=30d"
+      - "--web.console.libraries=/usr/share/prometheus/console_libraries"
+      - "--web.console.templates=/usr/share/prometheus/consoles"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./alerts.yml:/etc/prometheus/alerts.yml:ro
+      - prometheus_data:/prometheus
+    ports:
+      - "127.0.0.1:9090:9090"
+    restart: unless-stopped
+    depends_on:
+      backend:
+        condition: service_healthy
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: gold-bot-grafana
+    environment:
+      - GF_SECURITY_ADMIN_USER=${GRAFANA_USER:-admin}
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_PASSWORD:-admin}
+      - GF_USERS_ALLOW_SIGN_UP=false
+      - GF_SERVER_ROOT_URL=http://localhost:9092
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning
+      - ./grafana/dashboards:/var/lib/grafana/dashboards
+    ports:
+      - "127.0.0.1:9092:3000"
+    restart: unless-stopped
+    depends_on:
+      - prometheus
+
+volumes:
+  prometheus_data:
+  grafana_data:
+  redis-data:

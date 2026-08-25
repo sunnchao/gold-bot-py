@@ -1,0 +1,49 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  backend:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.12"
+          version: "latest"
+      - name: Sync dependencies
+        run: uv sync --frozen
+      - name: Lint
+        run: uv run ruff check src tests ../scripts
+      - name: Type check
+        run: uv run mypy src
+      - name: Tests (L1-L4, skip slow)
+        run: uv run pytest
+      - name: Contract tests (L2)
+        run: uv run pytest -m contract
+
+  frontend:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: Install
+        run: npm ci
+      - name: Lint
+        run: npm run lint
+      - name: Unit tests (L6)
+        run: npm test
+      - name: Build
+        run: npm run build
