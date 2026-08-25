@@ -303,9 +303,14 @@ def _register_ea_endpoints(app: FastAPI) -> None:
 
     async def _run_ea(request: Request) -> Response:
         # 镜像 TS handleEaRoute:EA 兼容端点接受任意方法(只要 JSON body 有效,如 GET /poll)
+        request_payload = await _request_dict(request)
+        # /api 前缀兼容(迁移前 EA/网关指向 /api/tick 等):还原为根路径再分发,
+        # handle_ea_route 按 request["path"] 分支,带前缀会落入 404。
+        if request_payload["path"].startswith("/api/"):
+            request_payload["path"] = request_payload["path"][len("/api"):]
         return _translate(
             await handle_ea_route(
-                await _request_dict(request),
+                request_payload,
                 {
                     "valid_tokens": app.state.valid_tokens,
                     "token_accounts": app.state.token_accounts,
@@ -327,9 +332,12 @@ def _register_ea_endpoints(app: FastAPI) -> None:
             )
         )
 
-    # 先注册各 EA 兼容端点的全方法路由(GET /poll 等,镜像 TS 不限制 method)
+    # 先注册各 EA 兼容端点的全方法路由(GET /poll 等,镜像 TS 不限制 method)。
+    # 同时注册 /api 前缀别名,兼容仍发 /api/* 的 EA 客户端(旧栈网关前缀)。
+    # 只注册精确路径,不做 /api/{ea_path} 泛化兜底,以免遮蔽 admin 的 /api POST 路由。
     for _ea_path in EA_COMPAT_ENDPOINTS:
         app.add_api_route(_ea_path, _run_ea, methods=_EA_ROUTE_METHODS, include_in_schema=False)
+        app.add_api_route("/api" + _ea_path, _run_ea, methods=_EA_ROUTE_METHODS, include_in_schema=False)
 
     # POST 单段兜底(镜像 TS routeRequest):未知 POST 路径落 404 not found 信封。
     # 未知非 POST 单段路径(GET /not-found 等)不注册任何路由,由

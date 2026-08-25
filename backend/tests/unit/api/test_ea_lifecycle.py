@@ -295,3 +295,43 @@ async def test_poll_returns_queued_commands() -> None:
     assert body["status"] == "OK"
     assert body["count"] == 1
     assert body["commands"][0]["action"] == "close"
+
+
+async def test_api_prefixed_ea_endpoints_are_supported() -> None:
+    """/api 前缀兼容(旧栈 EA/网关指向 /api/tick 等):行为与根路径一致并正常落库。"""
+    client, store = make_app(
+        now_unix=lambda: 1772342400,
+        now_iso=lambda: "2026-03-01T00:00:00.000Z",
+    )
+    accepted = client.post(
+        "/api/tick",
+        json={"account_id": "90011087", "bid": 3335.55, "ask": 3335.75, "spread": 21, "max_spread": 25},
+    )
+    assert accepted.status_code == 200
+    assert accepted.json() == {"status": "OK"}
+    tick = await store.get_latest_tick("90011087", "XAUUSD")
+    assert tick is not None and tick["bid"] == 3335.55
+
+    for path, status in {
+        "/register": 200,
+        "/heartbeat": 200,
+        "/bars": 200,
+        "/positions": 200,
+        "/poll": 200,
+        "/order_result": 400,  # 缺 command_id/result
+    }.items():
+        response = client.post("/api" + path, json={"account_id": "90011087"})
+        assert response.status_code == status, path
+
+    # 非 POST 方法同样支持(GET /api/poll 镜像 GET /poll)
+    poll = client.request("GET", "/api/poll", json={"account_id": "90011087"})
+    assert poll.status_code == 200
+    assert poll.json() == {"status": "OK", "commands": [], "count": 0}
+
+
+async def test_api_prefixed_ea_endpoints_require_valid_token() -> None:
+    client, _store = make_app(valid_tokens={"route-token"}, token_accounts={}, admin_tokens=set())
+    for path in ["/register", "/heartbeat", "/tick", "/bars", "/positions", "/poll", "/order_result"]:
+        response = client.post("/api" + path, json={"account_id": "90011087"})
+        assert response.status_code == 401, path
+        assert response.json() == {"status": "ERROR", "message": "invalid token"}, path
