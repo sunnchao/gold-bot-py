@@ -85,6 +85,19 @@ async def test_version_check_requires_token(tmp_path: Path) -> None:
     assert ok.json() == {"latest_version": "1.2.3", "latest_build": 45, "force_update": False}
 
 
+async def test_api_prefixed_version_check_matches_root_behavior(tmp_path: Path) -> None:
+    """/api 前缀兼容(旧栈 EA/网关指向 /api/version_check):行为与根路径一致。"""
+    client = make_app(release_root_with(tmp_path), valid_tokens={ROUTE_TOKEN})
+
+    no_token = client.post("/api/version_check", json={})
+    assert no_token.status_code == 401
+    assert no_token.json() == {"status": "ERROR", "message": "invalid token"}
+
+    ok = client.post("/api/version_check", json={}, headers={"X-API-Token": ROUTE_TOKEN})
+    assert ok.status_code == 200
+    assert ok.json() == {"latest_version": "1.2.3", "latest_build": 45, "force_update": False}
+
+
 async def test_download_requires_token_and_returns_file_bytes(tmp_path: Path) -> None:
     root = release_root_with(tmp_path)
     (root / MT4_DIR / "GoldBolt_Client.mq4").write_text("// EA source", encoding="utf-8")

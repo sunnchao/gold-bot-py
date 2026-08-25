@@ -486,7 +486,9 @@ def _register_service_endpoints(app: FastAPI) -> None:
 
     # 镜像 TS routeRequest:path === '/version_check' 分支不做 method 限制(任意方法均可,
     # 只要带 route token) → 与 GET 一样注册全方法。
+    # /api 前缀别名:兼容旧栈 EA/网关指向 /api/version_check。
     @app.api_route("/version_check", methods=["GET", "POST", "PUT", "PATCH", "DELETE"])
+    @app.api_route("/api/version_check", methods=["GET", "POST", "PUT", "PATCH", "DELETE"])
     async def version_check(request: Request) -> Response:
         token_guard = require_route_token_js(app.state, request)
         if token_guard is not None:
