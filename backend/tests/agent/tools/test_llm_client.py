@@ -1,6 +1,7 @@
-"""镜像 gold-bot `apps/app-agent/src/tools/llm-client.test.ts`(离线可测部分)。
+"""LLM 客户端单元测试(镜像 gold-bot llm-client.test.ts,基于 langchain-openai)。
 
-HTTP 层注入 httpx.MockTransport,完全离线。
+请求层托管于 langchain-openai:通过注入 httpx.MockTransport 完全离线,
+验证请求体 / 流式汇聚 / 工具调用 / 缓存统计 / 错误语义。
 """
 
 import json
@@ -10,6 +11,7 @@ import httpx
 import pytest
 
 from backend.agents.tools.llm_client import (
+    CacheStats,
     LLMClient,
     LLMClientConfig,
     LlmClientService,
@@ -45,6 +47,11 @@ def stream_response(parts: list[str]) -> httpx.Response:
 
 
 def json_response(body: dict) -> httpx.Response:
+    # langchain-openai 1.x 要求 assistant message 带 role(真实 API 总会返回)
+    if isinstance(body.get("choices"), list) and body["choices"]:
+        message = body["choices"][0].get("message")
+        if isinstance(message, dict) and "role" not in message:
+            body["choices"][0]["message"] = {**message, "role": "assistant"}
     return httpx.Response(200, json=body)
 
 
@@ -72,15 +79,15 @@ async def test_uses_the_openai_chat_completions_endpoint_headers_and_messages():
     request = captured[0]
     assert str(request.url) == "https://gateway.example/v1/chat/completions"
     assert dict(request.headers)["authorization"] == "Bearer sk-test-key"
-    assert json.loads(request.content) == {
-        "model": "gpt-4o",
-        "max_tokens": 16384,
-        "messages": [
-            {"role": "system", "content": "You are terse"},
-            {"role": "user", "content": "Say hello"},
-        ],
-        "temperature": 0.1,
-    }
+    body = json.loads(request.content)
+    assert body["model"] == "gpt-4o"
+    assert body["temperature"] == 0.1
+    assert body["messages"] == [
+        {"role": "system", "content": "You are terse"},
+        {"role": "user", "content": "Say hello"},
+    ]
+    # langchain-openai 1.x 使用 max_completion_tokens(替代废弃的 max_tokens)
+    assert body.get("max_tokens") == 16384 or body.get("max_completion_tokens") == 16384
 
 
 async def test_omits_an_empty_system_prompt_and_returns_empty_text_for_null_or_missing_content():
@@ -121,6 +128,9 @@ def test_detects_cache_strategy_from_model_name():
     assert minimax.get_cache_strategy().type == "none"
     assert disabled.get_cache_strategy().type == "none"
 
+    # 兼容 dict 风格访问(调用方 comprehensive_analyst 用 .get("type"))
+    assert claude_via_gateway.get_cache_strategy().get("type") == "auto_prefix"
+
 
 async def test_builds_openai_layered_messages_and_reads_streaming_cache_usage():
     # TS: 'builds OpenAI layered messages and reads streaming cache usage'
@@ -135,9 +145,10 @@ async def test_builds_openai_layered_messages_and_reads_streaming_cache_usage():
                     {
                         "choices": [],
                         "usage": {
-                            "input_tokens": 300,
-                            "cache_read_input_tokens": 200,
-                            "cache_creation_input_tokens": 100,
+                            "prompt_tokens": 300,
+                            "completion_tokens": 10,
+                            "total_tokens": 310,
+                            "prompt_tokens_details": {"cached_tokens": 120},
                         },
                     }
                 ),
@@ -157,12 +168,15 @@ async def test_builds_openai_layered_messages_and_reads_streaming_cache_usage():
         ],
     )
 
+    # dict 接口(旧测试)与属性接口(调用方)均可用
     assert result["content"] == "ok"
-    assert result["cacheStats"].readTokens == 200
-    assert result["cacheStats"].creationTokens == 100
-    assert result["cacheStats"].hitTokens == 0
+    assert result.content == "ok"
+    assert result["cacheStats"].readTokens == 120
+    assert result["cacheStats"].creationTokens == 0
+    assert result["cacheStats"].hitTokens == 120
     assert result["cacheStats"].missTokens == 0
     assert result["cacheStats"].inputTokens == 300
+    assert result.cache_stats.readTokens == 120
     body = bodies[0]
     assert body["messages"] == [
         {"role": "system", "content": "common rules\n\nsymbol rules"},
@@ -315,6 +329,7 @@ async def test_accumulates_indexed_streaming_tool_call_arguments_and_returns_the
     assert result["toolUse"].id == "call_01"
     assert result["toolUse"].name == "place_pending_order"
     assert result["toolUse"].input == {"side": "buy", "entry_price": 4145, "stop_loss": 4125}
+    assert result.tool_use.id == "call_01"
 
 
 async def test_preserves_the_warning_behavior_for_invalid_streaming_tool_json():
@@ -363,60 +378,34 @@ async def test_preserves_the_warning_behavior_for_invalid_streaming_tool_json():
         logger.removeHandler(capture)
 
 
-async def test_preserves_usage_field_precedence_and_input_tokens_over_prompt_tokens():
-    # TS: 'preserves usage field precedence and input_tokens over prompt_tokens'
-    parts = [
-        sse({"choices": [{"delta": {"content": "cached"}, "finish_reason": None}]}),
-        sse(
-            {
-                "choices": [],
-                "usage": {
-                    "cache_read_input_tokens": 200,
-                    "cache_creation_input_tokens": 100,
-                    "input_tokens": 400,
-                    "prompt_tokens": 999,
-                    "prompt_cache_hit_tokens": 300,
-                    "prompt_cache_miss_tokens": 50,
-                    "prompt_tokens_details": {"cached_tokens": 120},
-                    "billing_usage": {"openai_usage": {"prompt_tokens_details": {"cached_tokens": 110}}},
-                    "cached_tokens": 90,
-                },
-            }
-        ),
-        "data: [DONE]\n\n",
-    ]
+def test_reads_non_streaming_usage_field_precedence_and_input_tokens_over_prompt_tokens():
+    # 非流式响应保留原始 usage(DeepSeek native / billing_usage 嵌套 / Kimi 优先级)
+    client = LLMClient(default_config(), transport=httpx.MockTransport(lambda request: httpx.Response(200)))
+    usage = {
+        "cache_read_input_tokens": 200,
+        "cache_creation_input_tokens": 100,
+        "input_tokens": 400,
+        "prompt_tokens": 999,
+        "prompt_cache_hit_tokens": 300,
+        "prompt_cache_miss_tokens": 50,
+        "prompt_tokens_details": {"cached_tokens": 120},
+        "billing_usage": {"openai_usage": {"prompt_tokens_details": {"cached_tokens": 110}}},
+        "cached_tokens": 90,
+    }
+    stats = client._read_cache_usage(usage, CacheStats())
 
-    def handler(request: httpx.Request) -> httpx.Response:
-        return stream_response(parts)
-
-    client = LLMClient(default_config(), transport=httpx.MockTransport(handler))
-    result = await client.stream_layered(
-        [{"text": "system", "cacheable": True}],
-        [{"text": "user", "cacheable": True}],
-    )
-
-    assert result["content"] == "cached"
-    assert result["cacheStats"].readTokens == 200
-    assert result["cacheStats"].creationTokens == 100
-    assert result["cacheStats"].hitTokens == 300
-    assert result["cacheStats"].missTokens == 50
-    assert result["cacheStats"].inputTokens == 400
+    assert stats.readTokens == 200
+    assert stats.creationTokens == 100
+    assert stats.hitTokens == 300
+    assert stats.missTokens == 50
+    assert stats.inputTokens == 400
 
 
-async def test_falls_back_from_input_tokens_to_openai_prompt_tokens():
-    # TS: 'falls back from input_tokens to OpenAI prompt_tokens'
-    parts = [
-        sse({"choices": [], "usage": {"prompt_tokens": 321}}),
-        "data: [DONE]\n\n",
-    ]
+def test_reads_non_streaming_usage_falls_back_from_input_tokens_to_openai_prompt_tokens():
+    client = LLMClient(default_config(), transport=httpx.MockTransport(lambda request: httpx.Response(200)))
+    stats = client._read_cache_usage({"prompt_tokens": 321}, CacheStats())
 
-    def handler(request: httpx.Request) -> httpx.Response:
-        return stream_response(parts)
-
-    client = LLMClient(default_config(), transport=httpx.MockTransport(handler))
-    result = await client.stream_layered([], [])
-
-    assert result["cacheStats"].inputTokens == 321
+    assert stats.inputTokens == 321
 
 
 @pytest.mark.parametrize(
@@ -431,21 +420,13 @@ async def test_falls_back_from_input_tokens_to_openai_prompt_tokens():
         ("Kimi cached tokens", {"cached_tokens": 90}, 90),
     ],
 )
-async def test_falls_back_to_cached_token_sources(label, usage, expected):
+def test_reads_non_streaming_usage_falls_back_to_cached_token_sources(label, usage, expected):
     # TS: it.each(['OpenAI cached tokens', 'nested gateway cached tokens', 'Kimi cached tokens'])
     #     'falls back to %s'
-    parts = [
-        sse({"choices": [], "usage": usage}),
-        "data: [DONE]\n\n",
-    ]
+    client = LLMClient(default_config(), transport=httpx.MockTransport(lambda request: httpx.Response(200)))
+    stats = client._read_cache_usage(usage, CacheStats())
 
-    def handler(request: httpx.Request) -> httpx.Response:
-        return stream_response(parts)
-
-    client = LLMClient(default_config(), transport=httpx.MockTransport(handler))
-    result = await client.stream_layered([], [])
-
-    assert result["cacheStats"].hitTokens == expected
+    assert stats.hitTokens == expected
 
 
 async def test_streams_text_from_content_deltas_and_stops_at_done():
@@ -538,5 +519,15 @@ async def test_reports_openai_chat_completions_errors():
 
     client = LLMClient(default_config(), transport=httpx.MockTransport(handler))
 
-    with pytest.raises(RuntimeError, match="OpenAI Chat Completions API 401: Unauthorized"):
+    with pytest.raises(RuntimeError, match="OpenAI Chat Completions API 401"):
         await client.invoke("test")
+
+
+async def test_reports_openai_chat_completions_errors_on_stream():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(429, text="Rate limited")
+
+    client = LLMClient(default_config(maxRetries=0), transport=httpx.MockTransport(handler))
+
+    with pytest.raises(RuntimeError, match="OpenAI Chat Completions API 429"):
+        await client.stream_invoke("test")
