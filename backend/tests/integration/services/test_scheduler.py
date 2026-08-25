@@ -737,7 +737,7 @@ async def test_publishes_position_triggered_replay_signals_with_positions_analys
 # --------------------------------------------------------------------------- AI 止损
 
 
-async def test_queues_gbpjpy_ai_stop_loss_lock_profit_commands_with_atr_derived_from_h1_ohlc(monkeypatch) -> None:
+async def test_queues_gbpjpy_ai_stop_loss_lock_profit_commands_with_atr_derived_from_h1_ohlc() -> None:
     store = create_in_memory_store()
     await store.set_runtime_mode(ACCOUNT, "cutover")
     await save_tradeable_heartbeat(store)
@@ -772,7 +772,6 @@ async def test_queues_gbpjpy_ai_stop_loss_lock_profit_commands_with_atr_derived_
         store,
         lambda: "2026-04-13T08:02:00.000Z",
     )
-    monkeypatch.delenv("GB_AI_TRAIL_SYMBOLS", raising=False)
 
     await scheduler.enqueue_position_review(ACCOUNT, "GBPJPY")
     await scheduler.enqueue_position_review(ACCOUNT, "GBPJPY")
@@ -801,7 +800,8 @@ async def test_queues_gbpjpy_ai_stop_loss_lock_profit_commands_with_atr_derived_
     assert abs(commands[0]["atr"] - 0.5) < 5e-11
 
 
-async def test_does_not_queue_ai_stop_loss_commands_for_non_canary_symbols_by_default(monkeypatch, capsys) -> None:
+async def test_queues_ai_stop_loss_commands_for_any_symbol_reported_by_the_ea() -> None:
+    """白名单已移除:AI 止损跟踪对 EA 上报品种(XAUUSD 等非金丝雀品种)一律生效。"""
     store = create_in_memory_store()
     await store.set_runtime_mode(ACCOUNT, "cutover")
     await save_tradeable_heartbeat(store)
@@ -834,7 +834,7 @@ async def test_does_not_queue_ai_stop_loss_commands_for_non_canary_symbols_by_de
         }
     )
     await store.save_ai_result(
-        ACCOUNT, "XAUUSD", {"suggested_sl": 3338.8, "trade_plan": {"decision_id": "xau_disabled"}}
+        ACCOUNT, "XAUUSD", {"suggested_sl": 3338.8, "trade_plan": {"decision_id": "tpv1_modify_xau"}}
     )
     scheduler = SchedulerService(
         FakeAnalysis(lambda: {"replay": {"signal": None, "position_commands": None}}),
@@ -843,15 +843,32 @@ async def test_does_not_queue_ai_stop_loss_commands_for_non_canary_symbols_by_de
         store,
         lambda: "2026-04-13T08:02:00.000Z",
     )
-    monkeypatch.delenv("GB_AI_TRAIL_SYMBOLS", raising=False)
 
     await scheduler.enqueue_position_review(ACCOUNT, "XAUUSD")
-    assert '"reason":"symbol_ai_trail_disabled"' in capsys.readouterr().out
+    commands = await store.list_commands(ACCOUNT)
+    assert len(commands) == 1
+    assert_matches(
+        {
+            "action": "MODIFY",
+            "source": "ai_stop_loss",
+            "status": "queued",
+            "symbol": "XAUUSD",
+            "ticket": 123457,
+            "new_sl": 3338.8,
+            "sl": 3338.8,
+            "tp": 3355,
+            "old_sl": 3336,
+            "decision_id": "tpv1_modify_xau",
+            "trigger_time": "2026-04-13T08:02:00.000Z",
+            "analysis_mode": "positions",
+        },
+        commands[0],
+    )
+    assert abs(commands[0]["distance"] - 2.8) < 5e-11
+    assert abs(commands[0]["atr"] - 2) < 5e-11
 
-    assert await store.list_commands(ACCOUNT) == []
 
-
-async def test_does_not_queue_buy_ai_stop_loss_commands_that_loosen_below_the_current_stop(monkeypatch, capsys) -> None:
+async def test_does_not_queue_buy_ai_stop_loss_commands_that_loosen_below_the_current_stop(capsys) -> None:
     store = create_in_memory_store()
     await store.set_runtime_mode(ACCOUNT, "cutover")
     await save_tradeable_heartbeat(store)
@@ -900,17 +917,13 @@ async def test_does_not_queue_buy_ai_stop_loss_commands_that_loosen_below_the_cu
         store,
         lambda: "2026-04-13T08:02:00.000Z",
     )
-    monkeypatch.delenv("GB_AI_TRAIL_SYMBOLS", raising=False)
-
     await scheduler.enqueue_position_review(ACCOUNT, "GBPJPY")
     capsys.readouterr()
 
     assert await store.list_commands(ACCOUNT) == []
 
 
-async def test_suppresses_ai_stop_loss_modify_commands_for_the_same_ticket_inside_the_five_minute_cooldown(
-    monkeypatch,
-) -> None:
+async def test_suppresses_ai_stop_loss_modify_commands_for_the_same_ticket_inside_the_five_minute_cooldown() -> None:
     store = create_in_memory_store()
     await store.set_runtime_mode(ACCOUNT, "cutover")
     await save_tradeable_heartbeat(store)
@@ -960,8 +973,6 @@ async def test_suppresses_ai_stop_loss_modify_commands_for_the_same_ticket_insid
         store,
         lambda: now["value"],
     )
-    monkeypatch.delenv("GB_AI_TRAIL_SYMBOLS", raising=False)
-
     await scheduler.enqueue_position_review(ACCOUNT, "GBPJPY")
     now["value"] = "2026-04-13T08:04:00.000Z"
     await scheduler.enqueue_position_review(ACCOUNT, "GBPJPY")

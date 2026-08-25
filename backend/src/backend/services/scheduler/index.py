@@ -14,7 +14,6 @@ from __future__ import annotations
 import hashlib
 import json
 import math
-import os
 import re
 import sys
 import time
@@ -34,7 +33,6 @@ __all__ = [
 
 AI_STOP_LOSS_MODIFY_COOLDOWN_MS = 5 * 60 * 1000
 AI_STOP_LOSS_PROFIT_ATR_GATE = 1.5
-DEFAULT_AI_TRAIL_SYMBOLS = "GBPJPY"
 MODIFY_DISTANCE_EPSILON = 1e-9
 # MT4 STOPLEVEL 最小距离比例默认值(0.05%),SL/TP 离当前价比此更近会触发 error 130
 STOPLEVEL_MIN_RATIO_DEFAULT = 0.0005
@@ -50,7 +48,6 @@ AI_STOP_LOSS_SKIP_REASONS = (
     "ai_result_missing",
     "atr_le_zero",
     "price_le_zero",
-    "symbol_ai_trail_disabled",
     "not_be_or_profit_ready",
     "price_magnitude",
     "candidate_null",
@@ -424,9 +421,8 @@ class SchedulerService:
         await self._command_lifecycle.accept_candidate(account_id, candidate)
 
     async def _queue_ai_stop_loss_adjust(self, account_id: str, symbol: str) -> None:
-        if not _is_ai_stop_loss_trail_symbol_enabled(symbol):
-            self._log_ai_stop_loss_skip(account_id, symbol, "symbol_ai_trail_disabled")
-            return
+        # 对 EA 上报持仓的全部品种生效(不再有 GB_AI_TRAIL_SYMBOLS 白名单):
+        # 分析按 EA 端 /positions、/tick、/bars 载荷里的 symbol 字段执行。
         ai_result = await self._latest_ai_result(account_id, symbol)
         if ai_result is None:
             self._log_ai_stop_loss_skip(account_id, symbol, "ai_result_missing")
@@ -1034,25 +1030,6 @@ def _latest_atr(bars: list[EaRecord]) -> float:
         if _is_finite_number(value) and value > 0:
             return float(value)
     return 0
-
-
-def _is_ai_stop_loss_trail_symbol_enabled(symbol: str) -> bool:
-    return _normalize_ai_stop_loss_symbol(symbol) in _ai_trail_symbols()
-
-
-def _ai_trail_symbols() -> set[str]:
-    raw = os.environ.get("GB_AI_TRAIL_SYMBOLS")
-    if raw is None:
-        raw = DEFAULT_AI_TRAIL_SYMBOLS
-    return {
-        normalized
-        for normalized in (_normalize_ai_stop_loss_symbol(part) for part in raw.split(","))
-        if len(normalized) > 0
-    }
-
-
-def _normalize_ai_stop_loss_symbol(symbol: str) -> str:
-    return symbol.strip().upper()
 
 
 def _stoplevel_min_ratio(symbol: str) -> float:
