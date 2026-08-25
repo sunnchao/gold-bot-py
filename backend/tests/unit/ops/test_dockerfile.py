@@ -9,7 +9,7 @@ REPO_ROOT = Path(__file__).resolve().parents[4]
 
 def test_backend_image_copies_and_ships_static_dashboard() -> None:
     dockerfile = (REPO_ROOT / "backend" / "Dockerfile").read_text(encoding="utf-8")
-    assert "COPY --from=frontend /app/dist" in dockerfile
+    assert "COPY --from=frontend-build /app/dist" in dockerfile
     assert "/opt/dashboard" in dockerfile
     assert "uvicorn" in dockerfile
 
