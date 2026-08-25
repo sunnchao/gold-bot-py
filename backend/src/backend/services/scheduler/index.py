@@ -230,15 +230,18 @@ class SchedulerService:
         registration = await self._get_registration(account_id)
         threshold_pct = _max_daily_loss_pct(heartbeat, registration)
         if drawdown_pct >= threshold_pct:
+            payload = _json(
+                {
+                    "account_id": account_id,
+                    "utc_date": utc_date,
+                    "start_equity": start_equity,
+                    "equity": equity,
+                    "drawdown_pct": _to_fixed(drawdown_pct, 4),
+                    "threshold_pct": threshold_pct,
+                }
+            )
             print(
-                f"[SCHED] daily_loss_guard_blocked {_json({
-                    'account_id': account_id,
-                    'utc_date': utc_date,
-                    'start_equity': start_equity,
-                    'equity': equity,
-                    'drawdown_pct': _to_fixed(drawdown_pct, 4),
-                    'threshold_pct': threshold_pct,
-                })}",
+                f"[SCHED] daily_loss_guard_blocked {payload}",
                 file=sys.stderr,
             )
             return False
@@ -346,12 +349,15 @@ class SchedulerService:
         strategy = _string_field(signal_record, "strategy")
         heartbeat = await self._get_heartbeat(account_id)
         if _heartbeat_strategy_disabled(heartbeat, strategy):
+            payload = _json(
+                {
+                    "account_id": account_id,
+                    "symbol": symbol,
+                    "strategy": strategy,
+                }
+            )
             print(
-                f"[SCHED] signal_skipped_strategy_disabled {_json({
-                    'account_id': account_id,
-                    'symbol': symbol,
-                    'strategy': strategy,
-                })}"
+                f"[SCHED] signal_skipped_strategy_disabled {payload}",
             )
             return
         bars = await self._bars_by_timeframe(account_id, symbol)
@@ -379,15 +385,18 @@ class SchedulerService:
             )
             if allowed_lots is not None and signal_lots > allowed_lots:
                 command_lots = allowed_lots
+                payload = _json(
+                    {
+                        "account_id": account_id,
+                        "symbol": symbol,
+                        "strategy": strategy,
+                        "lots": signal_lots,
+                        "allowed_lots": allowed_lots,
+                        "clamped_lots": command_lots,
+                    }
+                )
                 print(
-                    f"[SCHED] signal_lots_clamped {_json({
-                        'account_id': account_id,
-                        'symbol': symbol,
-                        'strategy': strategy,
-                        'lots': signal_lots,
-                        'allowed_lots': allowed_lots,
-                        'clamped_lots': command_lots,
-                    })}"
+                    f"[SCHED] signal_lots_clamped {payload}",
                 )
         candidate: dict[str, Any] = {
             "command_id": command_id,
@@ -754,12 +763,15 @@ class SchedulerService:
             }
         )
         if result.get("blocked") is True:
+            payload = _json(
+                {
+                    "account_id": account_id,
+                    "symbol": symbol,
+                    "reason_codes": result.get("reason_codes"),
+                }
+            )
             print(
-                f"[SCHED] signal_blocked_by_market_filter {_json({
-                    'account_id': account_id,
-                    'symbol': symbol,
-                    'reason_codes': result.get('reason_codes'),
-                })}"
+                f"[SCHED] signal_blocked_by_market_filter {payload}",
             )
         return result
 

@@ -312,3 +312,46 @@ async def test_does_not_write_fallback_bar_insights_into_the_shared_market_cache
 
     assert calls["run_market_insight"] == 1
     assert cache.get("XAUUSD") is None
+
+
+@pytest.mark.asyncio
+async def test_non_market_first_comprehensive_analysis_wraps_analyst_result_for_publish_payload() -> None:
+    insight = build_insight()
+    calls = {"run": 0}
+
+    class FakeAnalyst:
+        async def run(self, payload_value, symbol, pending_signal, all_current_prices):
+            calls["run"] += 1
+            return insight
+
+    service = WorkflowNodes(
+        goldbot_api=SimpleNamespace(),
+        comprehensive_analyst=FakeAnalyst(),
+        publisher=SimpleNamespace(),
+        logger=SimpleNamespace(
+            info=lambda *a, **k: None,
+            warn=lambda *a, **k: None,
+            error=lambda *a, **k: None,
+        ),
+        config=SimpleNamespace(market_first_enabled=False),
+        bar_source=None,
+        market_insight_cache=None,
+    )
+
+    result = await service.comprehensive_analysis(
+        {
+            "accountId": "81124211",
+            "symbol": "XAUUSD",
+            "symbols": ["XAUUSD"],
+            "timestamp": "2026-08-12T00:00:00.000Z",
+            "payloads": {"XAUUSD": payload("XAUUSD")},
+            "pendingSignals": {},
+            "logs": [],
+            "errors": [],
+        }
+    )
+
+    assert calls["run"] == 1
+    assert "errors" not in result
+    assert result["comprehensiveAnalyses"]["XAUUSD"]["arbitration"].final_direction == "buy"
+    assert result["arbitrations"]["XAUUSD"].final_direction == "buy"

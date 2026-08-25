@@ -20,7 +20,7 @@ services:
       REDIS_URL: redis://gold-bot-redis:6379
       GOLDBOT_API_URL: http://gold-bot-backend:8000
     ports:
-      - "127.0.0.1:8880:8000"
+      - "127.0.0.1:8881:8000"
     volumes:
       - ./data:/code/data
     healthcheck:
@@ -37,20 +37,20 @@ services:
       retries: 3
     restart: unless-stopped
     networks:
-      - gold-bot_default
+      - 1panel-network
 
   frontend:
     image: ${GOLDBOT_FRONTEND_IMAGE:-ghcr.io/sunnchao/gold-bot-py-frontend:latest}
     pull_policy: always
     container_name: gold-bot-frontend
     ports:
-      - "127.0.0.1:8080:80"
+      - "127.0.0.1:8880:80"
     depends_on:
       backend:
         condition: service_healthy
     restart: unless-stopped
     networks:
-      - gold-bot_default
+      - 1panel-network
 
   redis:
     image: redis:7-alpine
@@ -66,7 +66,7 @@ services:
     volumes:
       - redis-data:/data
     networks:
-      - gold-bot_default
+      - 1panel-network
 
   prometheus:
     image: prom/prometheus:latest
@@ -85,7 +85,7 @@ services:
       - "127.0.0.1:9090:9090"
     restart: unless-stopped
     networks:
-      - gold-bot_default
+      - 1panel-network
 
   grafana:
     image: grafana/grafana:latest
@@ -103,7 +103,7 @@ services:
       - "127.0.0.1:9092:3000"
     restart: unless-stopped
     networks:
-      - gold-bot_default
+      - 1panel-network
 
 volumes:
   prometheus_data:
@@ -111,5 +111,5 @@ volumes:
   redis-data:
 
 networks:
-  gold-bot_default:
-    driver: bridge
+  1panel-network:
+    external: true

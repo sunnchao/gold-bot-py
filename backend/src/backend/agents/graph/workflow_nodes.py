@@ -435,7 +435,7 @@ class WorkflowNodes:
                     (state.get("pendingSignals") or {}).get(symbol),
                     all_current_prices,
                 )
-                entries.append((symbol, as_dict_shallow(result)))
+                entries.append((symbol, {"result": as_dict_shallow(result)}))
 
             return self._analysis_result_payload(state, entries, market_first=False)
         except Exception as err:  # noqa: BLE001

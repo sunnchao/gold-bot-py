@@ -21,7 +21,8 @@ import json
 import os
 import re
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
+from dataclasses import fields, is_dataclass
 from datetime import datetime
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -50,6 +51,27 @@ FetchResponse = Any
 
 FetchCallable = Callable[..., Awaitable[FetchResponse]]
 """fetch(url, method=..., headers=..., body=...) 异步回调。"""
+
+
+def _json_compatible(value: Any) -> Any:
+    """Recursively normalize dataclass / Pydantic / mapping values for JSON publishing."""
+    if hasattr(value, "model_dump"):
+        return _json_compatible(value.model_dump())
+    if is_dataclass(value):
+        return {field.name: _json_compatible(getattr(value, field.name)) for field in fields(value)}
+    if isinstance(value, Mapping):
+        return {str(key): _json_compatible(val) for key, val in value.items()}
+    if isinstance(value, list):
+        return [_json_compatible(item) for item in value]
+    if isinstance(value, tuple):
+        return [_json_compatible(item) for item in value]
+    return value
+
+
+def _json_dict(value: Any) -> JSONDict:
+    """Normalize signal values to a JSON-compatible dict for API + card publishing."""
+    payload = _json_compatible(value)
+    return payload if isinstance(payload, dict) else dict(payload)
 
 
 async def _default_fetch(*args: Any, **kwargs: Any) -> FetchResponse:
@@ -503,8 +525,9 @@ class PublisherService:
     async def post_to_goldbot(self, account_id: str, symbol: str, result: JSONDict) -> None:
         """镜像 postToGoldbot:将结果以 AISignalResult 发布到金标 API。"""
         logger = get_logger()
+        payload = _json_dict(result)
         logger.info({"accountId": account_id, "symbol": symbol}, "Publisher: posting to Goldbot API")
-        await self.goldbot_api.post_ai_result(account_id, symbol, result)
+        await self.goldbot_api.post_ai_result(account_id, symbol, payload)
         logger.info({"accountId": account_id, "symbol": symbol}, "Publisher: Goldbot API post successful")
 
     def send_feishu_card(self, account_id: str, symbol: str, result: JSONDict) -> Awaitable[None]:
@@ -530,12 +553,13 @@ class PublisherService:
 
     async def _send_feishu_card_now(self, account_id: str, symbol: str, result: JSONDict) -> None:
         logger = get_logger()
+        payload = _json_dict(result)
         webhook_url = self._webhook_url if self._webhook_url is not None else os.environ.get("FEISHU_WEBHOOK_URL")
         if not webhook_url:
             logger.warn({}, "Publisher: FEISHU_WEBHOOK_URL not set, skipping Feishu notification")
             return
 
-        card = build_feishu_card(account_id, symbol, result)
+        card = build_feishu_card(account_id, symbol, payload)
 
         secret = self._secret if self._secret is not None else os.environ.get("FEISHU_WEBHOOK_SECRET")
         if secret:
@@ -606,15 +630,16 @@ class PublisherService:
     async def publish(self, account_id: str, symbol: str, result: JSONDict, skip_feishu: bool = False) -> None:
         """镜像 publish:并发发布;全部目标失败时抛错。"""
         logger = get_logger()
+        payload = _json_dict(result)
         logger.info(
-            {"accountId": account_id, "symbol": symbol, "bias": result.get("bias")},
+            {"accountId": account_id, "symbol": symbol, "bias": payload.get("bias")},
             "Publisher: publishing result",
         )
 
-        operations: list[Awaitable[None]] = [self.post_to_goldbot(account_id, symbol, result)]
+        operations: list[Awaitable[None]] = [self.post_to_goldbot(account_id, symbol, payload)]
         if not skip_feishu:
             logger.info({"accountId": account_id, "symbol": symbol}, "Publisher: sending Feishu card")
-            operations.append(self.send_feishu_card(account_id, symbol, result))
+            operations.append(self.send_feishu_card(account_id, symbol, payload))
 
         outcomes = await asyncio.gather(*operations, return_exceptions=True)
 

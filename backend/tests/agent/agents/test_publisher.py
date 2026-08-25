@@ -310,3 +310,29 @@ async def test_build_feishu_card_adds_sign_timestamp_when_secret_provided():
     card = build_feishu_card("acc-001", "XAUUSD", create_signal())  # smoke: builds without error
     assert card["msg_type"] == "interactive"
     assert "card" in card
+
+
+async def test_publish_accepts_dataclass_signal_results_and_posts_dict_payload():
+    from backend.agents.types.agent import AISignalResult
+
+    api = FakeGoldbotApi()
+    service = PublisherService(
+        api,
+        webhook_url="https://feishu.example/webhook",
+        fetch=FakeFetchRecorder([FakeResponse({"code": 0, "msg": "ok"})]),
+    )
+    signal = AISignalResult(
+        bias="bullish",
+        confidence=80,
+        exit_suggestion="hold",
+        risk_alert=False,
+        arbitration={"direction": "buy", "action": "open", "reasoning": "test"},
+    )
+
+    await service.publish("acc-001", "XAUUSD", signal)
+
+    assert len(api.posted) == 1
+    _, _, payload = api.posted[0]
+    assert isinstance(payload, dict)
+    assert payload["bias"] == "bullish"
+    assert payload["arbitration"]["action"] == "open"
