@@ -73,6 +73,16 @@ async def test_poll_method_not_allowed() -> None:
     assert response.json() == {"status": "ERROR", "message": "method not allowed"}
 
 
+async def test_poll_accepts_api_prefixed_alias() -> None:
+    client = make_app()
+    response = client.post("/api/visual/poll", json=poll_body(), headers=headers())
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "ok"
+    assert body["account_id"] == ACCOUNT_ID
+    assert body["symbol"] == SYMBOL
+
+
 async def test_poll_returns_default_tick_and_empty_ai_when_nothing_stored() -> None:
     client = make_app()
     response = client.post("/visual/poll", json=poll_body(), headers=headers())

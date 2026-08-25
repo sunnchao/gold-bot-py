@@ -388,11 +388,15 @@ def _register_ea_endpoints(app: FastAPI) -> None:
             )
         )
 
-    @app.api_route("/visual/poll", methods=["POST", "GET"])
-    async def visual_poll(request: Request) -> Response:
+    async def _run_visual_poll(request: Request) -> Response:
+        request_payload = await _request_dict(request)
+        # /api 前缀兼容:旧网关/前端仍可能请求 /api/visual/poll,但 legacy
+        # handle_visual_route 按 /visual/poll 精确分支。
+        if request_payload["path"] == "/api/visual/poll":
+            request_payload["path"] = "/visual/poll"
         return _translate(
             await handle_visual_route(
-                await _request_dict(request),
+                request_payload,
                 {
                     "store": app.state.store,
                     "now_iso": app.state.now_iso,
@@ -403,6 +407,11 @@ def _register_ea_endpoints(app: FastAPI) -> None:
                 },
             )
         )
+
+    @app.api_route("/visual/poll", methods=["POST", "GET"])
+    @app.api_route("/api/visual/poll", methods=["POST", "GET"])
+    async def visual_poll(request: Request) -> Response:
+        return await _run_visual_poll(request)
 
     @app.api_route("/indicator_alert/{indicator_path}", methods=["POST", "GET"])
     async def indicator_alert(indicator_path: str, request: Request) -> Response:
