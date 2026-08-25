@@ -40,6 +40,7 @@ from backend.persistence.records import (
 from backend.persistence.store import (
     EaStore,
     create_in_memory_store,
+    create_postgres_store,
     create_sqlite_store,
     persistence_status,
 )
@@ -79,6 +80,7 @@ __all__ = [
     "StoredApiTokenInput",
     "StoredCommand",
     "create_in_memory_store",
+    "create_postgres_store",
     "create_sqlite_store",
     "is_command_source",
     "is_command_status",

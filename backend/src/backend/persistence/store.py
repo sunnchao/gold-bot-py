@@ -114,3 +114,10 @@ def create_sqlite_store(path: str) -> EaStore:
 
     run_migrations_sync(db_path=path)
     return SqliteEaStore(path)
+
+
+def create_postgres_store(dsn: str) -> EaStore:
+    """创建 PostgreSQL store;生产 DSN 存在时优先使用。"""
+    from backend.persistence.postgres_store import PostgresEaStore
+
+    return PostgresEaStore(dsn)

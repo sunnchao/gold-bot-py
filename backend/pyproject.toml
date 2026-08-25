@@ -12,6 +12,7 @@ dependencies = [
     # M1 存储层:SQLAlchemy Core + SQLite async(DDL 由 migration 文件控制,不用 ORM 建表)
     "sqlalchemy>=2.0",
     "aiosqlite>=0.20",
+    "asyncpg>=0.30",
     # M0 配置层:pydantic-settings 替代 gold-bot 的 packages/config
     "pydantic-settings>=2.6",
     # M2 观测与 SSE

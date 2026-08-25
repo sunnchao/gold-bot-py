@@ -50,6 +50,14 @@ class SqliteEaStore:
     def _connect(self) -> AsyncConnection:
         return self._engine.connect()
 
+    @property
+    def _row_order_column(self) -> str:
+        return "rowid"
+
+    @property
+    def _insert_token_account_ignore_sql(self) -> str:
+        return "INSERT OR IGNORE INTO token_accounts (token, account_id) VALUES (:token, :account)"
+
     async def _row(self, conn: AsyncConnection, sql: str, **params: Any) -> dict[str, Any] | None:
         result = await conn.execute(text(sql), params)
         mapping = result.mappings().first()
@@ -164,10 +172,11 @@ class SqliteEaStore:
                 record = await self._get_snapshot(conn, "positions", account_id_, symbol)
                 positions = record.get("positions") if record is not None else None
                 return [clone_record(p) for p in positions] if isinstance(positions, list) else []
+            row_order = self._row_order_column
             rows = await self._rows(
                 conn,
-                "SELECT payload_json FROM ea_snapshots "
-                "WHERE kind = 'positions' AND account_id = :account ORDER BY rowid ASC",
+                f"SELECT payload_json FROM ea_snapshots "
+                f"WHERE kind = 'positions' AND account_id = :account ORDER BY {row_order} ASC",
                 account=account_id_,
             )
             out: list[EaRecord] = []
@@ -285,7 +294,7 @@ class SqliteEaStore:
             rows = await self._rows(
                 conn,
                 "SELECT payload_json FROM ea_events "
-                "WHERE kind = 'order_result' AND account_id = :account ORDER BY rowid ASC",
+                f"WHERE kind = 'order_result' AND account_id = :account ORDER BY {self._row_order_column} ASC",
                 account=account_id_,
             )
             return [from_json(row["payload_json"]) for row in rows if isinstance(row.get("payload_json"), str)]
@@ -748,7 +757,7 @@ class SqliteEaStore:
     async def _next_pending_signal_id_in_sqlite(self, conn: AsyncConnection) -> int:
         rows = await self._rows(
             conn,
-            "SELECT payload_json FROM ea_events WHERE kind = 'pending_signal' ORDER BY rowid ASC",
+            f"SELECT payload_json FROM ea_events WHERE kind = 'pending_signal' ORDER BY {self._row_order_column} ASC",
         )
         max_id = 0
         for row in rows:
@@ -761,7 +770,8 @@ class SqliteEaStore:
         signal_id = int(numeric_field(signal, "id"))
         rows = await self._rows(
             conn,
-            "SELECT rowid AS row_id, payload_json FROM ea_events WHERE kind = 'pending_signal' ORDER BY rowid ASC",
+            f"SELECT {self._row_order_column} AS row_id, payload_json FROM ea_events "
+            f"WHERE kind = 'pending_signal' ORDER BY {self._row_order_column} ASC",
         )
         for row in rows:
             payload = from_json(row["payload_json"])
@@ -769,7 +779,7 @@ class SqliteEaStore:
                 await conn.execute(
                     text(
                         "UPDATE ea_events SET account_id = :account, symbol = :symbol, "
-                        "payload_json = :payload WHERE rowid = :row_id"
+                        f"payload_json = :payload WHERE {self._row_order_column} = :row_id"
                     ),
                     {
                         "account": account_id(signal),
@@ -785,10 +795,10 @@ class SqliteEaStore:
         async with self._connect() as conn:
             rows = await self._rows(
                 conn,
-                """
+                f"""
                 SELECT payload_json FROM ea_events
                 WHERE kind = 'pending_signal' AND account_id = :account AND symbol = :symbol
-                ORDER BY rowid ASC
+                ORDER BY {self._row_order_column} ASC
                 """,
                 account=account_id_,
                 symbol=symbol,
@@ -812,14 +822,15 @@ class SqliteEaStore:
         async with self._connect() as conn:
             rows = await self._rows(
                 conn,
-                "SELECT rowid AS row_id, payload_json FROM ea_events WHERE kind = 'pending_signal' ORDER BY rowid ASC",
+                f"SELECT {self._row_order_column} AS row_id, payload_json FROM ea_events "
+                f"WHERE kind = 'pending_signal' ORDER BY {self._row_order_column} ASC",
             )
             for row in rows:
                 payload = from_json(row["payload_json"])
                 if isinstance(payload, dict) and int(numeric_field(payload, "id")) == id_:
                     update_pending_signal_payload(payload, result, reason)
                     await conn.execute(
-                        text("UPDATE ea_events SET payload_json = :payload WHERE rowid = :row_id"),
+                        text(f"UPDATE ea_events SET payload_json = :payload WHERE {self._row_order_column} = :row_id"),
                         {"payload": to_json(payload), "row_id": row["row_id"]},
                     )
                     await conn.commit()
@@ -831,7 +842,8 @@ class SqliteEaStore:
         async with self._connect() as conn:
             rows = await self._rows(
                 conn,
-                "SELECT rowid AS row_id, payload_json FROM ea_events WHERE kind = 'pending_signal' ORDER BY rowid ASC",
+                f"SELECT {self._row_order_column} AS row_id, payload_json FROM ea_events "
+                f"WHERE kind = 'pending_signal' ORDER BY {self._row_order_column} ASC",
             )
             for row in rows:
                 payload = from_json(row["payload_json"])
@@ -844,7 +856,7 @@ class SqliteEaStore:
                     payload["arbitration_result"] = "timeout"
                     payload["arbitration_reason"] = "expired"
                     await conn.execute(
-                        text("UPDATE ea_events SET payload_json = :payload WHERE rowid = :row_id"),
+                        text(f"UPDATE ea_events SET payload_json = :payload WHERE {self._row_order_column} = :row_id"),
                         {"payload": to_json(payload), "row_id": row["row_id"]},
                     )
                     expired += 1
@@ -864,7 +876,7 @@ class SqliteEaStore:
             rows = await self._rows(
                 conn,
                 "SELECT payload_json FROM ea_snapshots "
-                "WHERE kind = 'ai_result' AND account_id = :account ORDER BY rowid ASC",
+                f"WHERE kind = 'ai_result' AND account_id = :account ORDER BY {self._row_order_column} ASC",
                 account=account_id_,
             )
             results: list[EaRecord] = []
@@ -896,7 +908,7 @@ class SqliteEaStore:
             await conn.execute(text("DELETE FROM token_accounts WHERE token = :token"), {"token": token["token"]})
             for account in token["accounts"]:
                 await conn.execute(
-                    text("INSERT OR IGNORE INTO token_accounts (token, account_id) VALUES (:token, :account)"),
+                    text(self._insert_token_account_ignore_sql),
                     {"token": token["token"], "account": account},
                 )
             await conn.commit()
@@ -953,10 +965,11 @@ class SqliteEaStore:
         async with self._connect() as conn:
             rows = await self._rows(
                 conn,
-                """
-                SELECT DISTINCT symbol FROM ea_snapshots
+                f"""
+                SELECT symbol FROM ea_snapshots
                 WHERE account_id = :account AND symbol <> '' AND kind IN ('tick', 'bars', 'positions')
-                ORDER BY rowid ASC
+                GROUP BY symbol
+                ORDER BY MIN({self._row_order_column}) ASC
                 """,
                 account=account_id_,
             )
