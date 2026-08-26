@@ -16,3 +16,10 @@ def create_store_from_env(env: GoldBotEnv | None = None) -> EaStore:
     if loaded.GB_EA_STORE_SQLITE_PATH.strip():
         return create_sqlite_store(loaded.GB_EA_STORE_SQLITE_PATH)
     return create_in_memory_store()
+
+
+async def ensure_store_schema(store: EaStore) -> None:
+    """Initialize schemas for stores that manage their own database migrations."""
+    ensure_schema = getattr(store, "ensure_schema", None)
+    if ensure_schema is not None:
+        await ensure_schema()

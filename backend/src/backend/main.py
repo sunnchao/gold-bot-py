@@ -8,7 +8,7 @@ from pydantic import BaseModel
 from backend.agents.runtime import create_agent_workflow
 from backend.api.app import create_api_app
 from backend.core.config import load_gold_bot_env
-from backend.core.database import create_store_from_env
+from backend.core.database import create_store_from_env, ensure_store_schema
 from backend.notifications import FeishuNotifier
 
 
@@ -52,6 +52,11 @@ if agent_token:
         }
     )
 app = create_api_app(app_options)
+
+
+@app.on_event("startup")
+async def initialize_persistence() -> None:
+    await ensure_store_schema(store)
 
 app.add_middleware(
     CORSMiddleware,
