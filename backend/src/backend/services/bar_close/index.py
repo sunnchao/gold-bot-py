@@ -42,7 +42,7 @@ class BarCloseEventService:
             return False
 
         try:
-            pending = trigger(account_id, symbol, normalized_timeframe, normalized_bar_time)
+            pending = trigger(account_id, symbol.strip().upper(), normalized_timeframe, normalized_bar_time)
         except Exception:
             self._logger.exception(
                 "bar-close trigger failed account=%s symbol=%s timeframe=%s bar_time=%s",
@@ -60,10 +60,8 @@ class BarCloseEventService:
         return True
 
     def _trigger_for(self, timeframe: str) -> AnalysisTrigger | None:
-        if timeframe == "M30":
-            return self._llm_trigger
         if timeframe == "M15":
-            return self._technical_trigger
+            return self._llm_trigger
         return None
 
     def _on_task_done(self, task: asyncio.Future[None]) -> None:

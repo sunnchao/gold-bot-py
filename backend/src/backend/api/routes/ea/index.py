@@ -592,6 +592,8 @@ async def handle_ea_route(
         _log_ea_lifecycle(deps.get("log"), "tick", parsed_body)
         return ok({"status": "OK"})
     if switch_path == "/bars":
+        parsed_body["symbol"] = helpers["symbol_default"](parsed_body).strip().upper()
+        parsed_body["timeframe"] = helpers["string_field_or_empty"](parsed_body, "timeframe").strip().upper()
         await deps["store"].save_bars(parsed_body)
         on_bars_saved = deps.get("on_bars_saved")
         if on_bars_saved is not None:

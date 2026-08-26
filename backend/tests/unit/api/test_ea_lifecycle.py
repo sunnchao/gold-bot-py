@@ -231,7 +231,7 @@ async def test_bars_and_positions_persist_with_defaults() -> None:
     assert stored[0]["order_class"] == "market"
 
 
-async def test_routes_m30_to_llm_and_m15_to_program_analysis_once_per_bar() -> None:
+async def test_routes_m15_to_llm_and_ignores_m30_once_per_bar() -> None:
     llm_calls: list[tuple[str, str, str, str]] = []
     technical_calls: list[tuple[str, str, str, str]] = []
     client, _store = make_app(
@@ -260,13 +260,29 @@ async def test_routes_m30_to_llm_and_m15_to_program_analysis_once_per_bar() -> N
     upload("M15", 1735690500)
 
     assert llm_calls == [
-        ("90011087", "XAUUSD", "M30", "1735689600"),
-        ("90011087", "XAUUSD", "M30", "1735691400"),
-    ]
-    assert technical_calls == [
         ("90011087", "XAUUSD", "M15", "1735689600"),
         ("90011087", "XAUUSD", "M15", "1735690500"),
     ]
+    assert technical_calls == []
+
+
+async def test_normalizes_m15_bar_before_triggering_llm_analysis() -> None:
+    llm_calls: list[tuple[str, str, str, str]] = []
+    client, store = make_app(llm_analysis_trigger=lambda *args: llm_calls.append(args))
+
+    response = client.post(
+        "/bars",
+        json={
+            "account_id": "90011087",
+            "symbol": " xauusd ",
+            "timeframe": " m15 ",
+            "bars": [{"time": 1735689600, "open": 1.0, "high": 1.1, "low": 0.9, "close": 1.05}],
+        },
+    )
+
+    assert response.status_code == 200
+    assert llm_calls == [("90011087", "XAUUSD", "M15", "1735689600")]
+    assert (await store.get_bars("90011087", "XAUUSD", "M15"))[0]["close"] == 1.05
 
 
 async def test_does_not_dispatch_bar_close_analysis_without_a_bar_time() -> None:
