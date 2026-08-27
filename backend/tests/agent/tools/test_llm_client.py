@@ -250,6 +250,43 @@ async def test_adds_prompt_cache_key_only_for_kimi_moonshot_strategy():
     assert "cache_control" not in json.dumps(body)
 
 
+async def test_deepseek_requests_set_reasoning_effort_high_and_disable_thinking():
+    # 老板要求:DeepSeek 模型 reasoning_effort=high,并显式关闭 thinking 输出。
+    bodies: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        bodies.append(json.loads(request.content))
+        return json_response({"choices": [{"message": {"content": "ok"}}]})
+
+    client = LLMClient(default_config(model="deepseek-v4-flash-0731"), transport=httpx.MockTransport(handler))
+    await client.invoke_layered(
+        [{"text": "system", "cacheable": True}],
+        [{"text": "user", "cacheable": False}],
+    )
+
+    body = bodies[0]
+    assert body["reasoning_effort"] == "high"
+    assert body["thinking"] == {"type": "disabled"}
+
+
+async def test_non_deepseek_requests_do_not_carry_deepseek_reasoning_fields():
+    bodies: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        bodies.append(json.loads(request.content))
+        return json_response({"choices": [{"message": {"content": "ok"}}]})
+
+    client = LLMClient(default_config(model="gpt-4o"), transport=httpx.MockTransport(handler))
+    await client.invoke_layered(
+        [{"text": "system", "cacheable": True}],
+        [{"text": "user", "cacheable": False}],
+    )
+
+    body = bodies[0]
+    assert "reasoning_effort" not in body
+    assert "thinking" not in body
+
+
 @pytest.mark.parametrize(
     ("label", "tool_choice", "expected_choice"),
     [

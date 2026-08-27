@@ -113,6 +113,11 @@ def detect_cache_strategy(model: str, enable_prompt_caching: bool) -> CacheStrat
     return CacheStrategy(type="auto_prefix")
 
 
+def _is_deepseek_model(model: str) -> bool:
+    """DeepSeek 推理模型:reasoning_effort=high + 关闭 thinking 输出。"""
+    return "deepseek" in model.lower()
+
+
 @dataclass(frozen=True)
 class LLMClientConfig:
     provider: str
@@ -223,6 +228,11 @@ class LLMClient:
         }
         if self._cache_strategy.type == "prompt_cache_key":
             params["extra_body"] = {"prompt_cache_key": "gold-analysis"}
+        if _is_deepseek_model(self._config.model):
+            extra_body = params.get("extra_body") or {}
+            extra_body["reasoning_effort"] = "high"
+            extra_body["thinking"] = {"type": "disabled"}
+            params["extra_body"] = extra_body
         if self._transport is not None:
             # httpx.MockTransport 同时实现 BaseTransport 与 AsyncBaseTransport
             params["http_client"] = httpx.Client(transport=self._transport, timeout=self._timeout)  # type: ignore[arg-type]
