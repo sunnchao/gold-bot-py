@@ -13,6 +13,10 @@ langchain-openai(ChatOpenAI),替代自研 httpx + SSE 解析:
   prompt_tokens_details.cached_tokens);非流式响应中原始 usage 完整保留在
   message.response_metadata["token_usage"],可经 _read_cache_usage 解析
   DeepSeek native / billing_usage.openai_usage 嵌套 / Kimi cached_tokens
+- fallback 模型兜底(本项目扩展,启用闲置的 LLM_FALLBACK_MODEL):请求抛错时自动
+  改用 fallback 模型重试一次;流式路径下空响应(无内容且无 tool_use)同样触发回退,
+  非流式路径仅在异常时回退(保留内容为 null 时返回空串的原语义);
+  fallback 与主模型相同(或为空)时不启用。DeepSeek 专属参数按实际请求的模型生效
 
 HTTP 层托管于 langchain-openai;测试通过注入 httpx.MockTransport 完全离线。
 """
@@ -21,8 +25,9 @@ from __future__ import annotations
 
 import importlib
 import json
+from collections.abc import Awaitable, Callable
 from dataclasses import asdict, dataclass, field, replace
-from typing import Any
+from typing import Any, TypeVar
 
 import httpx
 from langchain_openai import ChatOpenAI
@@ -50,6 +55,8 @@ __all__ = [
 DEFAULT_MAX_TOKENS = 16384
 DEFAULT_TEMPERATURE = 0.1
 LAYER_SEPARATOR = "\n\n----------------------------------------\n\n"
+
+ResponseT = TypeVar("ResponseT")
 
 CacheStrategyType = str
 # 'auto_prefix' | 'prompt_cache_key' | 'auto_prefix_unstable' | 'none'
@@ -207,6 +214,7 @@ class LLMClient:
         self._transport = transport
         self._timeout = config.timeout / 1000.0
         self._chat = self._build_chat()
+        self._fallback_chat = self._build_fallback_chat()
 
     # ------------------------------------------------------------------ 纯逻辑
 
@@ -216,9 +224,10 @@ class LLMClient:
     def get_model(self) -> str:
         return self._config.model
 
-    def _build_chat(self) -> ChatOpenAI:
+    def _build_chat(self, model: str | None = None) -> ChatOpenAI:
+        model = model or self._config.model
         params: dict[str, Any] = {
-            "model": self._config.model,
+            "model": model,
             "api_key": self._config.apiKey,
             "base_url": self._config.baseUrl,
             "temperature": DEFAULT_TEMPERATURE,
@@ -226,9 +235,9 @@ class LLMClient:
             "request_timeout": self._timeout,
             "max_retries": self._config.maxRetries,
         }
-        if self._cache_strategy.type == "prompt_cache_key":
+        if detect_cache_strategy(model, self._config.enablePromptCaching).type == "prompt_cache_key":
             params["extra_body"] = {"prompt_cache_key": "gold-analysis"}
-        if _is_deepseek_model(self._config.model):
+        if _is_deepseek_model(model):
             extra_body = params.get("extra_body") or {}
             extra_body["reasoning_effort"] = "high"
             extra_body["thinking"] = {"type": "disabled"}
@@ -238,6 +247,20 @@ class LLMClient:
             params["http_client"] = httpx.Client(transport=self._transport, timeout=self._timeout)  # type: ignore[arg-type]
             params["http_async_client"] = httpx.AsyncClient(transport=self._transport, timeout=self._timeout)
         return ChatOpenAI(**params)
+
+    def _build_fallback_chat(self) -> ChatOpenAI | None:
+        """fallback 模型与主模型相同(或为空)时不构建,避免同一模型重复请求。"""
+        fallback_model = (self._config.fallbackModel or "").strip()
+        if not fallback_model or fallback_model == self._config.model:
+            return None
+        return self._build_chat(model=fallback_model)
+
+    def _chat_chain(self) -> list[tuple[str, ChatOpenAI]]:
+        """按优先级排列的 (model, client):主模型在前,fallback 模型在后。"""
+        chain: list[tuple[str, ChatOpenAI]] = [(self._config.model, self._chat)]
+        if self._fallback_chat is not None:
+            chain.append((self._config.fallbackModel, self._fallback_chat))
+        return chain
 
     def _build_messages(self, prompt: str, system_message: str | None = None) -> list[dict[str, str]]:
         messages: list[dict[str, str]] = []
@@ -292,13 +315,13 @@ class LLMClient:
             return choice_type
         return "auto"
 
-    def _with_tools(self, opts: dict[str, Any]) -> Any:
+    def _with_tools(self, chat: ChatOpenAI, opts: dict[str, Any]) -> Any:
         """bind_tools 返回 Runnable,仍提供 astream/ainvoke,标注 Any 便于调用。"""
         tools = opts.get("tools")
         if not tools or len(tools) == 0:
-            return self._chat
+            return chat
         openai_tools = self._to_openai_tools(tools)
-        return self._chat.bind_tools(openai_tools, tool_choice=self._resolve_tool_choice(opts))
+        return chat.bind_tools(openai_tools, tool_choice=self._resolve_tool_choice(opts))
 
     # ------------------------------------------------------------------ usage
 
@@ -424,25 +447,72 @@ class LLMClient:
 
     # ------------------------------------------------------------------ 对外方法
 
+    async def _run_with_fallback(
+        self,
+        label: str,
+        run: Callable[[str, ChatOpenAI], Awaitable[ResponseT]],
+        *,
+        is_empty: Callable[[Any], bool] | None = None,
+    ) -> ResponseT:
+        """按 主模型 → fallback 模型 顺序执行同一请求。
+
+        - 请求抛错:记 warn 日志后尝试下一个模型;最后一个模型的异常原样抛出
+        - 空结果(可选 is_empty 判定,仅流式路径传入):非最后一个模型时尝试下一个
+        - 最后一个模型的结果总是采纳(含空结果,交由调用方兜底)
+        """
+        logger = get_logger()
+        chain = self._chat_chain()
+        result: ResponseT | None = None
+        for index, (model, chat) in enumerate(chain):
+            is_last = index == len(chain) - 1
+            try:
+                result = await run(model, chat)
+            except Exception as err:
+                logger.warn({"model": model, "err": str(err)}, f"{label}: request failed")
+                if is_last:
+                    raise
+                continue
+            if not is_last and result is not None and is_empty is not None and is_empty(result):
+                logger.warn(
+                    {"model": model, "fallbackModel": chain[index + 1][0]},
+                    f"{label}: empty result, retrying with fallback model",
+                )
+                continue
+            return result
+        raise RuntimeError("unreachable: chat chain is never empty")
+
     async def invoke(self, prompt: str, system_message: str | None = None) -> str:
-        """非流式 invoke:发送单次 Chat Completions 请求返回完整文本。"""
+        """非流式 invoke:发送 Chat Completions 请求返回文本;请求异常时回退 fallback 模型。
+
+        内容为 null/缺失时仍按原语义返回空串,不触发回退。
+        """
         messages = self._build_messages(prompt, system_message)
+        return await self._run_with_fallback(
+            "invoke",
+            lambda _model, chat: self._invoke_text(chat, messages),
+        )
+
+    async def _invoke_text(self, chat: Any, messages: list[dict[str, str]]) -> str:
         try:
-            message = await self._chat.ainvoke(messages)
+            message = await chat.ainvoke(messages)
         except APIStatusError as err:
             raise self._rethrow(err) from err
         content = message.content
         return content if isinstance(content, str) else ""
 
     async def stream_invoke(self, prompt: str, system_message: str | None = None) -> str:
-        """流式 invoke:收集 OpenAI Chat Completions SSE 文本块。"""
+        """流式 invoke:收集 OpenAI Chat Completions SSE 文本块;异常或空响应时回退 fallback 模型。"""
         messages = self._build_messages(prompt, system_message)
-        return await self._stream_text(messages)
+        return await self._run_with_fallback(
+            "streamInvoke",
+            lambda _model, chat: self._stream_text(chat, messages),
+            is_empty=lambda text: text.strip() == "",
+        )
 
-    async def _stream_text(self, messages: list[dict[str, str]]) -> str:
+    async def _stream_text(self, chat: Any, messages: list[dict[str, str]]) -> str:
         parts: list[str] = []
         try:
-            async for chunk in self._chat.astream(messages, stream_options={"include_usage": True}):
+            async for chunk in chat.astream(messages, stream_options={"include_usage": True}):
                 if isinstance(chunk.content, str) and chunk.content:
                     parts.append(chunk.content)
         except APIStatusError as err:
@@ -455,19 +525,33 @@ class LLMClient:
         user_layers: list[UserLayer],
         opts: dict[str, Any] | None = None,
     ) -> StreamResultDict:
-        """策略感知的分层流式调用:可缓存层作为独立 request messages。"""
+        """策略感知的分层流式调用:异常或空响应(无内容且无 tool_use)时回退 fallback 模型。"""
         opts = opts or {}
         messages = self._build_layered_messages(
             _as_blocks(system_blocks, SystemBlock),
             _as_blocks(user_layers, UserLayer),
         )
-        chat = self._with_tools(opts)
+        return await self._run_with_fallback(
+            "streamLayered",
+            lambda model, chat: self._stream_layered_once(model, chat, messages, opts),
+            is_empty=lambda result: result.content.strip() == "" and result.tool_use is None,
+        )
+
+    async def _stream_layered_once(
+        self,
+        model: str,
+        chat: ChatOpenAI,
+        messages: list[dict[str, str]],
+        opts: dict[str, Any],
+    ) -> StreamResultDict:
+        """单次模型的流式请求:汇总 content / tool_use / 缓存用量并按模型上报指标。"""
+        target = self._with_tools(chat, opts)
 
         content_parts: list[str] = []
         pending: dict[int, PendingToolUse] = {}
         usage: Any | None = None
         try:
-            async for chunk in chat.astream(messages, stream_options={"include_usage": True}):
+            async for chunk in target.astream(messages, stream_options={"include_usage": True}):
                 if isinstance(chunk.content, str) and chunk.content:
                     content_parts.append(chunk.content)
                 self._accumulate_tool_call_chunks(chunk, pending)
@@ -479,7 +563,7 @@ class LLMClient:
         cache_stats = self._cache_stats_from_usage_metadata(usage)
         tool_use = self._finalize_tool_use(pending)
 
-        _record_llm_cache_usage(cache_stats, self._config.model)
+        _record_llm_cache_usage(cache_stats, model)
 
         return StreamResultDict(content="".join(content_parts), cache_stats=cache_stats, tool_use=tool_use)
 
@@ -493,25 +577,30 @@ class LLMClient:
         user_messages: list[str] | list[UserLayer],
         opts: dict[str, Any] | None = None,
     ) -> str:
-        """非流式分层调用;system_message 为 str 时走旧的合并消息路径。"""
+        """非流式分层调用;请求异常时回退 fallback 模型(空内容不触发,保持原语义)。
+
+        system_message 为 str 时走旧的合并消息路径。
+        """
+        opts = opts or {}
         if isinstance(system_message, str):
             messages = self._build_messages(
                 self._combine_user_messages([str(m) for m in user_messages]),
                 system_message,
             )
-            chat = self._chat
-        else:
-            messages = self._build_layered_messages(
-                _as_blocks(system_message, SystemBlock),
-                _as_blocks(user_messages, UserLayer),
+            return await self._run_with_fallback(
+                "invokeLayered",
+                lambda _model, chat: self._invoke_text(chat, messages),
             )
-            chat = self._with_tools(opts or {})
-        try:
-            message = await chat.ainvoke(messages)
-        except APIStatusError as err:
-            raise self._rethrow(err) from err
-        content = message.content
-        return content if isinstance(content, str) else ""
+
+        messages = self._build_layered_messages(
+            _as_blocks(system_message, SystemBlock),
+            _as_blocks(user_messages, UserLayer),
+        )
+
+        async def run_with_tools(_model: str, chat: ChatOpenAI) -> str:
+            return await self._invoke_text(self._with_tools(chat, opts), messages)
+
+        return await self._run_with_fallback("invokeLayered", run_with_tools)
 
 
 def _record_llm_cache_usage(stats: CacheStats, model: str) -> None:

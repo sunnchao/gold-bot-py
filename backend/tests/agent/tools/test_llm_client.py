@@ -591,3 +591,203 @@ async def test_reports_openai_chat_completions_errors_on_stream():
 
     with pytest.raises(RuntimeError, match="OpenAI Chat Completions API 429"):
         await client.stream_invoke("test")
+
+
+async def test_invoke_falls_back_to_fallback_model_when_primary_request_fails():
+    # 主模型 500 → 自动改用 fallback 模型重试并返回其结果
+    bodies: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        bodies.append(json.loads(request.content))
+        if len(bodies) == 1:
+            return httpx.Response(500, text="boom")
+        return json_response({"choices": [{"message": {"content": "fallback ok"}}]})
+
+    client = LLMClient(default_config(maxRetries=0), transport=httpx.MockTransport(handler))
+
+    assert await client.invoke("test") == "fallback ok"
+    assert [body["model"] for body in bodies] == ["gpt-4o", "gpt-4o-mini"]
+
+
+async def test_invoke_raises_last_error_when_both_models_fail():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(500, text="boom")
+
+    client = LLMClient(default_config(maxRetries=0), transport=httpx.MockTransport(handler))
+
+    with pytest.raises(RuntimeError, match="OpenAI Chat Completions API 500"):
+        await client.invoke("test")
+
+
+async def test_no_fallback_request_when_fallback_model_equals_primary_model():
+    bodies: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        bodies.append(json.loads(request.content))
+        return httpx.Response(500, text="boom")
+
+    client = LLMClient(
+        default_config(model="gpt-4o", fallbackModel="gpt-4o", maxRetries=0),
+        transport=httpx.MockTransport(handler),
+    )
+
+    with pytest.raises(RuntimeError, match="OpenAI Chat Completions API 500"):
+        await client.invoke("test")
+    assert len(bodies) == 1
+
+
+async def test_stream_invoke_falls_back_when_primary_request_fails():
+    bodies: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        bodies.append(json.loads(request.content))
+        if len(bodies) == 1:
+            return httpx.Response(503, text="unavailable")
+        return stream_response(
+            [sse({"choices": [{"delta": {"content": "ok"}, "finish_reason": None}]}), "data: [DONE]\n\n"]
+        )
+
+    client = LLMClient(default_config(maxRetries=0), transport=httpx.MockTransport(handler))
+
+    assert await client.stream_invoke("test") == "ok"
+    assert [body["model"] for body in bodies] == ["gpt-4o", "gpt-4o-mini"]
+
+
+async def test_stream_invoke_falls_back_on_empty_content():
+    # 流式空响应(无任何内容块)视为失败,触发 fallback 模型重试
+    bodies: list[dict] = []
+    responses = iter(
+        [
+            stream_response([sse({"choices": [{"delta": {}, "finish_reason": "stop"}]}), "data: [DONE]\n\n"]),
+            stream_response(
+                [sse({"choices": [{"delta": {"content": "recovered"}, "finish_reason": None}]}), "data: [DONE]\n\n"]
+            ),
+        ]
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        bodies.append(json.loads(request.content))
+        return next(responses)
+
+    client = LLMClient(default_config(), transport=httpx.MockTransport(handler))
+
+    assert await client.stream_invoke("test") == "recovered"
+    assert [body["model"] for body in bodies] == ["gpt-4o", "gpt-4o-mini"]
+
+
+async def test_stream_layered_falls_back_on_empty_response_and_reports_per_model_metrics():
+    from backend.agents.metrics.llm_cache_metrics import llm_cache_registry, reset_llm_cache_metrics
+
+    reset_llm_cache_metrics()
+    bodies: list[dict] = []
+    responses = iter(
+        [
+            stream_response(
+                [
+                    sse({"choices": [{"delta": {}, "finish_reason": "stop"}]}),
+                    sse(
+                        {
+                            "choices": [],
+                            "usage": {"prompt_tokens": 50, "completion_tokens": 1, "total_tokens": 51},
+                        }
+                    ),
+                    "data: [DONE]\n\n",
+                ]
+            ),
+            stream_response(
+                [
+                    sse({"choices": [{"delta": {"content": "ok"}, "finish_reason": None}]}),
+                    sse(
+                        {
+                            "choices": [],
+                            "usage": {"prompt_tokens": 100, "completion_tokens": 1, "total_tokens": 101},
+                        }
+                    ),
+                    "data: [DONE]\n\n",
+                ]
+            ),
+        ]
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        bodies.append(json.loads(request.content))
+        return next(responses)
+
+    client = LLMClient(default_config(), transport=httpx.MockTransport(handler))
+    result = await client.stream_layered(
+        [{"text": "system", "cacheable": True}],
+        [{"text": "user", "cacheable": False}],
+    )
+
+    assert result.content == "ok"
+    assert [body["model"] for body in bodies] == ["gpt-4o", "gpt-4o-mini"]
+
+    # 指标按实际使用的模型分别上报
+    registry = llm_cache_registry()
+    assert registry.get_sample_value("goldbot_llm_cache_input_tokens_total", {"model": "gpt-4o"}) == 50
+    assert registry.get_sample_value("goldbot_llm_cache_input_tokens_total", {"model": "gpt-4o-mini"}) == 100
+
+
+async def test_stream_layered_keeps_tool_use_result_without_fallback():
+    # 空内容但携带合法 tool_use 属于成功结果,不触发 fallback
+    parts = [
+        sse(
+            {
+                "choices": [
+                    {
+                        "delta": {
+                            "tool_calls": [
+                                {
+                                    "index": 0,
+                                    "id": "call_01",
+                                    "function": {"name": "place_pending_order", "arguments": '{"amount":1}'},
+                                }
+                            ]
+                        },
+                        "finish_reason": None,
+                    }
+                ]
+            }
+        ),
+        sse({"choices": [{"delta": {}, "finish_reason": "tool_calls"}]}),
+        "data: [DONE]\n\n",
+    ]
+    bodies: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        bodies.append(json.loads(request.content))
+        return stream_response(parts)
+
+    client = LLMClient(default_config(), transport=httpx.MockTransport(handler))
+    result = await client.stream_layered(
+        [{"text": "system", "cacheable": True}],
+        [{"text": "user", "cacheable": False}],
+        {"tools": TRADE_ACTION_TOOLS, "toolChoice": {"type": "tool", "name": "place_pending_order"}},
+    )
+
+    assert result.tool_use is not None
+    assert result.tool_use.input == {"amount": 1}
+    assert len(bodies) == 1
+
+
+async def test_fallback_model_request_does_not_inherit_primary_model_params():
+    # DeepSeek 主模型失败 → fallback 到 gpt 模型时不得携带 DeepSeek 专属参数
+    bodies: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        bodies.append(json.loads(request.content))
+        if len(bodies) == 1:
+            return httpx.Response(500, text="boom")
+        return json_response({"choices": [{"message": {"content": "ok"}}]})
+
+    client = LLMClient(
+        default_config(model="deepseek-v4-flash-0731", fallbackModel="gpt-4o-mini", maxRetries=0),
+        transport=httpx.MockTransport(handler),
+    )
+
+    assert await client.invoke("test") == "ok"
+    assert bodies[0]["model"] == "deepseek-v4-flash-0731"
+    assert bodies[0]["reasoning_effort"] == "high"
+    assert bodies[1]["model"] == "gpt-4o-mini"
+    assert "reasoning_effort" not in bodies[1]
+    assert "thinking" not in bodies[1]
