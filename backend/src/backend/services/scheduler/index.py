@@ -645,7 +645,7 @@ class SchedulerService:
 
     async def _latest_ai_result(self, account_id: str, symbol: str) -> EaRecord | None:
         for result in await self._get_ai_results(account_id):
-            if _string_field(result, "symbol") == symbol:
+            if _string_field(result, "symbol").strip().upper() == symbol.strip().upper():
                 return result
         return None
 

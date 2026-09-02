@@ -86,12 +86,17 @@ class SqliteEaStore:
     async def _get_snapshot(
         self, conn: AsyncConnection, kind: str, account: str, symbol: str, timeframe: str = ""
     ) -> EaRecord | None:
+        # 大小写不敏感匹配:/bars 入库 upper() 而 /tick /positions 保留 EA 原样,
+        # 查询侧统一折叠,避免 GOLDM#(bars) 与 GOLDm#(tick/positions) 分裂。
         row = await self._row(
             conn,
             """
             SELECT payload_json FROM ea_snapshots
-            WHERE kind = :kind AND account_id = :account AND symbol = :symbol AND timeframe = :timeframe
-            """,
+            WHERE kind = :kind AND account_id = :account
+              AND upper(symbol) = upper(:symbol) AND timeframe = :timeframe
+            ORDER BY {order_col} ASC
+            LIMIT 1
+            """.format(order_col=self._row_order_column),
             kind=kind,
             account=account,
             symbol=symbol,
@@ -169,8 +174,22 @@ class SqliteEaStore:
     async def get_positions(self, account_id_: str, symbol: str | None = None) -> list[EaRecord]:
         async with self._connect() as conn:
             if symbol is not None and len(symbol) > 0:
-                record = await self._get_snapshot(conn, "positions", account_id_, symbol)
-                positions = record.get("positions") if record is not None else None
+                # 大小写不敏感匹配;变体并存(如 GOLDM#/GOLDm# 各存一份)时取最早
+                # 写入的快照(ORDER BY rowid LIMIT 1),避免重复持仓/选行不确定。
+                row = await self._row(
+                    conn,
+                    f"""
+                    SELECT payload_json FROM ea_snapshots
+                    WHERE kind = 'positions' AND account_id = :account
+                      AND upper(symbol) = upper(:symbol)
+                    ORDER BY {self._row_order_column} ASC
+                    LIMIT 1
+                    """,
+                    account=account_id_,
+                    symbol=symbol,
+                )
+                record = from_json(row["payload_json"]) if row is not None and isinstance(row.get("payload_json"), str) else None
+                positions = record.get("positions") if isinstance(record, dict) else None
                 return [clone_record(p) for p in positions] if isinstance(positions, list) else []
             row_order = self._row_order_column
             rows = await self._rows(
@@ -240,12 +259,18 @@ class SqliteEaStore:
         async with self._connect() as conn:
             rows = await self._rows(
                 conn,
-                """
-                SELECT ticket, tp1_hit, tp2_hit, max_profit_atr, be_moved, be_trigger_atr, best_sl,
-                       open_time, last_modify_time, add_on_count, last_add_on_time, last_add_on_price,
-                       group_id, group_avg_entry, group_best_sl, trailing_closed
-                FROM position_states WHERE account_id = :account AND symbol = :symbol
-                ORDER BY ticket ASC
+                f"""
+                SELECT p.ticket, p.tp1_hit, p.tp2_hit, p.max_profit_atr, p.be_moved, p.be_trigger_atr, p.best_sl,
+                       p.open_time, p.last_modify_time, p.add_on_count, p.last_add_on_time, p.last_add_on_price,
+                       p.group_id, p.group_avg_entry, p.group_best_sl, p.trailing_closed
+                FROM position_states p
+                WHERE p.account_id = :account AND upper(p.symbol) = upper(:symbol)
+                  AND p.{self._row_order_column} = (
+                      SELECT MIN(q.{self._row_order_column}) FROM position_states q
+                      WHERE q.account_id = p.account_id AND upper(q.symbol) = upper(p.symbol)
+                        AND q.ticket = p.ticket
+                  )
+                ORDER BY p.ticket ASC
                 """,
                 account=account_id_,
                 symbol=symbol,
@@ -258,14 +283,17 @@ class SqliteEaStore:
         async with self._connect() as conn:
             if not active_tickets:
                 await conn.execute(
-                    text("DELETE FROM position_states WHERE account_id = :account AND symbol = :symbol"),
+                    text(
+                        "DELETE FROM position_states WHERE account_id = :account AND upper(symbol) = upper(:symbol)"
+                    ),
                     {"account": account_id_, "symbol": symbol},
                 )
             else:
                 placeholders = ", ".join(f":t{i}" for i in range(len(active_tickets)))
                 await conn.execute(
                     text(
-                        f"DELETE FROM position_states WHERE account_id = :account AND symbol = :symbol "
+                        f"DELETE FROM position_states WHERE account_id = :account "
+                        f"AND upper(symbol) = upper(:symbol) "
                         f"AND ticket NOT IN ({placeholders})"
                     ),
                     {"account": account_id_, "symbol": symbol, **{f"t{i}": t for i, t in enumerate(active_tickets)}},
@@ -695,7 +723,7 @@ class SqliteEaStore:
         clauses = ["account_id = :account"]
         params: dict[str, Any] = {"account": string_field(filter_, "account_id")}
         if len(string_field(filter_, "symbol")) > 0:
-            clauses.append("symbol = :symbol")
+            clauses.append("upper(symbol) = upper(:symbol)")
             params["symbol"] = string_field(filter_, "symbol")
         if len(string_field(filter_, "status")) > 0:
             clauses.append("status = :status")
@@ -797,7 +825,7 @@ class SqliteEaStore:
                 conn,
                 f"""
                 SELECT payload_json FROM ea_events
-                WHERE kind = 'pending_signal' AND account_id = :account AND symbol = :symbol
+                WHERE kind = 'pending_signal' AND account_id = :account AND upper(symbol) = upper(:symbol)
                 ORDER BY {self._row_order_column} ASC
                 """,
                 account=account_id_,
@@ -963,21 +991,35 @@ class SqliteEaStore:
 
     async def list_symbols(self, account_id_: str) -> list[str]:
         async with self._connect() as conn:
+            # 大小写折叠去重;代表符号取首行(窗口函数 PG/SQLite 3.25+ 均支持)。
+            # 注意不能用 GROUP BY upper(symbol) 直接 SELECT symbol —— Postgres 会报
+            # "column must appear in GROUP BY",SQLite 宽松导致测试漏掉。
             rows = await self._rows(
                 conn,
                 f"""
-                SELECT symbol FROM ea_snapshots
-                WHERE account_id = :account AND symbol <> '' AND kind IN ('tick', 'bars', 'positions')
-                GROUP BY symbol
-                ORDER BY MIN({self._row_order_column}) ASC
+                SELECT symbol FROM (
+                    SELECT {self._row_order_column} AS rid, symbol,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY upper(symbol)
+                               ORDER BY {self._row_order_column} ASC
+                           ) AS rn
+                    FROM ea_snapshots
+                    WHERE account_id = :account AND symbol <> '' AND kind IN ('tick', 'bars', 'positions')
+                ) ranked
+                WHERE rn = 1
+                ORDER BY rid ASC
                 """,
                 account=account_id_,
             )
         out: list[str] = []
+        seen: set[str] = set()
         for row in rows:
             value = row["symbol"]
-            if isinstance(value, str) and len(value) > 0 and value not in out:
-                out.append(value)
+            if isinstance(value, str) and len(value) > 0:
+                key = value.upper()
+                if key not in seen:
+                    seen.add(key)
+                    out.append(value)
         return out
 
     async def list_ai_symbols(self, account_id_: str) -> list[str]:

@@ -394,7 +394,7 @@ def filter_decision_events(events: list[EaRecord], filter_: EaRecord) -> list[Ea
         e
         for e in events
         if e.get("account_id") == account
-        and (len(symbol) == 0 or e.get("symbol") == symbol)
+        and (len(symbol) == 0 or str(e.get("symbol", "")).upper() == symbol.upper())
         and (len(status) == 0 or e.get("status") == status)
     ]
     filtered.sort(key=lambda e: (e.get("created_at", ""), e.get("id", 0)), reverse=True)

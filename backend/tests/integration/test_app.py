@@ -672,6 +672,61 @@ async def test_analysis_strategy_backfill_from_comment() -> None:
     )
 
 
+async def test_analysis_payload_symbol_case_insensitive_tick_lookup() -> None:
+    """回归(81124211 GOLDm#):/bars 入库大写 GOLDM# 而 /tick 保留 EA 原样 GOLDm#,
+    workflow 用大写符号拉 payload 时必须能读到小写 tick,market_open 不得误判 closed。"""
+    client, store = make_client(now_unix=lambda: 1713000000)
+    await inject_ea_fixture(client, "register")
+    client.post(
+        "/heartbeat",
+        json={
+            "account_id": ACCOUNT_ID,
+            "balance": 10000,
+            "equity": 10000,
+            "free_margin": 9000,
+            "margin": 1000,
+            "market_open": True,
+            "is_trade_allowed": True,
+            "server_time": "2026.04.13 08:00:00",
+        },
+        headers=USER_HEADERS,
+    )
+    client.post(
+        "/tick",
+        json={
+            "account_id": ACCOUNT_ID,
+            "symbol": "GOLDm#",
+            "bid": 4325.92,
+            "ask": 4326.42,
+            "spread": 5,
+            "time": "08:00:00",
+        },
+        headers=USER_HEADERS,
+    )
+    client.post(
+        "/bars",
+        json={
+            "account_id": ACCOUNT_ID,
+            "symbol": "GOLDM#",
+            "timeframe": "H1",
+            "bars": [{"time": "2026.04.13 07:00", "open": 4320, "high": 4330, "low": 4318, "close": 4325, "volume": 100}],
+        },
+        headers=USER_HEADERS,
+    )
+
+    # workflow 触发链用大写符号(GOLDM#),EA 上报是小写 GOLDm#
+    response = client.get(f"/api/v2/analysis_payload/{ACCOUNT_ID}/GOLDM%23", headers=USER_HEADERS)
+    assert response.status_code == 200
+    body = response.json()
+    market = body.get("market") or {}
+    assert market.get("bid") == 4325.92, f"tick not found via uppercase symbol: {market}"
+    market_status = body.get("market_status") or {}
+    assert market_status.get("market_open") is True, f"market_open wrongly false: {market_status}"
+    assert market_status.get("stale") is not True
+    # H1 bars(大写入库)也能被小写符号读到
+    assert any(float(b.get("close", 0)) == 4325 for b in (body.get("bars") or {}).get("H1") or [])
+
+
 async def test_analysis_reparses_truncated_ai_strategy() -> None:
     client, store = make_client(now_unix=lambda: 1713000000)
     await inject_ea_fixture(client, "register")

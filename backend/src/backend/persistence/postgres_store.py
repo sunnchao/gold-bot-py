@@ -64,7 +64,9 @@ class PostgresEaStore(SqliteEaStore):
 
     @property
     def _row_order_column(self) -> str:
-        return "id"
+        # 生产 position_states / ea_snapshots 无 id 列(migration 0003 主键是复合键);
+        # ctid 是 PG 物理行标识,等价 SQLite rowid,用于"变体并存取最早行"的确定性排序。
+        return "ctid"
 
     @property
     def _insert_token_account_ignore_sql(self) -> str:

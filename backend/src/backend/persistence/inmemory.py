@@ -67,10 +67,19 @@ class InMemoryEaStore(EaStore):
 
     # ------------------------------------------------------------------ 快照
     def _snapshot(self, kind: str, account: str, symbol: str, timeframe: str = "") -> EaRecord | None:
-        value = self._snapshots.get((kind, account, symbol, timeframe))
-        return None if value is None else clone_record(value)
+        # 大小写不敏感匹配(与 SQLite 版一致):/bars 入库 upper 而 /tick 等保留 EA 原样
+        for key, value in self._snapshots.items():
+            if (
+                key[0] == kind
+                and key[1] == account
+                and key[2].upper() == symbol.upper()
+                and key[3] == timeframe
+            ):
+                return clone_record(value)
+        return None
 
     def _save_snapshot(self, kind: str, account: str, symbol: str, payload: EaRecord, timeframe: str = "") -> None:
+        # 存储时保留原样(读写都经大小写折叠),便于诊断时看到 EA 真实符号
         self._snapshots[(kind, account, symbol, timeframe)] = clone_record(payload)
 
     async def save_registration(self, payload: EaRecord) -> None:
@@ -115,11 +124,21 @@ class InMemoryEaStore(EaStore):
 
     async def get_positions(self, account_id_: str, symbol: str | None = None) -> list[EaRecord]:
         records: list[EaRecord] = []
-        for (kind, account, key_symbol, _), value in self._snapshots.items():
+        # 大小写折叠匹配;带 symbol 时与 SQLite 语义一致,命中多个变体快照只取
+        # 最早一个(dict 插入序 = 写入序),避免重复持仓。无 symbol 列出全部。
+        symbol_upper = symbol.upper() if symbol is not None and len(symbol) > 0 else None
+        matched: list[tuple[EaRecord, int]] = []
+        for index, ((kind, account, key_symbol, _), value) in enumerate(self._snapshots.items()):
             if kind != "positions" or account != account_id_:
                 continue
-            if symbol is not None and len(symbol) > 0 and key_symbol != symbol:
+            if symbol_upper is not None and key_symbol.upper() != symbol_upper:
                 continue
+            matched.append((value, index))
+        if not matched:
+            return []
+        if symbol_upper is not None:
+            matched = [min(matched, key=lambda pair: pair[1])]
+        for value, _index in matched:
             positions = value.get("positions")
             if isinstance(positions, list):
                 records.extend(clone_array(positions))
@@ -288,19 +307,23 @@ class InMemoryEaStore(EaStore):
         self._position_states[f"{account_id_}:{symbol}:{normalized['ticket']}"] = normalized
 
     async def load_position_states(self, account_id_: str, symbol: str) -> list[EaRecord]:
-        states = [
-            position_state_from_row(v)
-            for k, v in self._position_states.items()
-            if k.startswith(f"{account_id_}:{symbol}:")
-        ]
-        states.sort(key=lambda s: s["ticket"])
-        return states
+        # 只折叠 symbol 段;account_id 精确匹配(大小写不同的账户是不同账户)。
+        # 同 ticket 变体并存时取首个(key 插入序),与 SQL MIN(rowid) 语义一致。
+        prefix = f"{account_id_}:{symbol}:".upper()
+        by_ticket: dict[int, EaRecord] = {}
+        for k, v in self._position_states.items():
+            if not k.upper().startswith(prefix) or not k.startswith(f"{account_id_}:"):
+                continue
+            state = position_state_from_row(v)
+            by_ticket.setdefault(int(state["ticket"]), state)
+        return sorted(by_ticket.values(), key=lambda s: int(s["ticket"]))
 
     async def delete_stale_position_states(self, account_id_: str, symbol: str, active_tickets: list[int]) -> None:
         active = set(active_tickets)
+        symbol_upper = symbol.upper()
         for key in list(self._position_states.keys()):
             account, key_symbol, ticket = key.split(":")
-            if account == account_id_ and key_symbol == symbol and int(ticket) not in active:
+            if account == account_id_ and key_symbol.upper() == symbol_upper and int(ticket) not in active:
                 del self._position_states[key]
 
     # ------------------------------------------------------------------ 影子
@@ -376,13 +399,28 @@ class InMemoryEaStore(EaStore):
         return False
 
     async def get_pending_signals(self, account_id_: str, symbol: str) -> list[EaRecord]:
-        entries = self._pending_signals.get(f"{account_id_}:{symbol}", [])
+        # 大小写不敏感只作用于 symbol;account_id 精确匹配(与 SQLite 版语义对齐)。
+        prefix = f"{account_id_}:"
+        symbol_upper = symbol.upper()
+        entries = [
+            v
+            for k, vs in self._pending_signals.items()
+            if k.startswith(prefix) and k[len(prefix):].upper() == symbol_upper
+            for v in vs
+        ]
         pending = [e for e in entries if string_field(e, "status") == "pending"]
         pending.sort(key=lambda e: string_field(e, "created_at"), reverse=True)
         return [clone_record(e) for e in pending]
 
     async def get_pending_signal_by_id(self, account_id_: str, symbol: str, id_: int) -> EaRecord | None:
-        for entry in self._pending_signals.get(f"{account_id_}:{symbol}", []):
+        prefix = f"{account_id_}:"
+        symbol_upper = symbol.upper()
+        for entry in (
+            v
+            for k, vs in self._pending_signals.items()
+            if k.startswith(prefix) and k[len(prefix):].upper() == symbol_upper
+            for v in vs
+        ):
             if int(numeric_field(entry, "id")) == id_:
                 return clone_record(entry)
         return None
@@ -440,9 +478,13 @@ class InMemoryEaStore(EaStore):
 
     async def list_symbols(self, account_id_: str) -> list[str]:
         out: list[str] = []
+        seen: set[str] = set()
         for (kind, account, symbol, _), _value in self._snapshots.items():
-            if kind in ("tick", "bars", "positions") and account == account_id_:
-                self._append_unique(out, symbol)
+            if kind in ("tick", "bars", "positions") and account == account_id_ and len(symbol) > 0:
+                key = symbol.upper()
+                if key not in seen:
+                    seen.add(key)
+                    out.append(symbol)
         return out
 
     async def list_ai_symbols(self, account_id_: str) -> list[str]:

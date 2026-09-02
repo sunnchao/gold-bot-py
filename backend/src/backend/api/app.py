@@ -853,9 +853,13 @@ async def _raw_body(request: Request) -> str:
 
 
 async def _request_dict(request: Request) -> dict:
+    # scope["path"] 是网关解码后的完整路径;request.url.path 重建 URL 时会把 '#'
+    # 当 fragment 截断(GOLDM# → GOLDM),导致含 '#' 的品种(XM 微合约 GOLDm#/
+    # SILVERm#)analysis_payload / ai_result 的 symbol 静默丢失尾部。
+    path = request.scope.get("path") or request.url.path
     return {
         "method": request.method,
-        "path": request.url.path,
+        "path": path,
         "headers": {key: value for key, value in request.headers.items()},
         "url": str(request.url),
         "rawBody": await _raw_body(request),

@@ -43,7 +43,7 @@ class AnalysisService:
             (
                 result
                 for result in (await self.store.get_ai_results(account_id))
-                if _string_field(result, "symbol") == symbol
+                if _string_field(result, "symbol").strip().upper() == symbol.strip().upper()
             ),
             None,
         )

@@ -95,6 +95,62 @@ async def test_isolates_position_snapshots_by_account_and_symbol(store: EaStore)
     assert (await store.get_positions("acc-2")) == [{"ticket": 3}]
 
 
+async def test_symbol_lookup_is_case_insensitive_across_kinds(store: EaStore) -> None:
+    """回归:/bars 入库 upper() 而 /tick /positions 保留 EA 原样(如 GOLDm#),
+    查询侧必须大小写不敏感,否则 AI payload 读不到 tick → market_open=false → 静默跳过分析。"""
+    await store.save_bars(
+        {"account_id": "acc-1", "symbol": "GOLDM#", "timeframe": "H1", "bars": [{"time": "1", "close": 4325.0}]}
+    )
+    await store.save_tick({"account_id": "acc-1", "symbol": "GOLDm#", "bid": 4325.92, "ask": 4326.42})
+    await store.save_positions({"account_id": "acc-1", "symbol": "GOLDm#", "positions": [{"ticket": 9}]})
+
+    # 大写查 tick/positions(analysis_payload 触发链的实际路径)
+    tick_upper = await store.get_latest_tick("acc-1", "GOLDM#")
+    assert tick_upper is not None and tick_upper["bid"] == 4325.92
+    assert (await store.get_positions("acc-1", "GOLDM#")) == [{"ticket": 9}]
+    # 原样小写查 bars
+    assert (await store.get_bars("acc-1", "GOLDm#", "H1")) == [{"time": "1", "close": 4325.0}]
+
+    # 持仓状态同样大小写不敏感
+    await store.save_position_state("acc-1", "GOLDM#", {"ticket": 9, "tp1_hit": False})
+    states = await store.load_position_states("acc-1", "goldm#")
+    assert [s["ticket"] for s in states] == [9]
+
+    # list_symbols 去重大小写变体(返回首个出现的 EA 原样写法)
+    symbols = await store.list_symbols("acc-1")
+    assert len([s for s in symbols if s.upper() == "GOLDM#"]) == 1
+
+    # 不同品种仍隔离
+    await store.save_tick({"account_id": "acc-1", "symbol": "SILVERm#", "bid": 68.0})
+    assert (await store.get_latest_tick("acc-1", "SILVERM#")) is not None
+    assert (await store.get_latest_tick("acc-1", "XAUUSD")) is None
+
+
+async def test_variant_snapshots_coexist_read_deterministic(store: EaStore) -> None:
+    """变体并存(Codex 复核项):GOLDM# 与 GOLDm# 各存一份快照时,
+    折叠查询必须确定地取最早写入的一份,不得合并(重复持仓)或随机选行。"""
+    # positions:先 GOLDm#(EA 原样),后 GOLDM#
+    await store.save_positions({"account_id": "acc-1", "symbol": "GOLDm#", "positions": [{"ticket": 1}]})
+    await store.save_positions({"account_id": "acc-1", "symbol": "GOLDM#", "positions": [{"ticket": 2}]})
+    assert (await store.get_positions("acc-1", "GOLDM#")) == [{"ticket": 1}]
+    assert (await store.get_positions("acc-1", "goldm#")) == [{"ticket": 1}]
+    # 无 symbol 列出全部(不折叠去重)
+    all_pos = await store.get_positions("acc-1")
+    assert sorted(p["ticket"] for p in all_pos) == [1, 2]
+
+    # tick:变体并存取最早
+    await store.save_tick({"account_id": "acc-1", "symbol": "GOLDm#", "bid": 111.0})
+    await store.save_tick({"account_id": "acc-1", "symbol": "GOLDM#", "bid": 222.0})
+    tick = await store.get_latest_tick("acc-1", "GOLDM#")
+    assert tick is not None and tick["bid"] == 111.0
+
+    # list_symbols 只返回一个代表(EA 原样)
+    symbols = await store.list_symbols("acc-1")
+    gold_variants = [s for s in symbols if s.upper() == "GOLDM#"]
+    assert len(gold_variants) == 1
+    assert gold_variants[0] == "GOLDm#"
+
+
 async def test_claims_each_bar_close_event_once(store: EaStore) -> None:
     assert await store.claim_bar_close_event("acc-1", "XAUUSD", "M30", "2026-08-25T08:00:00Z") is True
     assert await store.claim_bar_close_event("acc-1", "XAUUSD", "M30", "2026-08-25T08:00:00Z") is False
