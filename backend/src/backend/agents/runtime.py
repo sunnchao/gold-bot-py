@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 from collections.abc import Mapping
+from types import SimpleNamespace
 from typing import Any
 
 from backend.agents.agents.comprehensive_analyst import ComprehensiveAnalystService
@@ -24,9 +25,11 @@ def create_agent_workflow(env: Mapping[str, str] | None = None) -> WorkflowServi
     config: Any = AppConfigService(validate_config(source))
     goldbot_api: Any = GoldbotApiService(config)
     llm_client: Any = LlmClientService(config)
+    trade_llm_config = SimpleNamespace(llm={**config.llm, "model": config.llm_trade_model})
+    trade_client: Any = LlmClientService(trade_llm_config)
     analyst: Any = ComprehensiveAnalystService(
         llm_client,
-        trade_client=llm_client,
+        trade_client=trade_client,
         trade_model=config.llm_trade_model,
     )
     publisher: Any = PublisherService(
