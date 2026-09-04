@@ -709,7 +709,9 @@ async def test_analysis_payload_symbol_case_insensitive_tick_lookup() -> None:
             "account_id": ACCOUNT_ID,
             "symbol": "GOLDM#",
             "timeframe": "H1",
-            "bars": [{"time": "2026.04.13 07:00", "open": 4320, "high": 4330, "low": 4318, "close": 4325, "volume": 100}],
+            "bars": [
+                {"time": "2026.04.13 07:00", "open": 4320, "high": 4330, "low": 4318, "close": 4325, "volume": 100}
+            ],
         },
         headers=USER_HEADERS,
     )

@@ -90,13 +90,13 @@ class SqliteEaStore:
         # 查询侧统一折叠,避免 GOLDM#(bars) 与 GOLDm#(tick/positions) 分裂。
         row = await self._row(
             conn,
-            """
+            f"""
             SELECT payload_json FROM ea_snapshots
             WHERE kind = :kind AND account_id = :account
               AND upper(symbol) = upper(:symbol) AND timeframe = :timeframe
-            ORDER BY {order_col} ASC
+            ORDER BY {self._row_order_column} ASC
             LIMIT 1
-            """.format(order_col=self._row_order_column),
+            """,
             kind=kind,
             account=account,
             symbol=symbol,
@@ -188,7 +188,10 @@ class SqliteEaStore:
                     account=account_id_,
                     symbol=symbol,
                 )
-                record = from_json(row["payload_json"]) if row is not None and isinstance(row.get("payload_json"), str) else None
+                payload_str = row.get("payload_json") if row is not None else None
+                record = (
+                    from_json(payload_str) if payload_str is not None and isinstance(payload_str, str) else None
+                )
                 positions = record.get("positions") if isinstance(record, dict) else None
                 return [clone_record(p) for p in positions] if isinstance(positions, list) else []
             row_order = self._row_order_column
