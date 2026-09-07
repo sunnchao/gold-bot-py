@@ -231,7 +231,7 @@ async def test_bars_and_positions_persist_with_defaults() -> None:
     assert stored[0]["order_class"] == "market"
 
 
-async def test_routes_m15_to_llm_and_ignores_m30_once_per_bar() -> None:
+async def test_routes_m30_to_llm_and_ignores_m15_once_per_bar() -> None:
     llm_calls: list[tuple[str, str, str, str]] = []
     technical_calls: list[tuple[str, str, str, str]] = []
     client, _store = make_app(
@@ -239,14 +239,17 @@ async def test_routes_m15_to_llm_and_ignores_m30_once_per_bar() -> None:
         technical_analysis_trigger=lambda *args: technical_calls.append(args),
     )
 
-    def upload(timeframe: str, bar_time: int) -> None:
+    def upload(timeframe: str, closed_bar_time: int) -> None:
         response = client.post(
             "/bars",
             json={
                 "account_id": "90011087",
                 "symbol": "XAUUSD",
                 "timeframe": timeframe,
-                "bars": [{"time": bar_time, "open": 1.0, "high": 1.1, "low": 0.9, "close": 1.05}],
+                "bars": [
+                    {"time": closed_bar_time, "open": 1.0, "high": 1.1, "low": 0.9, "close": 1.05},
+                    {"time": closed_bar_time + 1800, "open": 1.05, "high": 1.2, "low": 1.0, "close": 1.1},
+                ],
             },
         )
         assert response.status_code == 200
@@ -260,13 +263,13 @@ async def test_routes_m15_to_llm_and_ignores_m30_once_per_bar() -> None:
     upload("M15", 1735690500)
 
     assert llm_calls == [
-        ("90011087", "XAUUSD", "M15", "1735689600"),
-        ("90011087", "XAUUSD", "M15", "1735690500"),
+        ("90011087", "XAUUSD", "M30", "1735689600"),
+        ("90011087", "XAUUSD", "M30", "1735691400"),
     ]
     assert technical_calls == []
 
 
-async def test_normalizes_m15_bar_before_triggering_llm_analysis() -> None:
+async def test_normalizes_m30_bar_before_triggering_llm_analysis() -> None:
     llm_calls: list[tuple[str, str, str, str]] = []
     client, store = make_app(llm_analysis_trigger=lambda *args: llm_calls.append(args))
 
@@ -275,14 +278,119 @@ async def test_normalizes_m15_bar_before_triggering_llm_analysis() -> None:
         json={
             "account_id": "90011087",
             "symbol": " xauusd ",
-            "timeframe": " m15 ",
-            "bars": [{"time": 1735689600, "open": 1.0, "high": 1.1, "low": 0.9, "close": 1.05}],
+            "timeframe": " m30 ",
+            "bars": [
+                {"time": 1735689600, "open": 1.0, "high": 1.1, "low": 0.9, "close": 1.05},
+                {"time": 1735691400, "open": 1.05, "high": 1.2, "low": 1.0, "close": 1.1},
+            ],
         },
     )
 
     assert response.status_code == 200
-    assert llm_calls == [("90011087", "XAUUSD", "M15", "1735689600")]
-    assert (await store.get_bars("90011087", "XAUUSD", "M15"))[0]["close"] == 1.05
+    assert llm_calls == [("90011087", "XAUUSD", "M30", "1735689600")]
+    assert (await store.get_bars("90011087", "XAUUSD", "M30"))[0]["close"] == 1.05
+
+
+async def test_m30_bar_close_uses_penultimate_bar_from_oldest_to_newest_payload() -> None:
+    llm_calls: list[tuple[str, str, str, str]] = []
+    client, _store = make_app(llm_analysis_trigger=lambda *args: llm_calls.append(args))
+
+    response = client.post(
+        "/bars",
+        json={
+            "account_id": "90011087",
+            "symbol": "XAUUSD",
+            "timeframe": "M30",
+            "bars": [
+                {"time": 1735687800, "open": 0.8, "high": 0.9, "low": 0.7, "close": 0.85},
+                {"time": 1735689600, "open": 1.0, "high": 1.1, "low": 0.9, "close": 1.05},
+                {"time": 1735691400, "open": 1.2, "high": 1.3, "low": 1.1, "close": 1.25},
+                {"time": 1735693200, "open": 1.25, "high": 1.4, "low": 1.2, "close": 1.35},
+            ],
+        },
+    )
+
+    assert response.status_code == 200
+    assert llm_calls == [("90011087", "XAUUSD", "M30", "1735691400")]
+
+
+async def test_m30_single_open_bar_does_not_trigger_bar_close_analysis() -> None:
+    llm_calls: list[tuple[str, str, str, str]] = []
+    client, _store = make_app(llm_analysis_trigger=lambda *args: llm_calls.append(args))
+
+    response = client.post(
+        "/bars",
+        json={
+            "account_id": "90011087",
+            "symbol": "XAUUSD",
+            "timeframe": "M30",
+            "bars": [{"time": 1735691400, "open": 1.05, "high": 1.3, "low": 1.0, "close": 1.1}],
+        },
+    )
+
+    assert response.status_code == 200
+    assert llm_calls == []
+
+
+async def test_m30_bar_close_does_not_retrigger_when_open_bar_changes() -> None:
+    llm_calls: list[tuple[str, str, str, str]] = []
+    client, _store = make_app(llm_analysis_trigger=lambda *args: llm_calls.append(args))
+
+    def upload(open_close: float) -> None:
+        response = client.post(
+            "/bars",
+            json={
+                "account_id": "90011087",
+                "symbol": "XAUUSD",
+                "timeframe": "M30",
+                "bars": [
+                    {"time": 1735689600, "open": 1.0, "high": 1.1, "low": 0.9, "close": 1.05},
+                    {"time": 1735691400, "open": 1.05, "high": 1.3, "low": 1.0, "close": open_close},
+                ],
+            },
+        )
+        assert response.status_code == 200
+
+    upload(1.1)
+    upload(1.2)
+
+    assert llm_calls == [("90011087", "XAUUSD", "M30", "1735689600")]
+
+
+async def test_m30_bar_close_triggers_when_a_new_bar_opens() -> None:
+    llm_calls: list[tuple[str, str, str, str]] = []
+    client, _store = make_app(llm_analysis_trigger=lambda *args: llm_calls.append(args))
+
+    def upload(bars: list[dict[str, float | int]]) -> None:
+        response = client.post(
+            "/bars",
+            json={
+                "account_id": "90011087",
+                "symbol": "XAUUSD",
+                "timeframe": "M30",
+                "bars": bars,
+            },
+        )
+        assert response.status_code == 200
+
+    upload(
+        [
+            {"time": 1735689600, "open": 1.0, "high": 1.1, "low": 0.9, "close": 1.05},
+            {"time": 1735691400, "open": 1.05, "high": 1.3, "low": 1.0, "close": 1.1},
+        ]
+    )
+    upload(
+        [
+            {"time": 1735689600, "open": 1.0, "high": 1.1, "low": 0.9, "close": 1.05},
+            {"time": 1735691400, "open": 1.05, "high": 1.3, "low": 1.0, "close": 1.2},
+            {"time": 1735693200, "open": 1.2, "high": 1.25, "low": 1.15, "close": 1.22},
+        ]
+    )
+
+    assert llm_calls == [
+        ("90011087", "XAUUSD", "M30", "1735689600"),
+        ("90011087", "XAUUSD", "M30", "1735691400"),
+    ]
 
 
 async def test_does_not_dispatch_bar_close_analysis_without_a_bar_time() -> None:

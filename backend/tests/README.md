@@ -105,7 +105,7 @@
 | `apps/app-server/src/dockerfile.spec.ts` | `backend/tests/unit/ops/test_dockerfile.py` | M0 | ✅ 同左 | L3 镜像契约 |
 | `apps/app-server/src/routes/ai.spec.ts` | `backend/tests/unit/api/test_ai.py` | M6 | ✅ 15 用例(P0) | L2;非 GET 两个 spec it() 镜像 + analysis_payload 快照/market_status/strategy_mapping/ai_result 决策事件/风险命令入队 |
 | `apps/app-server/src/routes/ai-result-method.spec.ts` | `backend/tests/unit/api/test_ai.py` | M6 | ✅ 2 用例(P0) | L2;并入 test_ai.py(PUT ai_result / PATCH v2 ai_result) |
-| `apps/app-server/src/routes/ea-lifecycle-normalization.spec.ts` | `backend/tests/unit/api/test_ea_lifecycle.py` | M4 | ✅ 12 用例(P0) | L2;register 标量拒绝/heartbeat 默认值+tick symbol 默认逐条镜像 + EA 端点鉴权/绑定/校验矩阵 |
+| `apps/app-server/src/routes/ea-lifecycle-normalization.spec.ts` | `backend/tests/unit/api/test_ea_lifecycle.py` | M4 | ✅ 18 用例(P0) | L2;register 标量拒绝/heartbeat 默认值+tick symbol 默认逐条镜像 + EA 端点鉴权/绑定/校验矩阵 + M30 bar-close 自动分析契约 |
 | `apps/app-server/src/routes/indicator-alert.spec.ts` | `backend/tests/unit/api/test_indicator_alert.py` | M4 | ✅ 7 用例(P0) | L2;TTL 4h 去重(原载荷保留)/Go 可解码拒绝/结构化克隆语义 |
 | 附带:`apps/app-server/src/routes/visual.ts`(poll 语义) | `backend/tests/unit/api/test_visual.py` | M4 | ✅ 9 用例(P0) | L2;鉴权 401/403/405 + tick/AI 摘要默认值 + trade_plan 回退 + alerts 过滤 |
 | 附带:`apps/app-server/src/app.ts`(trade_history/version/download/__contracts/healthz/metrics) | `backend/tests/unit/api/test_trade_history.py` + `test_version_download.py` | M4 | ✅ 16 用例(P0) | L2;magic→strategy 映射/MT 时长/已平仓入库+指标,版本回退/权限/下载字节/契约端点 |

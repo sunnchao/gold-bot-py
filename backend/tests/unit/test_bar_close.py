@@ -16,7 +16,7 @@ async def test_dispatch_does_not_wait_for_async_llm_analysis() -> None:
 
     service = BarCloseEventService(create_in_memory_store(), llm_trigger=llm_trigger)
 
-    assert await service.dispatch("acc-1", "XAUUSD", "M15", "2026-08-25T08:00:00Z") is True
+    assert await service.dispatch("acc-1", "XAUUSD", "M30", "2026-08-25T08:00:00Z") is True
     await asyncio.wait_for(started.wait(), timeout=1)
     assert release.is_set() is False
 
@@ -24,7 +24,7 @@ async def test_dispatch_does_not_wait_for_async_llm_analysis() -> None:
     await asyncio.sleep(0)
 
 
-async def test_dispatch_triggers_llm_on_m15_close() -> None:
+async def test_dispatch_triggers_llm_on_m30_close() -> None:
     calls: list[tuple[str, str, str, str]] = []
 
     async def llm_trigger(account: str, symbol: str, timeframe: str, bar_time: str) -> None:
@@ -32,13 +32,13 @@ async def test_dispatch_triggers_llm_on_m15_close() -> None:
 
     service = BarCloseEventService(create_in_memory_store(), llm_trigger=llm_trigger)
 
-    assert await service.dispatch("acc-1", "XAUUSD", "M15", "2026-08-25T08:15:00Z") is True
+    assert await service.dispatch("acc-1", "XAUUSD", "M30", "2026-08-25T08:30:00Z") is True
     await asyncio.sleep(0)
 
-    assert calls == [("acc-1", "XAUUSD", "M15", "2026-08-25T08:15:00Z")]
+    assert calls == [("acc-1", "XAUUSD", "M30", "2026-08-25T08:30:00Z")]
 
 
-async def test_dispatch_triggers_each_m15_close_only_once() -> None:
+async def test_dispatch_triggers_each_m30_close_only_once() -> None:
     calls: list[str] = []
 
     async def llm_trigger(_account: str, _symbol: str, _timeframe: str, bar_time: str) -> None:
@@ -46,14 +46,14 @@ async def test_dispatch_triggers_each_m15_close_only_once() -> None:
 
     service = BarCloseEventService(create_in_memory_store(), llm_trigger=llm_trigger)
 
-    assert await service.dispatch("acc-1", "XAUUSD", "M15", "2026-08-25T08:15:00Z") is True
-    assert await service.dispatch("acc-1", "XAUUSD", "M15", "2026-08-25T08:15:00Z") is False
+    assert await service.dispatch("acc-1", "XAUUSD", "M30", "2026-08-25T08:30:00Z") is True
+    assert await service.dispatch("acc-1", "XAUUSD", "M30", "2026-08-25T08:30:00Z") is False
     await asyncio.sleep(0)
 
-    assert calls == ["2026-08-25T08:15:00Z"]
+    assert calls == ["2026-08-25T08:30:00Z"]
 
 
-async def test_dispatch_does_not_trigger_llm_on_m30_close() -> None:
+async def test_dispatch_does_not_trigger_llm_on_m15_close() -> None:
     calls: list[str] = []
 
     async def llm_trigger(_account: str, _symbol: str, timeframe: str, _bar_time: str) -> None:
@@ -61,7 +61,7 @@ async def test_dispatch_does_not_trigger_llm_on_m30_close() -> None:
 
     service = BarCloseEventService(create_in_memory_store(), llm_trigger=llm_trigger)
 
-    assert await service.dispatch("acc-1", "XAUUSD", "M30", "2026-08-25T08:30:00Z") is False
+    assert await service.dispatch("acc-1", "XAUUSD", "M15", "2026-08-25T08:15:00Z") is False
     await asyncio.sleep(0)
 
     assert calls == []

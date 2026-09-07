@@ -38,6 +38,7 @@ __all__ = [
     "has_invalid_optional_string",
     "has_invalid_optional_string_array",
     "is_record",
+    "latest_bar_time",
     "normalize_bars_payload",
     "normalize_heartbeat_payload",
     "normalize_mt_time",
@@ -344,9 +345,10 @@ def normalize_bars_payload(body: dict) -> str | None:
 
 def latest_bar_time(body: dict) -> str:
     bars = body.get("bars")
-    if not isinstance(bars, list) or not bars:
+    if not isinstance(bars, list) or len(bars) < 2:
         return ""
-    latest = bars[-1]
+    # MT4/MT5 SendBars emits bars oldest to newest; the final bar is still open.
+    latest = bars[-2]
     if not isinstance(latest, dict):
         return ""
     value = latest.get("time")

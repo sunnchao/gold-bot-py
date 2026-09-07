@@ -60,7 +60,7 @@ class BarCloseEventService:
         return True
 
     def _trigger_for(self, timeframe: str) -> AnalysisTrigger | None:
-        if timeframe == "M15":
+        if timeframe == "M30":
             return self._llm_trigger
         return None
 
