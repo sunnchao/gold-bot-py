@@ -1222,10 +1222,10 @@ async def test_drops_replay_signals_when_the_ea_heartbeat_reports_the_strategy_d
     assert await store.list_commands(ACCOUNT) == []
 
 
-# --------------------------------------------------------------------------- Phase 5.1 服务端日亏保护
+# --------------------------------------------------------------------------- 日亏保护已移除
 
 
-async def test_records_the_daily_start_equity_on_first_sight_and_keeps_signals_flowing() -> None:
+async def test_equity_does_not_create_a_daily_loss_baseline_or_block_signals() -> None:
     store = create_in_memory_store()
     await store.set_runtime_mode(ACCOUNT, "cutover")
     await store.save_heartbeat({"account_id": ACCOUNT, "market_open": True, "is_trade_allowed": True, "equity": 10000})
@@ -1266,15 +1266,15 @@ async def test_records_the_daily_start_equity_on_first_sight_and_keeps_signals_f
 
     await scheduler.enqueue_analysis(ACCOUNT, "XAUUSD", "H1")
 
-    # 当日首见心跳权益 → 记录 UTC 日起始权益基线,同时正常放行信号
-    assert await store.get_daily_start_equity(ACCOUNT, "2026-04-13") == 10000
+    # 日亏保护已移除,正常放行信号
+    assert await store.get_daily_start_equity(ACCOUNT, "2026-04-13") is None
     assert len(await store.list_commands(ACCOUNT)) == 1
 
 
-async def test_blocks_live_analysis_when_the_daily_realized_drawdown_reaches_the_limit(capsys) -> None:
+async def test_daily_drawdown_does_not_block_analysis_or_position_review(capsys) -> None:
     store = create_in_memory_store()
     await store.set_runtime_mode(ACCOUNT, "cutover")
-    # 当日起始权益 10000,当前权益 9400 → 回撤 6% ≥ 默认阈值 5%
+    # 即使当日起始权益 10000、当前权益 9400（回撤 6%），也不再阻断任何调度链路。
     await store.save_daily_start_equity(ACCOUNT, "2026-04-13", 10000)
     await store.save_heartbeat({"account_id": ACCOUNT, "market_open": True, "is_trade_allowed": True, "equity": 9400})
     analysis = FakeAnalysis(
@@ -1297,13 +1297,13 @@ async def test_blocks_live_analysis_when_the_daily_realized_drawdown_reaches_the
     await scheduler.enqueue_analysis(ACCOUNT, "XAUUSD", "H1")
     await scheduler.enqueue_position_review(ACCOUNT, "XAUUSD")
     err += capsys.readouterr().err
-    assert "daily_loss_guard_blocked" in err
 
-    assert analysis.calls == 0
+    assert "daily_loss_guard_blocked" not in err
+    assert analysis.calls == 2
     assert await store.list_commands(ACCOUNT) == []
 
 
-async def test_uses_ea_max_daily_loss_instead_of_environment_variable(monkeypatch) -> None:
+async def test_ignores_ea_and_environment_daily_loss_settings(monkeypatch) -> None:
     monkeypatch.setenv("GB_MAX_DAILY_LOSS_PCT", "0.01")
     store = create_in_memory_store()
     await store.set_runtime_mode(ACCOUNT, "cutover")
@@ -1359,7 +1359,7 @@ async def test_uses_ea_max_daily_loss_instead_of_environment_variable(monkeypatc
     assert len(await store.list_commands(ACCOUNT)) == 1
 
 
-async def test_resets_the_daily_loss_guard_baseline_when_the_utc_date_rolls_over() -> None:
+async def test_ignores_previous_daily_loss_baseline_when_scheduling() -> None:
     store = create_in_memory_store()
     await store.set_runtime_mode(ACCOUNT, "cutover")
     # 前一 UTC 日亏损 6%(10000 → 9400),跨日后应以新基线放行
@@ -1402,8 +1402,7 @@ async def test_resets_the_daily_loss_guard_baseline_when_the_utc_date_rolls_over
 
     await scheduler.enqueue_analysis(ACCOUNT, "XAUUSD", "H1")
 
-    # 跨 UTC 日:旧基线不再生效,当日以 9400 建立新基线并正常下发信号
-    assert await store.get_daily_start_equity(ACCOUNT, "2026-04-13") == 9400
+    # 日亏保护已移除,历史基线不影响调度
     assert len(await store.list_commands(ACCOUNT)) == 1
 
 

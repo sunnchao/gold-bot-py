@@ -1,7 +1,7 @@
 """SchedulerService(镜像 gold-bot apps/app-server/src/services/scheduler/service.ts)。
 
 按 TS 语义逐字移植:enqueueAnalysis / enqueuePositionReview 及全部内部链路
-(市况过滤、日亏保护 Phase 5.1、riskgate allowedLots Phase 5.2、per-symbol
+(市况过滤、riskgate allowedLots Phase 5.2、per-symbol
 STOPLEVEL Phase 5.3、AI 止损 5 分钟冷却)。console.log/console.warn 镜像为
 stdout/stderr 的 print,JSON 序列化保持 JSON.stringify 紧凑格式。
 
@@ -15,7 +15,6 @@ import hashlib
 import json
 import math
 import re
-import sys
 import time
 from collections.abc import Callable
 from datetime import UTC, datetime
@@ -205,47 +204,9 @@ class SchedulerService:
     # ------------------------------------------------------------------ 内部链路
     async def _can_run_live_analysis(self, account_id: str) -> bool:
         heartbeat = await self._get_heartbeat(account_id)
-        if _explicit_boolean(heartbeat, "market_open") is not True or _explicit_boolean(
+        return _explicit_boolean(heartbeat, "market_open") is True and _explicit_boolean(
             heartbeat, "is_trade_allowed"
-        ) is not True:
-            return False
-        return await self._passes_daily_loss_guard(account_id, heartbeat)
-
-    async def _passes_daily_loss_guard(self, account_id: str, heartbeat: EaRecord) -> bool:
-        """服务端日亏保护(Phase 5.1):按 UTC 日持久化当日起始权益基线。"""
-        equity = _number_field(heartbeat, "equity")
-        if (
-            equity <= 0
-            or self._store is None
-            or not hasattr(self._store, "get_daily_start_equity")
-            or not hasattr(self._store, "save_daily_start_equity")
-        ):
-            return True
-        utc_date = _utc_date_key(self._now_iso())
-        start_equity = await self._store.get_daily_start_equity(account_id, utc_date)
-        if start_equity is None or start_equity <= 0:
-            await self._store.save_daily_start_equity(account_id, utc_date, equity)
-            return True
-        drawdown_pct = (start_equity - equity) / start_equity
-        registration = await self._get_registration(account_id)
-        threshold_pct = _max_daily_loss_pct(heartbeat, registration)
-        if drawdown_pct >= threshold_pct:
-            payload = _json(
-                {
-                    "account_id": account_id,
-                    "utc_date": utc_date,
-                    "start_equity": start_equity,
-                    "equity": equity,
-                    "drawdown_pct": _to_fixed(drawdown_pct, 4),
-                    "threshold_pct": threshold_pct,
-                }
-            )
-            print(
-                f"[SCHED] daily_loss_guard_blocked {payload}",
-                file=sys.stderr,
-            )
-            return False
-        return True
+        ) is True
 
     async def _allowed_lots_for_signal(
         self,
@@ -978,25 +939,6 @@ def _utc_minute_key(value: str) -> str:
     return f"{dt.year:04d}{dt.month:02d}{dt.day:02d}{dt.hour:02d}{dt.minute:02d}"
 
 
-def _utc_date_key(value: str) -> str:
-    millis = _parse_iso_ms(value)
-    if millis is None:
-        millis = time.time() * 1000
-    dt = datetime.fromtimestamp(millis / 1000, tz=UTC)
-    return f"{dt.year:04d}-{dt.month:02d}-{dt.day:02d}"
-
-
-def _max_daily_loss_pct(*records: EaRecord | None) -> float:
-    """日亏保护阈值来自 EA MaxDailyLoss(百分比),默认 5% → 0.05。"""
-    for record in records:
-        if record is None:
-            continue
-        raw = _number_field(record, "max_daily_loss")
-        if raw > 0:
-            return raw / 100.0 if raw > 1 else raw
-    return 0.05
-
-
 def _live_current_price(tick: EaRecord, bars: dict[str, list[EaRecord]]) -> float:
     bid = _number_field(tick, "bid")
     ask = _number_field(tick, "ask")
@@ -1096,12 +1038,6 @@ def _parse_iso_ms(value: str) -> float | None:
     except (TypeError, ValueError):
         return None
     return millis if math.isfinite(millis) else None
-
-
-def _to_fixed(value: float, digits: int) -> float:
-    """镜像 JS Number.prototype.toFixed(半向 +inf 舍入),返回数值。"""
-    factor = 10**digits
-    return math.floor(value * factor + 0.5) / factor
 
 
 def _json(value: Any) -> str:
