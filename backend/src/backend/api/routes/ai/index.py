@@ -1689,10 +1689,14 @@ async def queue_ai_approve_pending_commands(
                 store, account_id, symbol, trade_plan, pending_gate.get("reason", ""), event_timestamp
             )
             continue
+        # 命令投递给 EA 必须用账户真实注册品种名(tradableSymbol,gate 已按大小写折叠从
+        # registration.ai_symbols 解析),而非外层分析名(可能大小写不一致,如 GOLDM# vs GOLDm#)。
+        # EA 按精确 symbol 匹配 /poll 到的命令,名不符会 symbol_mismatch 拒单。
+        command_symbol = pending_gate.get("tradableSymbol") or symbol
         candidate = build_ai_approve_command_candidate(
             {
                 "accountId": account_id,
-                "symbol": symbol,
+                "symbol": command_symbol,
                 "tradePlan": trade_plan,
                 "riskGate": risk_gate,
                 "nowIso": event_timestamp,

@@ -236,6 +236,7 @@ async def evaluate_ai_approve_pending_gate(gate_input: AIApprovePendingGateInput
 
     return {
         "accepted": True,
+        "tradableSymbol": tradable_symbol,
         "currentPrice": current_price,
         "entry": entry,
         "lots": lots,

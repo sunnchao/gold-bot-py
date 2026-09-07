@@ -1775,6 +1775,92 @@ async def test_ai_result_confidence_65_cutover_queues() -> None:
     assert polled[0]["score"] == 65
 
 
+async def test_ai_approve_command_uses_real_registered_symbol_when_analysis_case_differs() -> None:
+    # 回归:微合约账户 EA 真实注册名为 GOLDm#(registration.ai_symbols),而分析/发布侧用大写
+    # GOLDM#。命令投递给 EA 必须带真实注册名(GOLDm#),否则 EA 按精确 symbol 匹配 poll 到的
+    # 命令会 symbol_mismatch 拒单(2026-09-07 诊断出的实盘 0 成交根因之一)。
+    client, store = make_client()
+    now_ms = int(datetime.now(UTC).timestamp() * 1000)
+    now_iso = _now_iso_from_ms(now_ms)
+    client.app.state.now_iso = lambda: now_iso
+
+    await store.set_runtime_mode(ACCOUNT_ID, "cutover")
+    await store.save_registration(
+        {"account_id": ACCOUNT_ID, "leverage": 500, "ai_symbols": ["GOLDm#"]}
+    )
+    await store.save_heartbeat(
+        {
+            "account_id": ACCOUNT_ID,
+            "equity": 10000,
+            "free_margin": 9000,
+            "market_open": True,
+            "is_trade_allowed": True,
+        }
+    )
+    # tick/bars 以 EA 真实名 GOLDm# 落库(镜像实际:analysis_payload 经 %23 解码为分析名,
+    # 但 EA 侧 tick/positions 存真实注册名)
+    await store.save_tick(
+        {
+            "account_id": ACCOUNT_ID,
+            "symbol": "GOLDm#",
+            "bid": 3335.5,
+            "ask": 3335.7,
+            "spread": 0.2,
+            "time": _now_iso_from_ms(now_ms - 30_000),
+        }
+    )
+    for timeframe in ("D1", "H4", "H1", "M30", "M15"):
+        await store.save_bars(
+            {
+                "account_id": ACCOUNT_ID,
+                "symbol": "GOLDm#",
+                "timeframe": timeframe,
+                "bars": _trend_bars_payload(),
+            }
+        )
+
+    # 分析/发布用大写 GOLDM# 投递 ai_result(# 需 URL 编码为 %23,镜像实际链路)
+    response = client.post(
+        f"/api/v2/ai_result/{ACCOUNT_ID}/GOLDM%23",
+        json={
+            "trade_plan": {
+                "schema_version": "trade_plan.v1",
+                "decision_id": "tpv1_case_alias",
+                "account_id": ACCOUNT_ID,
+                "symbol": "GOLDM#",
+                "mode": "approve",
+                "side": "buy",
+                "entry_zone": {"min": 3335.5, "max": 3335.7},
+                "execution_type": "market",
+                "requested_order_type": "market",
+                "stop_loss": 3330,
+                "take_profit": [3345],
+                "max_lots": 0.1,
+                "confidence": 80,
+                "expires_at": "2099-06-06T09:15:00Z",
+                "reason_codes": ["mode.approve", "side.buy"],
+                "narrative": "uppercase analysis name must not leak into EA command symbol",
+            },
+        },
+        headers=USER_HEADERS,
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["command_status"] == "queued"
+
+    commands = await store.list_commands(ACCOUNT_ID)
+    assert len(commands) == 1
+    command = commands[0]
+    assert command["action"] == "SIGNAL"
+    assert command["source"] == "ai_approve"
+    assert command["decision_id"] == "tpv1_case_alias"
+    # 命令 symbol 必须是 EA 真实注册名 GOLDm#,不能是大写 GOLDM#
+    assert command["symbol"] == "GOLDm#"
+
+    polled = await store.poll_commands(ACCOUNT_ID)
+    assert polled[0]["symbol"] == "GOLDm#"
+
+
 async def test_ai_result_confidence_64_queue_skip() -> None:
     client, store = make_client()
     await store.set_runtime_mode(ACCOUNT_ID, "cutover")
