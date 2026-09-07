@@ -16,7 +16,6 @@ from backend.services.ai_approve.command import (
 )
 from backend.services.ai_approve.gate import (
     AI_APPROVE_COOLDOWN_MS,
-    AI_APPROVE_MAX_DAILY_SIGNALS_PER_SYMBOL,
     AIApproveCooldown,
     AiApproveGate,
     create_ai_approve_cooldown,
@@ -37,7 +36,6 @@ from backend.services.ai_approve.rules import (
 
 __all__ = [
     "AI_APPROVE_COOLDOWN_MS",
-    "AI_APPROVE_MAX_DAILY_SIGNALS_PER_SYMBOL",
     "AI_APPROVE_MIN_RR",
     "AIApproveCommandInput",
     "AIApproveCooldown",

@@ -25,7 +25,6 @@ from backend.services.ai_approve.rules import (
 
 __all__ = [
     "AI_APPROVE_COOLDOWN_MS",
-    "AI_APPROVE_MAX_DAILY_SIGNALS_PER_SYMBOL",
     "AIApproveCooldown",
     "AiApproveGate",
     "create_ai_approve_cooldown",
@@ -34,7 +33,6 @@ __all__ = [
 ]
 
 AI_APPROVE_COOLDOWN_MS = 30 * 60 * 1000
-AI_APPROVE_MAX_DAILY_SIGNALS_PER_SYMBOL = 2
 
 AIApprovePendingGateInput = dict[str, Any]
 AIApprovePendingGateResult = EaRecord
@@ -211,13 +209,8 @@ async def evaluate_ai_approve_pending_gate(gate_input: AIApprovePendingGateInput
     if await store.has_active_ai_approve_pending(account_id, tradable_symbol, side, now_iso):
         return _reject("pending.duplicate")
 
-    # 每品种每日限额(Phase 4.1):当日(UTC)该品种已下发的 AI 信号 >= 上限时拒绝,
-    # 阻断同日高频反向互扫;draft/shadow_only 不计入(未真正下发)。
-    if (
-        await _count_ai_approve_signals_today(store, account_id, tradable_symbol, now_iso)
-        >= AI_APPROVE_MAX_DAILY_SIGNALS_PER_SYMBOL
-    ):
-        return _reject("daily_limit.symbol")
+    # 每品种每日限额(Phase 4.1)已移除(2026-09-07 老板拍板):配额由 cooldown + 其他关卡把控,
+    # 不再按 UTC 日限制该品种 AI 信号条数。保留 pending.duplicate 防同向重复。
 
     cooldown = gate_input.get("cooldown")
     if cooldown is not None and cooldown.active(tradable_symbol, now_iso, AI_APPROVE_COOLDOWN_MS) is True:
@@ -308,30 +301,6 @@ def create_ai_approve_gate(store: EaStore, **options: Any) -> AiApproveGate:
 
 def _reject(reason: str) -> AIApprovePendingGateResult:
     return {"accepted": False, "reason": reason}
-
-
-async def _count_ai_approve_signals_today(store: EaStore, account_id: str, symbol: str, now_iso: str) -> int:
-    """当日(UTC)该品种已进入队列的 ai_approve 信号数(镜像 countAIApproveSignalsToday)。
-
-    queued/delivered/acked/failed/superseded 都算“已下发过”,draft/shadow_only/rejected 不算。
-    """
-    today = now_iso[:10]
-    if len(today) != 10:
-        return 0
-    commands = await store.list_commands(account_id)
-    want_symbol = symbol.strip().upper()
-    count = 0
-    for command in commands:
-        if command.get("source") != "ai_approve":
-            continue
-        if command.get("status") in ("draft", "shadow_only", "rejected"):
-            continue
-        command_symbol = _string_field(command, "symbol").strip().upper()
-        if command_symbol != want_symbol:
-            continue
-        if _string_field(command, "created_at")[:10] == today:
-            count += 1
-    return count
 
 
 def _current_price_from_tick(tick: EaRecord) -> float:

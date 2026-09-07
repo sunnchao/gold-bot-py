@@ -213,14 +213,15 @@ async def test_rejects_active_duplicate_ai_approve_pending_commands() -> None:
     assert result == {"accepted": False, "reason": "pending.duplicate"}
 
 
-async def test_rejects_plans_once_the_per_symbol_daily_ai_signal_limit_is_reached() -> None:
+async def test_no_longer_rejects_when_per_symbol_daily_ai_signal_limit_was_removed() -> None:
     store = create_in_memory_store()
     await seed_strong_trend_state(store)
-    # 用 SELL 方向占满当日限额,避免先触发 pending.duplicate(BUY 侧无重复)。
-    # save_command_candidate 用真实时钟盖 created_at,所以 now_iso 也用真实时钟对齐 UTC 日期。
+    # 每日配额(原 Phase 4.1, 上限 2)已移除(2026-09-07 老板拍板)。这里写入远超旧上限
+    # (5 条 SELL)的已下发命令,断言不再被 daily_limit.symbol 拦截。
+    # 用 SELL 方向铺历史命令;待测 plan 为 BUY,避免撞 pending.duplicate(BUY 侧无重复)。
     real_now_iso = current_timestamp()
     expiration = int(time.time()) + 4 * 60 * 60
-    for suffix in ("a", "b"):
+    for suffix in ("a", "b", "c", "d", "e"):
         command = await store.save_command_candidate(
             ACCOUNT_ID,
             {
@@ -235,7 +236,8 @@ async def test_rejects_plans_once_the_per_symbol_daily_ai_signal_limit_is_reache
         await store.promote_command(command["command_id"])
 
     result = await evaluate(store, now_iso=real_now_iso)
-    assert result == {"accepted": False, "reason": "daily_limit.symbol"}
+    # 不再因当日累计条数拒绝 —— 只受其余关卡(pending.duplicate/cooldown 等)约束。
+    assert result.get("reason") != "daily_limit.symbol"
 
 
 async def test_rejects_weak_trend_consensus_after_the_go_lots_halving_rule() -> None:
