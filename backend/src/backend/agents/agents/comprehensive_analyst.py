@@ -367,15 +367,17 @@ class StructureCache:
     def get_or_build(self, symbol: str, payload: JSONDict) -> dict[str, Any]:
         wave_prices = extract_wave_closed_bar_prices(payload)
         chanlun_bars = extract_closed_chanlun_bars(payload)
+        wave_source_timeframe = _first_closed_source_timeframe(payload, 2)
+        chanlun_source_timeframe = _first_closed_source_timeframe(payload, 3)
         wave_structure = (
-            analyze_elliott_wave(wave_prices)
+            analyze_elliott_wave(wave_prices) | {"sourceTimeframe": wave_source_timeframe}
             if len(wave_prices) >= 2
-            else build_unavailable_wave_structure()
+            else build_unavailable_wave_structure() | {"sourceTimeframe": None}
         )
         chanlun_structure = (
-            analyze_chanlun(chanlun_bars)
+            analyze_chanlun(chanlun_bars) | {"sourceTimeframe": chanlun_source_timeframe}
             if len(chanlun_bars) >= 3
-            else build_unavailable_chanlun_structure()
+            else build_unavailable_chanlun_structure() | {"sourceTimeframe": None}
         )
         candlestick_patterns = summarize_candlestick_patterns(payload)
         harmonic_ctx_stable = sanitize_harmonic_context_stable(payload)
@@ -405,8 +407,73 @@ class StructureCache:
         return {"blockTexts": block_texts, "harmonicVolatile": harmonic_ctx_volatile}
 
 
+def _neutralize_unsupported_theory(result: JSONDict) -> None:
+    """Prevent LLM prose from upgrading minimal observations into confirmed theory."""
+    wave = result.get("wave")
+    if isinstance(wave, dict):
+        wave.update(
+            {
+                "wave_confirmation": "rejected",
+                "extension_wave": None,
+                "corrective_type": None,
+                "trend_strength": "weak",
+                # Schema compatibility requires the object, but zero is an
+                # explicit neutral sentinel—not a model-generated wave target.
+                "target_levels": {"level_1_618": 0, "level_2_0": 0},
+                "confidence": 0,
+                "rationale": (
+                    "波浪完整计数不可用，局部摆动仅作观察 "
+                    "(Full wave count unavailable; swings are observation only)"
+                ),
+            }
+        )
+    chanlun = result.get("chanlun")
+    if isinstance(chanlun, dict):
+        chanlun.update(
+            {
+                "trend": "range",
+                "strength": "weak",
+                "latest_signal": "hold",
+                "hub_state": "none",
+                "confidence": 0,
+                "rationale": (
+                    "缠论笔段与中枢不可用，分型不构成确认信号 "
+                    "(Chanlun strokes and hubs unavailable; fractals are not confirmation)"
+                ),
+            }
+        )
+    arbitration = result.get("arbitration")
+    if not isinstance(arbitration, dict):
+        return
+    wave_theory = arbitration.get("wave_theory")
+    if isinstance(wave_theory, dict):
+        wave_theory.update(
+            {
+                "current_wave": "Unknown",
+                "wave_direction": "unclear",
+                "wave_count": "Unavailable",
+                "next_target": "N/A",
+                "confidence": 0,
+                "rationale": "波浪完整计数不可用 (Full wave count unavailable)",
+            }
+        )
+    chanlun_theory = arbitration.get("chanlun_theory")
+    if isinstance(chanlun_theory, dict):
+        chanlun_theory.update(
+            {
+                "trend": "range",
+                "bi_direction": "none",
+                "duan_direction": "none",
+                "zhongshu_state": "none",
+                "buy_sell_point": "none",
+                "confidence": 0,
+                "rationale": "缠论笔段与中枢不可用 (Chanlun strokes and hubs unavailable)",
+            }
+        )
+
+
 def normalize_comprehensive(result: JSONDict) -> JSONDict:
-    """镜像 normalizeComprehensive:Chanlun 顶级枚举归一化(在 schema 校验之后)。"""
+    """Normalize enums and enforce the programmatic evidence boundary."""
     chanlun = result.get("chanlun")
     if isinstance(chanlun, dict):
         if chanlun.get("hub_state") in ("breaking_up", "breaking_down"):
@@ -418,6 +485,7 @@ def normalize_comprehensive(result: JSONDict) -> JSONDict:
             chanlun["latest_signal"] = "sell"
         elif latest == "close":
             chanlun["latest_signal"] = "sell"
+    _neutralize_unsupported_theory(result)
     return result
 
 
@@ -610,24 +678,76 @@ MAX_RECENT_FRACTALS = 12
 MAX_RECENT_STROKES = 12
 MAX_RECENT_HUBS = 6
 
+STRUCTURE_EVIDENCE_VERSION = "minimal-observation-v1"
+
+
+def _structure_evidence(
+    *,
+    name: str,
+    status: str,
+    source_timeframe: str | None,
+    reason: str,
+    observed_points: int,
+) -> JSONDict:
+    """Return an auditable evidence envelope without inventing confirmation times."""
+    return {
+        "name": name,
+        "status": status,
+        "sourceTimeframe": source_timeframe,
+        "observedPoints": observed_points,
+        "occurredAt": None,
+        "confirmedAt": None,
+        "invalidationCriteria": "A confirmed full structure implementation is required.",
+        "algorithmVersion": STRUCTURE_EVIDENCE_VERSION,
+        "reason": reason,
+        # Keep the first shipped spelling additive for consumers that already
+        # render it; new consumers should use the canonical `reason` field.
+        "statusReason": reason,
+    }
+
 
 def summarize_wave_structure(wave: JSONDict) -> JSONDict:
+    swing_points = wave.get("swingPoints") or []
+    # The current implementation only detects local swings; it does not label
+    # valid impulse/corrective waves, so it must never support a confirmed wave.
     return {
-        "direction": wave.get("direction"),
-        "validation": wave.get("validation"),
-        "confidence": wave.get("confidence"),
-        "impulseWaves": wave.get("impulseWaves"),
-        "correctiveWaves": wave.get("correctiveWaves"),
-        "swingPoints": (wave.get("swingPoints") or [])[-MAX_RECENT_SWING_POINTS:],
+        "direction": None,
+        "validation": {"isValid": False, "violations": ["full_wave_labeling_unavailable"]},
+        "confidence": 0,
+        "impulseWaves": [],
+        "correctiveWaves": [],
+        "swingPoints": swing_points[-MAX_RECENT_SWING_POINTS:],
+        "evidence": _structure_evidence(
+            name="elliott_wave",
+            status="unavailable",
+            source_timeframe=wave.get("sourceTimeframe"),
+            reason="Local swing observations are not a confirmed Elliott wave count.",
+            observed_points=len(swing_points),
+        ),
     }
 
 
 def summarize_chanlun_structure(chanlun: JSONDict) -> JSONDict:
+    fractals = chanlun.get("fractals") or []
     return {
-        "fractals": (chanlun.get("fractals") or [])[-MAX_RECENT_FRACTALS:],
-        "strokes": (chanlun.get("strokes") or [])[-MAX_RECENT_STROKES:],
-        "hubs": (chanlun.get("hubs") or [])[-MAX_RECENT_HUBS:],
+        "fractals": fractals[-MAX_RECENT_FRACTALS:],
+        "strokes": [],
+        "hubs": [],
+        "evidence": _structure_evidence(
+            name="chanlun",
+            status="unavailable",
+            source_timeframe=chanlun.get("sourceTimeframe"),
+            reason="Fractals are observations; strokes and hubs are not implemented.",
+            observed_points=len(fractals),
+        ),
     }
+
+
+def _first_closed_source_timeframe(payload: JSONDict, min_count: int) -> str | None:
+    for timeframe in PREFERRED_BAR_TIMEFRAMES:
+        if len(get_payload_bars(payload, timeframe)[:-1]) >= min_count:
+            return timeframe
+    return None
 
 
 PIVOT_FIELDS = ("pp", "r1", "s1")
@@ -704,7 +824,8 @@ def render_structure_tier_block(tier: str, inputs: StructureTierInputs) -> str:
     pattern_line = render_candlestick_patterns_for(inputs.candlestick_patterns, tier)
     sections.append(f"### CANDLESTICK_PATTERNS ({tier})\n{pattern_line or 'none'}")
 
-    return f"## COMPUTED STRUCTURES — {tier} (caching eligible)\n\n{'\n\n'.join(sections)}"
+    rendered_sections = "\n\n".join(sections)
+    return f"## COMPUTED STRUCTURES — {tier} (caching eligible)\n\n{rendered_sections}"
 
 
 def build_static_context_prompt(
@@ -736,7 +857,8 @@ def build_static_account_and_strategy_text(payload: JSONDict, market_only: bool)
     if not market_only:
         static_action_fields = partition_account(payload.get("account") or {}).get("staticFields", {})
         sections.append("### ACCOUNT_STATIC\n" + stable_stringify(static_action_fields))
-    return f"## STATIC ACCOUNT & STRATEGY CONTEXT (caching eligible)\n\n{'\n\n'.join(sections)}"
+    rendered_sections = "\n\n".join(sections)
+    return f"## STATIC ACCOUNT & STRATEGY CONTEXT (caching eligible)\n\n{rendered_sections}"
 
 
 def strip_hoisted_pivot_fields(indicator: JSONDict) -> JSONDict:

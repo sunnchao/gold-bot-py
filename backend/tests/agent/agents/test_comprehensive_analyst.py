@@ -72,6 +72,80 @@ def make_service(client, trade_client=None):
     return ca.ComprehensiveAnalystService(client, trade_client=trade_client)
 
 
+def test_minimal_wave_and_chanlun_evidence_cannot_claim_confirmation():
+    wave = ca.summarize_wave_structure(
+        {
+            "direction": "bullish",
+            "confidence": True,
+            "swingPoints": [{"index": 2, "price": 10, "type": "low"}],
+            "impulseWaves": [],
+            "correctiveWaves": [],
+        }
+    )
+    chanlun = ca.summarize_chanlun_structure(
+        {"fractals": [{"type": "bottom", "index": 2, "price": 10}], "strokes": [], "hubs": []}
+    )
+    assert wave["evidence"]["status"] == "unavailable"
+    assert wave["direction"] is None
+    assert wave["confidence"] == 0
+    assert wave["evidence"]["confirmedAt"] is None
+    assert wave["evidence"]["statusReason"]
+    wave_with_source = ca.summarize_wave_structure({**wave, "sourceTimeframe": "M30"})
+    assert wave_with_source["evidence"]["sourceTimeframe"] == "M30"
+    assert chanlun["evidence"]["status"] == "unavailable"
+    assert chanlun["strokes"] == []
+    assert chanlun["hubs"] == []
+
+
+def test_normalize_comprehensive_neutralizes_unsupported_theory_only():
+    result = {
+        "technical": {"bias": "bullish", "confidence": 72},
+        "wave": {
+            "wave_confirmation": "confirmed",
+            "extension_wave": 3,
+            "corrective_type": "zigzag",
+            "trend_strength": "strong",
+            "confidence": 88,
+            "rationale": "fabricated wave",
+        },
+        "chanlun": {
+            "trend": "up",
+            "strength": "strong",
+            "latest_signal": "buy",
+            "hub_state": "active",
+            "confidence": 91,
+            "rationale": "fabricated chanlun",
+        },
+        "harmonic": {"detected_pattern": "gartley", "direction": "bullish", "confidence": 80},
+        "arbitration": {
+            "wave_theory": {
+                "wave_direction": "impulse_up",
+                "wave_count": "1-2-3",
+                "confidence": 90,
+                "rationale": "fabricated wave",
+            },
+            "chanlun_theory": {
+                "trend": "up",
+                "bi_direction": "up",
+                "duan_direction": "up",
+                "zhongshu_state": "breaking_up",
+                "buy_sell_point": "buy_2",
+                "confidence": 90,
+                "rationale": "fabricated chanlun",
+            },
+        },
+    }
+    normalized = ca.normalize_comprehensive(result)
+    assert normalized["wave"]["wave_confirmation"] == "rejected"
+    assert normalized["wave"]["confidence"] == 0
+    assert normalized["chanlun"]["latest_signal"] == "hold"
+    assert normalized["chanlun"]["confidence"] == 0
+    assert normalized["arbitration"]["wave_theory"]["wave_direction"] == "unclear"
+    assert normalized["arbitration"]["chanlun_theory"]["buy_sell_point"] == "none"
+    assert normalized["technical"]["bias"] == "bullish"
+    assert normalized["harmonic"]["detected_pattern"] == "gartley"
+
+
 # ─────────────────────── 输入 fixtures(与 TS 逐字节一致) ─────────────────────
 
 MARKDOWN_RESPONSE = """## TECHNICAL
@@ -661,7 +735,9 @@ async def test_keeps_harmonic_volatile_fields_out_of_semi_static_layer():
 
     assert '"score":75' not in first_user_layers[h1_tier].text
     assert '"completion_pct":90' not in first_user_layers[h1_tier].text
-    assert '"reason"' not in first_user_layers[h1_tier].text
+    # The auditable structure evidence envelope is intentionally static and
+    # belongs in this cached layer; volatile harmonic fields do not.
+    assert '"reason"' in first_user_layers[h1_tier].text
 
     assert '"type":"bat"' in first_user_layers[h1_tier].text
     assert '"direction":"bullish"' in first_user_layers[h1_tier].text
