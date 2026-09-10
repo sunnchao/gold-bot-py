@@ -443,10 +443,13 @@ def run_replay(raw: Any) -> ReplayResult:
     ai_stop_loss_result = _apply_ai_stop_loss_override(position_filter_result["signal"], snapshot.get("ai_result"))
     ai_take_profit_result = _apply_ai_take_profit_override(ai_stop_loss_result["signal"], snapshot.get("ai_result"))
     rr_filter_result = _apply_min_rr_filter(ai_take_profit_result["signal"], traditional_config["minRR"])
+    final_validation_result = _apply_final_pullback_validation(
+        rr_filter_result["signal"], enriched_h1, traditional_config
+    )
     position_review = _evaluate_replay_position_commands(snapshot, enriched_h1, current_price)
 
     return {
-        "signal": rr_filter_result["signal"],
+        "signal": final_validation_result["signal"],
         "logs": _build_replay_logs(
             snapshot,
             enriched_h1,
@@ -463,7 +466,7 @@ def run_replay(raw: Any) -> ReplayResult:
             min_score_result["logs"],
             position_filter_result["logs"],
             ai_stop_loss_result["logs"] + ai_take_profit_result["logs"],
-            rr_filter_result["logs"],
+            rr_filter_result["logs"] + final_validation_result["logs"],
             momentum_config,
             traditional_config,
             smc_context,
@@ -1268,6 +1271,80 @@ def _apply_min_rr_filter(signal: ReplaySignal | None, min_rr: float) -> dict[str
                 }
             ],
         }
+    return {"signal": signal, "logs": []}
+
+
+def _apply_final_pullback_validation(
+    signal: ReplaySignal | None, h1: list[EnrichedReplayBar], config: ReplayTraditionalConfig
+) -> dict[str, Any]:
+    """
+    pullback 策略最终校验：几何、TP2 R:R ≥ 1.25、止损距离 ≤ 2.5 ATR。
+    """
+    if signal is None:
+        return {"signal": signal, "logs": []}
+    
+    strategy = signal.get("strategy", "")
+    if strategy != "pullback":
+        # 只校验 pullback 策略
+        return {"signal": signal, "logs": []}
+    
+    side = signal["side"]
+    entry = signal["entry"]
+    stop_loss = signal["stop_loss"]
+    
+    # 1. 几何校验：BUY 时 entry > SL，SELL 时 entry < SL
+    if (side == "BUY" and entry <= stop_loss) or (side == "SELL" and entry >= stop_loss):
+        return {
+            "signal": None,
+            "logs": [
+                {
+                    "level": "error",
+                    "strategy": "pullback",
+                    "msg": f"❌ pullback.final_geometry_invalid: {side} entry={_format_fixed(entry, 2)} / SL={_format_fixed(stop_loss, 2)} 几何无效 ⏭",
+                }
+            ],
+        }
+    
+    # 2. TP2 RR ≥ 1.25 校验
+    tp2 = signal.get("tp2")
+    if tp2 is not None and tp2 > 0:
+        # 用 _signal_risk_reward 计算 TP2 的 RR
+        rr_tp2 = _signal_risk_reward(side, entry, stop_loss, tp2)
+        if rr_tp2 is not None and rr_tp2 + 1e-12 < 1.25:
+            return {
+                "signal": None,
+                "logs": [
+                    {
+                        "level": "warn",
+                        "strategy": "pullback",
+                        "msg": f"⚠️ pullback.final_rr_below_minimum: TP2 R:R={_format_risk_reward(rr_tp2)} < 1.25 拒绝 ⏭",
+                    }
+                ],
+            }
+    
+    # 3. 止损距离 ≤ 2.5 ATR 校验
+    if not h1:
+        return {"signal": signal, "logs": []}
+    last = h1[-1]
+    atr_value = last.get("atr", 0)
+    if atr_value <= 0:
+        return {"signal": signal, "logs": []}
+    
+    risk = abs(entry - stop_loss)
+    max_stop_distance_atr = 2.5
+    if risk > atr_value * max_stop_distance_atr + 1e-8:
+        risk_atr = risk / atr_value
+        return {
+            "signal": None,
+            "logs": [
+                {
+                    "level": "error",
+                    "strategy": "pullback",
+                    "msg": f"❌ pullback.stop_distance_exceeded: 止损距离={_format_fixed(risk_atr, 2)} ATR > {_format_fixed(max_stop_distance_atr, 1)} ATR 拒绝 ⏭",
+                }
+            ],
+        }
+    
     return {"signal": signal, "logs": []}
 
 

@@ -957,3 +957,138 @@ def test_compute_replay_coverage_sees_no_pairs_in_top_level_fixture_dir() -> Non
     """当前夹具根目录是 input.json/expected.json 命名,coverage(按 _snapshot.json 配对)应为 0 对。"""
     summary = compute_replay_coverage(str(FIXTURE_ROOT))
     assert summary == {"total": 0, "validated": 0}
+
+
+def test_pullback_final_validation_rejects_invalid_geometry_buy() -> None:
+    """pullback 最终校验：BUY 几何无效（entry <= SL）拒绝。"""
+    from backend.trading_core.replay.replay import _apply_final_pullback_validation
+
+    signal = {
+        "strategy": "pullback",
+        "side": "BUY",
+        "entry": 95.0,
+        "stop_loss": 95.5,  # SL 高于 entry，几何无效
+        "tp1": 98.0,
+        "tp2": 100.0,
+    }
+    h1 = [{"atr": 2.0}]
+    config = {"pullback": {}}
+
+    result = _apply_final_pullback_validation(signal, h1, config)
+    assert result["signal"] is None
+    assert len(result["logs"]) == 1
+    assert result["logs"][0]["level"] == "error"
+    assert result["logs"][0]["strategy"] == "pullback"
+    assert "pullback.final_geometry_invalid" in result["logs"][0]["msg"]
+    assert "几何无效" in result["logs"][0]["msg"]
+
+
+def test_pullback_final_validation_rejects_invalid_geometry_sell() -> None:
+    """pullback 最终校验：SELL 几何无效（entry >= SL）拒绝。"""
+    from backend.trading_core.replay.replay import _apply_final_pullback_validation
+
+    signal = {
+        "strategy": "pullback",
+        "side": "SELL",
+        "entry": 95.0,
+        "stop_loss": 94.5,  # SL 低于 entry，几何无效
+        "tp1": 92.0,
+        "tp2": 90.0,
+    }
+    h1 = [{"atr": 2.0}]
+    config = {"pullback": {}}
+
+    result = _apply_final_pullback_validation(signal, h1, config)
+    assert result["signal"] is None
+    assert len(result["logs"]) == 1
+    assert result["logs"][0]["level"] == "error"
+    assert "pullback.final_geometry_invalid" in result["logs"][0]["msg"]
+
+
+def test_pullback_final_validation_rejects_low_tp2_rr() -> None:
+    """pullback 最终校验：TP2 R:R < 1.25 拒绝。"""
+    from backend.trading_core.replay.replay import _apply_final_pullback_validation
+
+    signal = {
+        "strategy": "pullback",
+        "side": "BUY",
+        "entry": 95.0,
+        "stop_loss": 93.0,  # risk = 2.0
+        "tp1": 96.0,
+        "tp2": 97.0,  # reward = 2.0, RR = 1.0 < 1.25
+    }
+    h1 = [{"atr": 2.0}]
+    config = {"pullback": {}}
+
+    result = _apply_final_pullback_validation(signal, h1, config)
+    assert result["signal"] is None
+    assert len(result["logs"]) == 1
+    assert result["logs"][0]["level"] == "warn"
+    assert result["logs"][0]["strategy"] == "pullback"
+    assert "pullback.final_rr_below_minimum" in result["logs"][0]["msg"]
+    assert "< 1.25" in result["logs"][0]["msg"]
+
+
+def test_pullback_final_validation_rejects_excessive_stop_distance() -> None:
+    """pullback 最终校验：止损距离 > 2.5 ATR 拒绝。"""
+    from backend.trading_core.replay.replay import _apply_final_pullback_validation
+
+    signal = {
+        "strategy": "pullback",
+        "side": "BUY",
+        "entry": 95.0,
+        "stop_loss": 88.0,  # 95 - 88 = 7 = 3.5 ATR > 2.5 ATR
+        "tp1": 100.0,
+        "tp2": 105.0,
+    }
+    h1 = [{"atr": 2.0}]
+    config = {"pullback": {}}
+
+    result = _apply_final_pullback_validation(signal, h1, config)
+    assert result["signal"] is None
+    assert len(result["logs"]) == 1
+    assert result["logs"][0]["level"] == "error"
+    assert result["logs"][0]["strategy"] == "pullback"
+    assert "pullback.stop_distance_exceeded" in result["logs"][0]["msg"]
+    assert "> 2.5" in result["logs"][0]["msg"]
+
+
+def test_pullback_final_validation_passes_valid_signal() -> None:
+    """pullback 最终校验：合法信号通过。"""
+    from backend.trading_core.replay.replay import _apply_final_pullback_validation
+
+    signal = {
+        "strategy": "pullback",
+        "side": "BUY",
+        "entry": 95.0,
+        "stop_loss": 93.0,  # risk = 2.0 ATR
+        "tp1": 97.5,
+        "tp2": 98.0,  # reward = 3.0, RR = 1.5 >= 1.25
+    }
+    h1 = [{"atr": 2.0}]
+    config = {"pullback": {}}
+
+    result = _apply_final_pullback_validation(signal, h1, config)
+    assert result["signal"] == signal
+    assert len(result["logs"]) == 0
+
+
+def test_pullback_final_validation_skips_non_pullback_strategy() -> None:
+    """pullback 最终校验：非 pullback 策略跳过。"""
+    from backend.trading_core.replay.replay import _apply_final_pullback_validation
+
+    signal = {
+        "strategy": "divergence",
+        "side": "BUY",
+        "entry": 95.0,
+        "stop_loss": 96.0,  # 几何无效，但不是 pullback 策略
+        "tp1": 100.0,
+        "tp2": 105.0,
+    }
+    h1 = [{"atr": 2.0}]
+    config = {"pullback": {}}
+
+    result = _apply_final_pullback_validation(signal, h1, config)
+    assert result["signal"] == signal
+    assert len(result["logs"]) == 0
+
