@@ -1282,16 +1282,16 @@ def _apply_final_pullback_validation(
     """
     if signal is None:
         return {"signal": signal, "logs": []}
-    
+
     strategy = signal.get("strategy", "")
     if strategy != "pullback":
         # 只校验 pullback 策略
         return {"signal": signal, "logs": []}
-    
+
     side = signal["side"]
     entry = signal["entry"]
     stop_loss = signal["stop_loss"]
-    
+
     # 1. 几何校验：BUY 时 entry > SL，SELL 时 entry < SL
     if (side == "BUY" and entry <= stop_loss) or (side == "SELL" and entry >= stop_loss):
         return {
@@ -1300,11 +1300,14 @@ def _apply_final_pullback_validation(
                 {
                     "level": "error",
                     "strategy": "pullback",
-                    "msg": f"❌ pullback.final_geometry_invalid: {side} entry={_format_fixed(entry, 2)} / SL={_format_fixed(stop_loss, 2)} 几何无效 ⏭",
+                    "msg": (
+                        f"❌ pullback.final_geometry_invalid: {side} "
+                        f"entry={_format_fixed(entry, 2)} / SL={_format_fixed(stop_loss, 2)} 几何无效 ⏭"
+                    ),
                 }
             ],
         }
-    
+
     # 2. TP2 RR ≥ 1.25 校验
     tp2 = signal.get("tp2")
     if tp2 is not None and tp2 > 0:
@@ -1317,11 +1320,14 @@ def _apply_final_pullback_validation(
                     {
                         "level": "warn",
                         "strategy": "pullback",
-                        "msg": f"⚠️ pullback.final_rr_below_minimum: TP2 R:R={_format_risk_reward(rr_tp2)} < 1.25 拒绝 ⏭",
+                        "msg": (
+                            f"⚠️ pullback.final_rr_below_minimum: "
+                            f"TP2 R:R={_format_risk_reward(rr_tp2)} < 1.25 拒绝 ⏭"
+                        ),
                     }
                 ],
             }
-    
+
     # 3. 止损距离 ≤ 2.5 ATR 校验
     if not h1:
         return {"signal": signal, "logs": []}
@@ -1329,7 +1335,7 @@ def _apply_final_pullback_validation(
     atr_value = last.get("atr", 0)
     if atr_value <= 0:
         return {"signal": signal, "logs": []}
-    
+
     risk = abs(entry - stop_loss)
     max_stop_distance_atr = 2.5
     if risk > atr_value * max_stop_distance_atr + 1e-8:
@@ -1340,11 +1346,15 @@ def _apply_final_pullback_validation(
                 {
                     "level": "error",
                     "strategy": "pullback",
-                    "msg": f"❌ pullback.stop_distance_exceeded: 止损距离={_format_fixed(risk_atr, 2)} ATR > {_format_fixed(max_stop_distance_atr, 1)} ATR 拒绝 ⏭",
+                    "msg": (
+                        f"❌ pullback.stop_distance_exceeded: "
+                        f"止损距离={_format_fixed(risk_atr, 2)} ATR > "
+                        f"{_format_fixed(max_stop_distance_atr, 1)} ATR 拒绝 ⏭"
+                    ),
                 }
             ],
         }
-    
+
     return {"signal": signal, "logs": []}
 
 
