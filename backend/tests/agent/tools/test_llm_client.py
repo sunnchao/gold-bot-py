@@ -250,8 +250,8 @@ async def test_adds_prompt_cache_key_only_for_kimi_moonshot_strategy():
     assert "cache_control" not in json.dumps(body)
 
 
-async def test_deepseek_requests_set_reasoning_effort_high_and_disable_thinking():
-    # 老板要求:DeepSeek 模型 reasoning_effort=high,并显式关闭 thinking 输出。
+async def test_deepseek_requests_set_reasoning_effort_max_and_disable_thinking():
+    # 老板要求:DeepSeek 模型 reasoning_effort=max,并显式关闭 thinking 输出。
     bodies: list[dict] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -265,7 +265,7 @@ async def test_deepseek_requests_set_reasoning_effort_high_and_disable_thinking(
     )
 
     body = bodies[0]
-    assert body["reasoning_effort"] == "high"
+    assert body["reasoning_effort"] == "max"
     assert body["thinking"] == {"type": "disabled"}
 
 
@@ -787,7 +787,7 @@ async def test_fallback_model_request_does_not_inherit_primary_model_params():
 
     assert await client.invoke("test") == "ok"
     assert bodies[0]["model"] == "deepseek-v4-flash-0731"
-    assert bodies[0]["reasoning_effort"] == "high"
+    assert bodies[0]["reasoning_effort"] == "max"
     assert bodies[1]["model"] == "gpt-4o-mini"
     assert "reasoning_effort" not in bodies[1]
     assert "thinking" not in bodies[1]

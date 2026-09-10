@@ -239,7 +239,7 @@ class LLMClient:
             params["extra_body"] = {"prompt_cache_key": "gold-analysis"}
         if _is_deepseek_model(model):
             extra_body = params.get("extra_body") or {}
-            extra_body["reasoning_effort"] = "high"
+            extra_body["reasoning_effort"] = "max"
             extra_body["thinking"] = {"type": "disabled"}
             params["extra_body"] = extra_body
         if self._transport is not None:
