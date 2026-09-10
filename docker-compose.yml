@@ -19,6 +19,8 @@ services:
       GB_REDIS_URL: redis://gold-bot-redis:6379
       REDIS_URL: redis://gold-bot-redis:6379
       GOLDBOT_API_URL: http://gold-bot-backend:8000
+      LLM_API_KEY: sk-d38DUi1xUI4UMtfMDkV6kKeUgsYANNMoNxcIIBStDf3NL7k4
+      LLM_MODEL: deepseek-flash
     ports:
       - "127.0.0.1:8881:8000"
     volumes:
