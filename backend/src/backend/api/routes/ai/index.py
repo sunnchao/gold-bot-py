@@ -38,7 +38,7 @@ __all__ = [
 VALID_TRADE_PLAN_MODES = {"observe", "veto", "approve", "modify", "reduce", "close"}
 VALID_TRADE_PLAN_SIDES = {"buy", "sell", "none"}
 AI_RISK_EXIT_SUGGESTIONS = {"close_partial", "close_all", "close_short"}
-AI_APPROVE_QUEUE_MIN_CONFIDENCE = 65
+AI_APPROVE_QUEUE_MIN_CONFIDENCE = 50
 ALLOWED_STRATEGY_MAPPING_KEYS = [
     "20250231",
     "20250232",
