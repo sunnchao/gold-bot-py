@@ -1,5 +1,9 @@
 # 默认拉取 GHCR 发布镜像。本地构建使用：
 # docker compose -f docker-compose.yml -f docker-compose.build.yml up --build
+#
+# 日常更新只拉取自家镜像（backend/frontend 常变，infra 镜像固定版本）：
+#   docker compose pull backend frontend && docker compose up -d
+# 不要用裸 `docker compose pull`，它会把 redis/prometheus/grafana 也全拉一遍。
 services:
   backend:
     image: ${GOLDBOT_BACKEND_IMAGE:-ghcr.io/sunnchao/gold-bot-py-backend:latest}
@@ -56,6 +60,8 @@ services:
 
   redis:
     image: redis:7-alpine
+    # infra 镜像版本固定：本地缺失时才拉，up/更新时不重复拉取
+    pull_policy: missing
     container_name: gold-bot-redis
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
@@ -72,6 +78,8 @@ services:
 
   prometheus:
     image: prom/prometheus:latest
+    # 同上：只在缺失时拉取
+    pull_policy: missing
     container_name: gold-bot-prometheus
     command:
       - "--config.file=/etc/prometheus/prometheus.yml"
@@ -91,6 +99,8 @@ services:
 
   grafana:
     image: grafana/grafana:latest
+    # 同上：只在缺失时拉取
+    pull_policy: missing
     container_name: gold-bot-grafana
     environment:
       - GF_SECURITY_ADMIN_USER=${GRAFANA_USER:-admin}
