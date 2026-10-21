@@ -1,24 +1,12 @@
 # syntax=docker/dockerfile:1.7
-# Build from repo root:
+# Build from repo root after `npm run build` in frontend/:
 #   docker build -f backend/Dockerfile -t gold-bot-backend .
 #
 # 前端静态资源打进 /opt/dashboard，并镜像 TS releaseRoot/apps/app-web/dist 布局。
 #
-# 缓存策略：依赖安装（npm ci / uv sync）与源码复制分成独立阶段，源码变更不会
+# 缓存策略：依赖安装（uv sync）与源码复制分成独立阶段，源码变更不会
 # 使依赖层失效；配合 CI 的 type=gha 层缓存实现重复构建的快速复用。
-
-# --- Frontend: install deps (cached separately from source) ---
-FROM node:22-alpine AS frontend-deps
-WORKDIR /app
-COPY frontend/package.json frontend/package-lock.json ./
-RUN --mount=type=cache,target=/root/.npm npm ci
-
-# --- Frontend: build (reuses deps layer) ---
-FROM node:22-alpine AS frontend-build
-WORKDIR /app
-COPY frontend/ ./
-COPY --from=frontend-deps /app/node_modules ./node_modules
-RUN npm run build && test -f /app/dist/index.html
+# 前端静态资源与架构无关，由构建上下文的 frontend/dist 提供（CI 只构建一次）。
 
 # --- Python: install deps into venv (cached separately from source) ---
 FROM python:3.12-slim AS python-deps
@@ -51,7 +39,7 @@ COPY backend/src ./src
 # install only the project (deps already present in venv; fast)
 RUN pip install --no-cache-dir uv \
  && uv sync --frozen --no-dev
-COPY --from=frontend-build /app/dist /opt/dashboard
-COPY --from=frontend-build /app/dist /code/apps/app-web/dist
+COPY frontend/dist /opt/dashboard
+COPY frontend/dist /code/apps/app-web/dist
 EXPOSE 8000
 CMD ["uvicorn", "backend.main:app", "--host", "0.0.0.0", "--port", "8000"]

@@ -1,3 +1,5 @@
+# 两个镜像都消费 frontend/dist，构建前先产出静态资源：
+#   (cd frontend && npm ci && npm run build)
 services:
   backend:
     build:

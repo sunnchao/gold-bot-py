@@ -27,8 +27,9 @@ npm run dev
 保留 `/api` 前缀;`VITE_PROXY_TARGET=http://backend:8000` 用于 Docker 内联)。
 Token 认证通过 `?token=...` 查询参数或 localStorage 中的 `gold-bot.dashboard-token`。
 
-生产:frontend 镜像用 nginx(`try_files` + `/accounts/` 回 `__dynamic__`);
-backend 镜像把 `frontend/dist` 拷到 `/opt/dashboard` 与 `apps/app-web/dist`,
+生产:先 `npm run build`。frontend 镜像用 nginx 直接拷贝 `dist`
+(`try_files` + `/accounts/` 回 `__dynamic__`);backend 镜像把同一份
+`frontend/dist` 拷到 `/opt/dashboard` 与 `apps/app-web/dist`。
 `create_api_app` 在 JSON 404 之前按 TS `staticDashboardResponse` 回 HTML。
 
 ## 质量门禁
