@@ -1,4 +1,4 @@
 node_modules/
-dist/
+# dist 由 CI 的 web-dist 产物提供，构建时必须进上下文，不忽略
 .next/
 *.log
