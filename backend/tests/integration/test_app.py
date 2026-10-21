@@ -73,9 +73,9 @@
                                                                     → test_ai_result_v2_gate_reject_no_queue
 - "does not queue live commands for accepted AI approve plans in shadow mode"
   → test_ai_result_shadow_mode_stores_but_does_not_queue
-- "queues confidence 65 accepted AI approve plans for cutover accounts"
-  → test_ai_result_confidence_65_cutover_queues
-- "records a queue skip event for confidence 64 accepted AI approve plans" → test_ai_result_confidence_64_queue_skip
+- "queues confidence 50 accepted AI approve plans for cutover accounts"
+  → test_ai_result_confidence_50_cutover_queues
+- "records a queue skip event for confidence 49 accepted AI approve plans" → test_ai_result_confidence_49_queue_skip
 - stop intents(BUY_STOP/SELL_STOP)                                 → test_ai_result_stop_intents_cutover_no_queue
 - "queues the first valid dual AI approve plan and keeps the Go symbol cooldown behavior"
                                                                     → test_ai_result_dual_plan_queues_first_and_cooldown
@@ -1695,7 +1695,7 @@ async def test_ai_result_shadow_mode_stores_but_does_not_queue() -> None:
     assert snapshot["command"]["risk_gate"]["canProduceLiveCommands"] is False
 
 
-async def test_ai_result_confidence_65_cutover_queues() -> None:
+async def test_ai_result_confidence_50_cutover_queues() -> None:
     client, store = make_client()
     now_ms = int(datetime.now(UTC).timestamp() * 1000)
     now_iso = _now_iso_from_ms(now_ms)
@@ -1740,7 +1740,7 @@ async def test_ai_result_confidence_65_cutover_queues() -> None:
                 "stop_loss": 3330,
                 "take_profit": [3345],
                 "max_lots": 0.1,
-                "confidence": 65,
+                "confidence": 50,
                 "expires_at": "2099-06-06T09:15:00Z",
                 "reason_codes": ["mode.approve", "side.buy"],
                 "narrative": "cutover mode may queue after deterministic and pending gates",
@@ -1762,8 +1762,8 @@ async def test_ai_result_confidence_65_cutover_queues() -> None:
     assert command["status"] == "queued"
     assert command["decision_id"] == "tpv1_cutover_mode"
     assert command["type"] == "BUY"
-    assert command["confidence"] == 65
-    assert command["score"] == 65
+    assert command["confidence"] == 50
+    assert command["score"] == 50
 
     polled = await store.poll_commands(ACCOUNT_ID)
     assert len(polled) == 1
@@ -1771,8 +1771,8 @@ async def test_ai_result_confidence_65_cutover_queues() -> None:
     assert polled[0]["source"] == "ai_approve"
     assert polled[0]["decision_id"] == "tpv1_cutover_mode"
     assert polled[0]["type"] == "BUY"
-    assert polled[0]["confidence"] == 65
-    assert polled[0]["score"] == 65
+    assert polled[0]["confidence"] == 50
+    assert polled[0]["score"] == 50
 
 
 async def test_ai_approve_command_uses_real_registered_symbol_when_analysis_case_differs() -> None:
@@ -1861,7 +1861,7 @@ async def test_ai_approve_command_uses_real_registered_symbol_when_analysis_case
     assert polled[0]["symbol"] == "GOLDm#"
 
 
-async def test_ai_result_confidence_64_queue_skip() -> None:
+async def test_ai_result_confidence_49_queue_skip() -> None:
     client, store = make_client()
     await store.set_runtime_mode(ACCOUNT_ID, "cutover")
     await store.save_registration({"account_id": ACCOUNT_ID, "leverage": 500})
@@ -1902,7 +1902,7 @@ async def test_ai_result_confidence_64_queue_skip() -> None:
                 "stop_loss": 3330,
                 "take_profit": [3345],
                 "max_lots": 0.1,
-                "confidence": 64,
+                "confidence": 49,
                 "expires_at": "2099-06-06T09:15:00Z",
                 "reason_codes": ["mode.approve", "side.buy"],
                 "narrative": "otherwise valid approve below live confidence threshold",
