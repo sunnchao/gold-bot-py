@@ -54,6 +54,9 @@ __all__ = [
 
 DEFAULT_MAX_TOKENS = 16384
 DEFAULT_TEMPERATURE = 0.1
+# Kimi 思考模型:思考 token 计入 completion,正文预算需相应放大。
+KIMI_THINKING_MAX_TOKENS = 32768
+MAX_REASONING_EFFORT = "max"
 LAYER_SEPARATOR = "\n\n----------------------------------------\n\n"
 
 ResponseT = TypeVar("ResponseT")
@@ -123,6 +126,12 @@ def detect_cache_strategy(model: str, enable_prompt_caching: bool) -> CacheStrat
 def _is_deepseek_model(model: str) -> bool:
     """DeepSeek 推理模型:reasoning_effort=high + 关闭 thinking 输出。"""
     return "deepseek" in model.lower()
+
+
+def _is_kimi_thinking_model(model: str) -> bool:
+    """Kimi/Moonshot 思考模型(kimi-k3.1-pro 等):开启 max 思考。"""
+    model_lower = model.lower()
+    return "kimi" in model_lower or "moonshot" in model_lower
 
 
 @dataclass(frozen=True)
@@ -239,9 +248,17 @@ class LLMClient:
             params["extra_body"] = {"prompt_cache_key": "gold-analysis"}
         if _is_deepseek_model(model):
             extra_body = params.get("extra_body") or {}
-            extra_body["reasoning_effort"] = "max"
+            extra_body["reasoning_effort"] = MAX_REASONING_EFFORT
             extra_body["thinking"] = {"type": "disabled"}
             params["extra_body"] = extra_body
+        if _is_kimi_thinking_model(model):
+            # 老板要求:kimi-k3.1-pro 开启 max 思考(thinking 打开 + effort 拉满),
+            # 并放大 max_tokens,避免思考 token 挤占正文导致 JSON 截断。
+            extra_body = params.get("extra_body") or {}
+            extra_body["reasoning_effort"] = MAX_REASONING_EFFORT
+            extra_body["thinking"] = {"type": "enabled"}
+            params["extra_body"] = extra_body
+            params["max_tokens"] = max(int(params["max_tokens"]), KIMI_THINKING_MAX_TOKENS)
         if self._transport is not None:
             # httpx.MockTransport 同时实现 BaseTransport 与 AsyncBaseTransport
             params["http_client"] = httpx.Client(transport=self._transport, timeout=self._timeout)  # type: ignore[arg-type]

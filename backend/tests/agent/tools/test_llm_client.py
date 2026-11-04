@@ -269,6 +269,30 @@ async def test_deepseek_requests_set_reasoning_effort_max_and_disable_thinking()
     assert body["thinking"] == {"type": "disabled"}
 
 
+async def test_kimi_requests_enable_max_thinking_and_raise_max_tokens():
+    # 老板要求:主分析基座模型 kimi-k3.1-pro 开启 max 思考;
+    # 思考 token 计入 completion,故 max_tokens 需放大到 32768。
+    bodies: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        bodies.append(json.loads(request.content))
+        return json_response({"choices": [{"message": {"content": "{\"ok\": true}"}}]})
+
+    client = LLMClient(default_config(model="kimi-k3.1-pro"), transport=httpx.MockTransport(handler))
+    await client.invoke_layered(
+        [{"text": "system", "cacheable": True}],
+        [{"text": "user", "cacheable": False}],
+    )
+
+    body = bodies[0]
+    assert body["model"] == "kimi-k3.1-pro"
+    assert body["reasoning_effort"] == "max"
+    assert body["thinking"] == {"type": "enabled"}
+    assert body["max_completion_tokens"] == 32768
+    # kimi 仍走 prompt_cache_key 缓存策略
+    assert body["prompt_cache_key"] == "gold-analysis"
+
+
 async def test_non_deepseek_requests_do_not_carry_deepseek_reasoning_fields():
     bodies: list[dict] = []
 
