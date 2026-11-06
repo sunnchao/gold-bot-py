@@ -9,8 +9,9 @@
 - 动态价格窗 + 跨品种碰撞检测 + 交易业务校验
 - decide_trade_action(legacy 工具)与 decide_account_actions(账户感知 + rebuild)
 
-依赖说明:tools/elliott-wave.ts、tools/chanlun-core.ts 由最小确定性本地实现支撑
-(_support.analyze_elliott_wave / analyze_chanlun),待后续 M7 worker 移植后对齐。
+依赖说明:tools/elliott-wave.ts、tools/chanlun-core.ts 已分别由
+tools/elliott_wave.py、tools/chanlun_core.py 完整移植;_support.analyze_elliott_wave /
+analyze_chanlun 仅作适配层,把 dataclass 结果转成 dict 后返回。
 """
 
 from __future__ import annotations
@@ -404,49 +405,169 @@ class StructureCache:
                 self._cache[key] = StructureTierEntry(hash_value=hash_value, text=text)
                 block_texts.append(text)
 
-        return {"blockTexts": block_texts, "harmonicVolatile": harmonic_ctx_volatile}
+        return {
+            "blockTexts": block_texts,
+            "harmonicVolatile": harmonic_ctx_volatile,
+            "waveStructure": wave_structure,
+            "chanlunStructure": chanlun_structure,
+        }
 
 
-def _neutralize_unsupported_theory(result: JSONDict) -> None:
-    """Prevent LLM prose from upgrading minimal observations into confirmed theory."""
+# 波浪结构视为"可用"的最低置信度:真实引擎在 5 浪齐全时给 75(有规则违规扣分),
+# 60 表示至少要有完整 5 浪结构,排除零散摆动点凑出的伪结构。
+WAVE_STRUCTURE_MIN_CONFIDENCE = 60
+
+
+def _wave_structure_confirmed(structure: dict[str, Any] | None) -> bool:
+    """波浪结构是否达到"可用于判断趋势"的级别。
+
+    判定条件:5 浪推动结构完整,且结构置信度达到可用线。
+    注意不要求 validation.isValid —— 艾略特规则违规(如 "Wave 4 overlaps
+    Wave 1")在引导/对角楔形中本就允许,而且 5 浪完整计数本身已是强结构证据;
+    违规会通过 confidence 扣分体现,由置信度门槛统一裁决,避免把可用结构误判成
+    "结构不可用"从而把 trend_strength 永久钉死为 weak。
+    """
+    if not isinstance(structure, dict):
+        return False
+    if len(structure.get("impulseWaves") or []) != 5:
+        return False
+    confidence = structure.get("confidence")
+    if not isinstance(confidence, (int, float)) or isinstance(confidence, bool):
+        return False
+    return float(confidence) >= WAVE_STRUCTURE_MIN_CONFIDENCE
+
+
+def _chanlun_structure_available(structure: dict[str, Any] | None) -> bool:
+    """缠论结构是否可用:至少成笔(有笔才有方向,有中枢才有级别)。"""
+    if not isinstance(structure, dict):
+        return False
+    return bool(structure.get("strokes"))
+
+
+def _current_hub_state(structure: dict[str, Any] | None) -> str | None:
+    """按'当前价格是否真的还在最新中枢区间内'推导中枢状态。
+
+    缠论中枢由连续 3 笔重叠生成,引擎(build_hubs)用滑动窗口遍历,因此 999 根 K 上
+    会产出大量历史中枢。**存在历史中枢不等于当前仍处中枢内**:价格早已离开时,
+    状态应为 none。若仅以'hubs 非空'就把 LLM 的 none 改写成 active,等于向交易决策
+    注入伪造的'价格仍在盘整中枢'证据——与 evidence-integrity 的初衷相悖。
+
+    返回 "active"(价格落在最新中枢区间内)或 "none"(已离开),无法判定时返回 None。
+    """
+    if not isinstance(structure, dict):
+        return None
+    hubs = structure.get("hubs") or []
+    if not hubs:
+        return "none"
+    last_hub = hubs[-1]
+    if not isinstance(last_hub, dict):
+        return None
+    low = last_hub.get("low")
+    high = last_hub.get("high")
+    price = _structure_latest_price(structure)
+    if not isinstance(low, (int, float)) or isinstance(low, bool):
+        return None
+    if not isinstance(high, (int, float)) or isinstance(high, bool):
+        return None
+    if price is None:
+        return None
+    lower, upper = (float(low), float(high)) if low <= high else (float(high), float(low))
+    return "active" if lower <= price <= upper else "none"
+
+
+def _structure_latest_price(structure: dict[str, Any] | None) -> float | None:
+    """取结构里最新的收盘价:优先最后一根处理后的 K,退化到最后一笔的终点。"""
+    if not isinstance(structure, dict):
+        return None
+    for bar in reversed(structure.get("processedBars") or []):
+        if isinstance(bar, dict):
+            close = bar.get("close")
+            if isinstance(close, (int, float)) and not isinstance(close, bool):
+                return float(close)
+    for stroke in reversed(structure.get("strokes") or []):
+        if isinstance(stroke, dict):
+            end = stroke.get("endPrice")
+            if isinstance(end, (int, float)) and not isinstance(end, bool):
+                return float(end)
+    return None
+
+
+def _neutralize_unsupported_theory(
+    result: JSONDict,
+    wave_structure: dict[str, Any] | None = None,
+    chanlun_structure: dict[str, Any] | None = None,
+) -> None:
+    """Prevent LLM prose from upgrading minimal observations into confirmed theory.
+
+    仅当程序化结构确实不可用时才降级为 rejected/weak。当 tools/ 引擎给出的结构
+    真实可用时,保留 LLM 的波浪/缠论判断(仍由下面的 clamp 限制其 confidence
+    不超过结构自身的可信度),避免把"可用结构"误伤成"弱趋势"。
+    """
+    wave_available = _wave_structure_confirmed(wave_structure)
+    chanlun_available = _chanlun_structure_available(chanlun_structure)
+
     wave = result.get("wave")
     if isinstance(wave, dict):
-        wave.update(
-            {
-                "wave_confirmation": "rejected",
-                "extension_wave": None,
-                "corrective_type": None,
-                "trend_strength": "weak",
-                # Schema compatibility requires the object, but zero is an
-                # explicit neutral sentinel—not a model-generated wave target.
-                "target_levels": {"level_1_618": 0, "level_2_0": 0},
-                "confidence": 0,
-                "rationale": (
-                    "波浪完整计数不可用，局部摆动仅作观察 "
-                    "(Full wave count unavailable; swings are observation only)"
-                ),
-            }
-        )
+        if wave_available:
+            # 结构可用:不强制 rejected/weak,但趋势强度不允许弱于程序化结论,
+            # confidence 以结构置信度为上限(LLM 不得凭空抬高)。
+            assert wave_structure is not None
+            structure_confidence = float(wave_structure.get("confidence") or 0)
+            current = wave.get("confidence")
+            if not isinstance(current, (int, float)) or current > structure_confidence:
+                wave["confidence"] = structure_confidence
+            if wave.get("wave_confirmation") == "rejected":
+                wave["wave_confirmation"] = "partial"
+            if wave.get("trend_strength") == "weak":
+                wave["trend_strength"] = "moderate"
+        else:
+            wave.update(
+                {
+                    "wave_confirmation": "rejected",
+                    "extension_wave": None,
+                    "corrective_type": None,
+                    "trend_strength": "weak",
+                    # Schema compatibility requires the object, but zero is an
+                    # explicit neutral sentinel—not a model-generated wave target.
+                    "target_levels": {"level_1_618": 0, "level_2_0": 0},
+                    "confidence": 0,
+                    "rationale": (
+                        "波浪完整计数不可用，局部摆动仅作观察 "
+                        "(Full wave count unavailable; swings are observation only)"
+                    ),
+                }
+            )
     chanlun = result.get("chanlun")
     if isinstance(chanlun, dict):
-        chanlun.update(
-            {
-                "trend": "range",
-                "strength": "weak",
-                "latest_signal": "hold",
-                "hub_state": "none",
-                "confidence": 0,
-                "rationale": (
-                    "缠论笔段与中枢不可用，分型不构成确认信号 "
-                    "(Chanlun strokes and hubs unavailable; fractals are not confirmation)"
-                ),
-            }
-        )
+        if chanlun_available:
+            # 笔/中枢可用:保留 LLM 判断,只修正那些"结构不可用"时代的硬编码结论。
+            # 中枢状态必须由"价格是否真的仍在最新中枢区间内"推导 —— 历史上存在中枢
+            # 不等于当前仍在中枢内,否则等于伪造盘整证据。
+            assert chanlun_structure is not None
+            derived_hub_state = _current_hub_state(chanlun_structure)
+            if derived_hub_state is not None:
+                chanlun["hub_state"] = derived_hub_state
+            if chanlun.get("strength") == "weak":
+                chanlun["strength"] = "moderate"
+        else:
+            chanlun.update(
+                {
+                    "trend": "range",
+                    "strength": "weak",
+                    "latest_signal": "hold",
+                    "hub_state": "none",
+                    "confidence": 0,
+                    "rationale": (
+                        "缠论笔段与中枢不可用，分型不构成确认信号 "
+                        "(Chanlun strokes and hubs unavailable; fractals are not confirmation)"
+                    ),
+                }
+            )
     arbitration = result.get("arbitration")
     if not isinstance(arbitration, dict):
         return
     wave_theory = arbitration.get("wave_theory")
-    if isinstance(wave_theory, dict):
+    if isinstance(wave_theory, dict) and not wave_available:
         wave_theory.update(
             {
                 "current_wave": "Unknown",
@@ -458,7 +579,7 @@ def _neutralize_unsupported_theory(result: JSONDict) -> None:
             }
         )
     chanlun_theory = arbitration.get("chanlun_theory")
-    if isinstance(chanlun_theory, dict):
+    if isinstance(chanlun_theory, dict) and not chanlun_available:
         chanlun_theory.update(
             {
                 "trend": "range",
@@ -472,7 +593,11 @@ def _neutralize_unsupported_theory(result: JSONDict) -> None:
         )
 
 
-def normalize_comprehensive(result: JSONDict) -> JSONDict:
+def normalize_comprehensive(
+    result: JSONDict,
+    wave_structure: dict[str, Any] | None = None,
+    chanlun_structure: dict[str, Any] | None = None,
+) -> JSONDict:
     """Normalize enums and enforce the programmatic evidence boundary."""
     chanlun = result.get("chanlun")
     if isinstance(chanlun, dict):
@@ -485,7 +610,7 @@ def normalize_comprehensive(result: JSONDict) -> JSONDict:
             chanlun["latest_signal"] = "sell"
         elif latest == "close":
             chanlun["latest_signal"] = "sell"
-    _neutralize_unsupported_theory(result)
+    _neutralize_unsupported_theory(result, wave_structure, chanlun_structure)
     return result
 
 
@@ -678,7 +803,7 @@ MAX_RECENT_FRACTALS = 12
 MAX_RECENT_STROKES = 12
 MAX_RECENT_HUBS = 6
 
-STRUCTURE_EVIDENCE_VERSION = "minimal-observation-v1"
+STRUCTURE_EVIDENCE_VERSION = "programmatic-structure-v2"
 
 
 def _structure_evidence(
@@ -697,7 +822,10 @@ def _structure_evidence(
         "observedPoints": observed_points,
         "occurredAt": None,
         "confirmedAt": None,
-        "invalidationCriteria": "A confirmed full structure implementation is required.",
+        "invalidationCriteria": (
+            "Invalidate on structure recompute (new closed bar) or when the "
+            "impulse/corrective labeling no longer satisfies Elliott rules."
+        ),
         "algorithmVersion": STRUCTURE_EVIDENCE_VERSION,
         "reason": reason,
         # Keep the first shipped spelling additive for consumers that already
@@ -707,9 +835,44 @@ def _structure_evidence(
 
 
 def summarize_wave_structure(wave: JSONDict) -> JSONDict:
+    """把结构引擎的波浪结果压成 prompt/report 用的摘要。
+
+    真实引擎(tools/elliott_wave.py)会给出 swingPoints / impulseWaves /
+    correctiveWaves / validation;只有 5 浪推动结构齐全且置信度达标时才标记为
+    可用并透出 label,否则仍按"仅局部摆动观察"降级,避免把噪音当完成浪。
+    """
     swing_points = wave.get("swingPoints") or []
-    # The current implementation only detects local swings; it does not label
-    # valid impulse/corrective waves, so it must never support a confirmed wave.
+    impulse_waves = wave.get("impulseWaves") or []
+    corrective_waves = wave.get("correctiveWaves") or []
+    validation = wave.get("validation") or {}
+    confidence = wave.get("confidence")
+    confidence = float(confidence) if isinstance(confidence, (int, float)) and not isinstance(confidence, bool) else 0.0
+
+    if len(impulse_waves) == 5 and confidence >= WAVE_STRUCTURE_MIN_CONFIDENCE:
+        return {
+            "direction": wave.get("direction"),
+            "validation": {
+                "isValid": bool(validation.get("isValid")),
+                "violations": list(validation.get("violations") or []),
+            },
+            "confidence": confidence,
+            "impulseWaves": impulse_waves,
+            "correctiveWaves": corrective_waves,
+            "swingPoints": swing_points[-MAX_RECENT_SWING_POINTS:],
+            "evidence": _structure_evidence(
+                name="elliott_wave",
+                status="observed",
+                source_timeframe=wave.get("sourceTimeframe"),
+                reason=(
+                    "Programmatic 5-wave impulse labeling is available "
+                    f"(confidence {confidence:.0f}); Elliott rule violations "
+                    f"{'none' if validation.get('isValid') else list(validation.get('violations') or [])}."
+                ),
+                observed_points=len(swing_points),
+            ),
+        }
+
+    # 结构不完整:仍按"仅局部摆动观察"降级。
     return {
         "direction": None,
         "validation": {"isValid": False, "violations": ["full_wave_labeling_unavailable"]},
@@ -728,7 +891,33 @@ def summarize_wave_structure(wave: JSONDict) -> JSONDict:
 
 
 def summarize_chanlun_structure(chanlun: JSONDict) -> JSONDict:
+    """把缠论引擎结果压成摘要:有笔/中枢即视为结构可用。"""
     fractals = chanlun.get("fractals") or []
+    strokes = chanlun.get("strokes") or []
+    hubs = chanlun.get("hubs") or []
+
+    if strokes:
+        # 只透出最近的笔/中枢:全量(实测 252 笔 / 222 中枢)会把 prompt 撑到 50K+,
+        # 而决策只需最新结构上下文。
+        recent_strokes = strokes[-MAX_RECENT_STROKES:]
+        recent_hubs = hubs[-MAX_RECENT_HUBS:]
+        return {
+            "fractals": fractals[-MAX_RECENT_FRACTALS:],
+            "strokes": recent_strokes,
+            "hubs": recent_hubs,
+            "evidence": _structure_evidence(
+                name="chanlun",
+                status="observed",
+                source_timeframe=chanlun.get("sourceTimeframe"),
+                reason=(
+                    f"Programmatic Chanlun structure available: {len(strokes)} strokes, "
+                    f"{len(hubs)} hubs, {len(fractals)} fractals "
+                    f"(showing last {len(recent_strokes)} strokes / {len(recent_hubs)} hubs)."
+                ),
+                observed_points=len(fractals),
+            ),
+        }
+
     return {
         "fractals": fractals[-MAX_RECENT_FRACTALS:],
         "strokes": [],
@@ -737,7 +926,7 @@ def summarize_chanlun_structure(chanlun: JSONDict) -> JSONDict:
             name="chanlun",
             status="unavailable",
             source_timeframe=chanlun.get("sourceTimeframe"),
-            reason="Fractals are observations; strokes and hubs are not implemented.",
+            reason="Fractals are observations; no strokes or hubs were built.",
             observed_points=len(fractals),
         ),
     }
@@ -1681,6 +1870,10 @@ class ComprehensiveAnalystService:
         self.app_config = app_config or {}
         self.trade_model = trade_model
         self.structure_cache = StructureCache()
+        # 当前 run() 计算出的程序化结构,供 normalize/重试路径共用,
+        # 使 _neutralize_unsupported_theory 能按"结构是否真实可用"判断。
+        self._wave_structure: dict[str, Any] | None = None
+        self._chanlun_structure: dict[str, Any] | None = None
         if trade_client is not None:
             self.trade_client = trade_client
         else:
@@ -1727,7 +1920,9 @@ class ComprehensiveAnalystService:
             logger.info({"symbol": symbol}, "comprehensiveAnalysis: structured retry recovered a valid result")
             if not parsed.get("harmonic"):
                 parsed["harmonic"] = build_harmonic_from_context(None)
-            return normalize_comprehensive(parsed)
+            return normalize_comprehensive(
+                parsed, self._wave_structure, self._chanlun_structure
+            )
         except Exception as err:
             logger.warn(
                 {"symbol": symbol, "err": str(err)},
@@ -1827,6 +2022,9 @@ class ComprehensiveAnalystService:
         ]
 
         structure_result = build_static_context_prompt(payload, symbol, self.structure_cache)
+        # 保存本次结构,供 normalize_comprehensive / 结构化重试路径判定理论可用性。
+        self._wave_structure = structure_result.get("waveStructure")
+        self._chanlun_structure = structure_result.get("chanlunStructure")
         market_only = options.get("marketOnly") is True
 
         static_account_strategy_text = build_static_account_and_strategy_text(payload, market_only)
@@ -1888,7 +2086,9 @@ class ComprehensiveAnalystService:
         if format_ == "markdown":
             md_result = parse_markdown_response(raw, current_price, profile)
             if md_result:
-                result_data = normalize_comprehensive(md_result)
+                result_data = normalize_comprehensive(
+                    md_result, self._wave_structure, self._chanlun_structure
+                )
             else:
                 logger.warn({"symbol": symbol}, "comprehensiveAnalysis: Markdown parse failed, trying JSON fallback")
                 parsed = safe_parse_response(
@@ -1906,7 +2106,9 @@ class ComprehensiveAnalystService:
                 else:
                     if not parsed.get("harmonic"):
                         parsed["harmonic"] = build_harmonic_from_context(None)
-                    result_data = normalize_comprehensive(parsed)
+                    result_data = normalize_comprehensive(
+                        parsed, self._wave_structure, self._chanlun_structure
+                    )
         else:
             parsed = safe_parse_response(
                 raw, validate_comprehensive_data, {"agent": "comprehensive", "symbol": symbol}
@@ -1923,7 +2125,9 @@ class ComprehensiveAnalystService:
             else:
                 if not parsed.get("harmonic"):
                     parsed["harmonic"] = build_harmonic_from_context(None)
-                result_data = normalize_comprehensive(parsed)
+                result_data = normalize_comprehensive(
+                    parsed, self._wave_structure, self._chanlun_structure
+                )
 
         result: JSONDict = result_data
 

@@ -11,6 +11,10 @@ from backend.persistence.store import EaStore
 
 AnalysisTrigger = Callable[[str, str, str, str], Awaitable[None] | None]
 
+# 自动 AI 分析的触发周期:每根该周期的 K 线收盘后触发一次全局分析。
+# 老板决策(2026-11-06):由 M30 改为 M15,分析频率翻倍。
+TRIGGER_TIMEFRAME = "M15"
+
 
 class BarCloseEventService:
     def __init__(
@@ -60,7 +64,7 @@ class BarCloseEventService:
         return True
 
     def _trigger_for(self, timeframe: str) -> AnalysisTrigger | None:
-        if timeframe == "M30":
+        if timeframe == TRIGGER_TIMEFRAME:
             return self._llm_trigger
         return None
 

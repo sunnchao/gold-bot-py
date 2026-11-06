@@ -146,6 +146,242 @@ def test_normalize_comprehensive_neutralizes_unsupported_theory_only():
     assert normalized["harmonic"]["detected_pattern"] == "gartley"
 
 
+def _theory_result(**over: object) -> dict:
+    """构造一份 LLM 声称强理论的结果,用于验证 neutralize 的结构感知行为。"""
+    result = {
+        "technical": {"bias": "bearish", "confidence": 62},
+        "wave": {
+            "wave_confirmation": "confirmed",
+            "extension_wave": 5,
+            "corrective_type": "zigzag",
+            "trend_strength": "strong",
+            "target_levels": {"level_1_618": 4000.0, "level_2_0": 3900.0},
+            "confidence": 88,
+            "rationale": "5-wave impulse complete",
+        },
+        "chanlun": {
+            "trend": "down",
+            "strength": "strong",
+            "latest_signal": "sell",
+            "hub_state": "active",
+            "confidence": 70,
+            "rationale": "hub breakdown",
+        },
+        "arbitration": {
+            "confidence": 62,
+            "action": "open",
+            "wave_theory": {
+                "current_wave": "5",
+                "wave_direction": "down",
+                "wave_count": "5 complete",
+                "next_target": "3900",
+                "confidence": 75,
+                "rationale": "impulse done",
+            },
+            "chanlun_theory": {
+                "trend": "down",
+                "bi_direction": "down",
+                "duan_direction": "down",
+                "zhongshu_state": "active",
+                "buy_sell_point": "sell",
+                "confidence": 70,
+                "rationale": "hub breakdown",
+            },
+        },
+    }
+    result.update(over)  # type: ignore[arg-type]
+    return result
+
+
+def _five_wave_structure(confidence: float = 75, valid: bool = False) -> dict:
+    """5 浪齐全的波浪结构(valid=False 模拟 Wave4/Wave1 重叠违规)。"""
+    return {
+        "direction": "bearish",
+        "swingPoints": [{"index": i, "price": 100.0 - i, "type": "low"} for i in range(6)],
+        "impulseWaves": [{"wave": w} for w in range(1, 6)],
+        "correctiveWaves": [{"wave": "A"}, {"wave": "B"}, {"wave": "C"}],
+        "validation": {
+            "isValid": valid,
+            "violations": [] if valid else ["Wave 4 cannot overlap the price territory of wave 1."],
+        },
+        "confidence": confidence,
+    }
+
+
+def _chanlun_structure(strokes: int = 252, hubs: int = 222) -> dict:
+    return {
+        "processedBars": [],
+        "fractals": [{"type": "top", "index": 1, "price": 100.0}] * 3,
+        "strokes": [{"startIndex": i, "endIndex": i + 1, "direction": "down"} for i in range(strokes)],
+        "hubs": [{"startIndex": i, "endIndex": i + 2, "low": 1.0, "high": 2.0} for i in range(hubs)],
+    }
+
+
+def test_available_structure_keeps_llm_theory_and_unblocks_weak_threshold():
+    """结构可用时不得把 trend_strength 钉死为 weak(否则动态门槛永久 +6)。"""
+    result = ca.normalize_comprehensive(
+        _theory_result(), _five_wave_structure(), _chanlun_structure()
+    )
+    assert result["wave"]["trend_strength"] == "strong"
+    assert result["wave"]["wave_confirmation"] == "confirmed"
+    # LLM 的 confidence 被结构置信度(75)钳住,不得凭空抬高
+    assert result["wave"]["confidence"] == 75
+    assert result["arbitration"]["wave_theory"]["confidence"] != 0
+    assert result["chanlun"]["strength"] == "strong"
+    assert result["chanlun"]["hub_state"] == "active"
+
+
+def test_wave_structure_with_rule_violation_still_usable():
+    """Wave4/Wave1 重叠在引导楔形中合法,5 浪齐全且置信度达标即应视为可用。"""
+    structure = _five_wave_structure(confidence=75, valid=False)
+    assert ca._wave_structure_confirmed(structure) is True
+    result = ca.normalize_comprehensive(_theory_result(), structure, _chanlun_structure())
+    assert result["wave"]["trend_strength"] != "weak"
+
+
+def test_wave_structure_below_confidence_floor_is_unusable():
+    """置信度不足以支撑趋势判断的残缺口径仍须降级。"""
+    assert ca._wave_structure_confirmed(_five_wave_structure(confidence=39)) is False
+    result = ca.normalize_comprehensive(
+        _theory_result(), _five_wave_structure(confidence=39), _chanlun_structure()
+    )
+    assert result["wave"]["trend_strength"] == "weak"
+    assert result["wave"]["wave_confirmation"] == "rejected"
+    assert result["wave"]["confidence"] == 0
+
+
+def test_incomplete_impulse_is_unusable_even_with_high_confidence():
+    structure = _five_wave_structure(confidence=95)
+    structure["impulseWaves"] = structure["impulseWaves"][:3]
+    assert ca._wave_structure_confirmed(structure) is False
+
+
+def test_chanlun_available_when_only_strokes_present():
+    """有笔即可用(有方向),中枢缺失时不得强制 hub_state=none 之外的降级。"""
+    result = ca.normalize_comprehensive(
+        _theory_result(), _five_wave_structure(), _chanlun_structure(strokes=10, hubs=0)
+    )
+    assert result["chanlun"]["strength"] == "strong"
+
+
+def test_structure_unavailable_still_neutralizes_everything():
+    """结构不可用时安全边界必须维持原语义。"""
+    result = ca.normalize_comprehensive(
+        _theory_result(),
+        {"impulseWaves": [], "validation": {"isValid": False}, "confidence": 0},
+        {"strokes": [], "hubs": []},
+    )
+    assert result["wave"]["trend_strength"] == "weak"
+    assert result["wave"]["wave_confirmation"] == "rejected"
+    assert result["wave"]["confidence"] == 0
+    assert result["chanlun"]["strength"] == "weak"
+    assert result["chanlun"]["latest_signal"] == "hold"
+    assert result["chanlun"]["confidence"] == 0
+    assert result["arbitration"]["wave_theory"]["confidence"] == 0
+    assert result["arbitration"]["chanlun_theory"]["buy_sell_point"] == "none"
+
+
+def test_normalize_without_structures_is_backward_compatible():
+    """不传结构(默认参数)时保持旧的降级语义,兼容既有调用。"""
+    result = ca.normalize_comprehensive(_theory_result())
+    assert result["wave"]["trend_strength"] == "weak"
+    assert result["wave"]["wave_confirmation"] == "rejected"
+
+
+def test_hub_state_derived_from_price_inside_last_hub():
+    """价格仍在最新中枢区间内时,中枢状态必须是 active。"""
+    structure = _chanlun_structure()
+    structure["hubs"] = [{"startIndex": 0, "endIndex": 2, "low": 99.0, "high": 101.0}]
+    structure["processedBars"] = [{"index": 5, "close": 100.0}]
+    assert ca._current_hub_state(structure) == "active"
+    result = ca.normalize_comprehensive(_theory_result(), _five_wave_structure(), structure)
+    assert result["chanlun"]["hub_state"] == "active"
+
+
+def test_hub_state_is_none_when_price_left_the_last_hub():
+    """回归守卫:存在大量历史中枢但价格已离开时,不得伪造 active 盘整证据。
+
+    引擎(build_hubs)按滑动窗口生成中枢,999 根 K 会产出上百个历史中枢;
+    若仅凭'hubs 非空'就把 none 改写成 active,等于向交易决策注入虚假证据。
+    """
+    structure = _chanlun_structure()
+    structure["hubs"] = [{"startIndex": i, "endIndex": i + 2, "low": 4095.0, "high": 4106.0} for i in range(213)]
+    structure["processedBars"] = [{"index": 998, "close": 4055.59}]  # 已跌破中枢下沿
+    assert ca._chanlun_structure_available(structure) is True
+    assert ca._current_hub_state(structure) == "none"
+
+    result = ca.normalize_comprehensive(
+        _theory_result(), _five_wave_structure(), structure
+    )
+    assert result["chanlun"]["hub_state"] == "none", "价格已离开中枢却仍被判为 active"
+
+
+def test_hub_state_none_when_no_hubs_even_with_strokes():
+    """只有笔、没有中枢时,中枢状态应为 none 而不是被兜底成 active。"""
+    structure = _chanlun_structure(strokes=10, hubs=0)
+    structure["processedBars"] = [{"index": 9, "close": 100.0}]
+    assert ca._current_hub_state(structure) == "none"
+
+
+def test_hub_state_falls_back_to_undefined_without_price():
+    """无法取到价格时不得臆断,返回 None 让调用方跳过覆盖。"""
+    structure = _chanlun_structure()
+    structure["processedBars"] = []
+    structure["strokes"] = []
+    assert ca._structure_latest_price(structure) is None
+    assert ca._current_hub_state(structure) is None
+
+
+def test_dynamic_threshold_drops_after_structure_upgrade():
+    """回归守卫:结构可用 -> strong -> 动态门槛 50;旧行为 -> weak -> 64。"""
+    from backend.agents.graph.compose import get_dynamic_confidence_threshold
+
+    with_structure = ca.normalize_comprehensive(
+        _theory_result(), _five_wave_structure(), _chanlun_structure()
+    )
+    without = ca.normalize_comprehensive(_theory_result())
+
+    assert get_dynamic_confidence_threshold(with_structure["wave"]["trend_strength"], False, 0) == 50
+    assert get_dynamic_confidence_threshold(without["wave"]["trend_strength"], False, 0) == 64
+
+
+def test_summarize_wave_structure_exposes_real_labels():
+    """5 浪齐全时摘要必须透出方向/浪标签,不能再一律 unavailable。"""
+    summary = ca.summarize_wave_structure(_five_wave_structure())
+    assert summary["evidence"]["status"] == "observed"
+    assert summary["direction"] == "bearish"
+    assert summary["confidence"] == 75
+    assert len(summary["impulseWaves"]) == 5
+    assert len(summary["correctiveWaves"]) == 3
+    assert summary["evidence"]["algorithmVersion"] == ca.STRUCTURE_EVIDENCE_VERSION
+
+
+def test_summarize_wave_structure_stays_unavailable_for_local_swings_only():
+    summary = ca.summarize_wave_structure({"swingPoints": [{"index": 1}], "confidence": True})
+    assert summary["evidence"]["status"] == "unavailable"
+    assert summary["direction"] is None
+    assert summary["confidence"] == 0
+    assert summary["impulseWaves"] == []
+
+
+def test_summarize_chanlun_exposes_strokes_and_hubs_but_truncates():
+    """缠论有笔/中枢时必须透出,且只保留最近 N 个,避免 prompt 膨胀。"""
+    summary = ca.summarize_chanlun_structure(_chanlun_structure(strokes=252, hubs=222))
+    assert summary["evidence"]["status"] == "observed"
+    assert len(summary["strokes"]) == ca.MAX_RECENT_STROKES
+    assert len(summary["hubs"]) == ca.MAX_RECENT_HUBS
+    # 截断必须取"最近的",即末尾
+    assert summary["strokes"][-1]["startIndex"] == 251
+    assert summary["hubs"][-1]["startIndex"] == 221
+
+
+def test_summarize_chanlun_unavailable_without_strokes():
+    summary = ca.summarize_chanlun_structure({"fractals": [{"type": "top"}], "strokes": [], "hubs": []})
+    assert summary["evidence"]["status"] == "unavailable"
+    assert summary["strokes"] == []
+    assert summary["hubs"] == []
+
+
 # ─────────────────────── 输入 fixtures(与 TS 逐字节一致) ─────────────────────
 
 MARKDOWN_RESPONSE = """## TECHNICAL

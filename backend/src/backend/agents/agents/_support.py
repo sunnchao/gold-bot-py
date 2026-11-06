@@ -14,8 +14,8 @@
 - types/schemas.ts               -> clean_sr_levels() + schemas 校验器(轻量 Zod 等价)
 - tools/llm-client.ts            -> SystemBlock/UserLayer/ToolUse/CacheStats/
                                    StreamLayeredResult/LlmClient(Protocol)/LlmClientService
-- tools/chanlun-core.ts          -> analyze_chanlun()(最小确定性实现,待后续 worker 对齐)
-- tools/elliott-wave.ts          -> analyze_elliott_wave()(最小确定性实现,待后续 worker 对齐)
+- tools/chanlun-core.ts          -> analyze_chanlun()(完整移植:chanlun_core.py)
+- tools/elliott-wave.ts          -> analyze_elliott_wave()(完整移植:elliott_wave.py)
 
 依赖说明:utils/parse.ts、utils/stable-stringify.ts、utils/logger.ts、
 config/symbol-profile.ts、tools/llm-client.ts、types/schemas.ts 由其他 M7 worker
@@ -24,6 +24,7 @@ config/symbol-profile.ts、tools/llm-client.ts、types/schemas.ts 由其他 M7 w
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import math
 import re
@@ -1732,8 +1733,21 @@ def validate_arbitration_business(
     )
 
 
-# ─── 最小结构化分析器(依赖 tools/elliott-wave.ts / tools/chanlun-core.ts,
-#     待其他 M7 worker 移植后对齐;此处仅保证确定性输出,供 StructureCache 使用) ──
+# ─── 结构分析器:转发到 tools/ 下的真实移植实现 ──────────────────────
+# tools/elliott_wave.py 与 tools/chanlun_core.py 已是 tools/*.ts 的完整移植,
+# 此处仅作为适配层:把返回的 @dataclass 转成 dict,以兼容调用点
+# `analyze_elliott_wave(prices) | {"sourceTimeframe": ...}` 的字典合并写法。
+
+
+def _structure_to_dict(value: Any) -> Any:
+    """把 dataclass 结构递归转成纯 JSON 友好的 dict/list。"""
+    if dataclasses.is_dataclass(value) and not isinstance(value, type):
+        return {f.name: _structure_to_dict(getattr(value, f.name)) for f in dataclasses.fields(value)}
+    if isinstance(value, dict):
+        return {key: _structure_to_dict(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_structure_to_dict(item) for item in value]
+    return value
 
 
 def build_unavailable_wave_structure() -> dict[str, Any]:
@@ -1755,57 +1769,37 @@ def build_unavailable_chanlun_structure() -> dict[str, Any]:
 
 
 def analyze_elliott_wave(prices: list[float]) -> dict[str, Any]:
-    """最小 Elliott Wave 结构分析(确定性实现,待 tools/elliott-wave.ts 移植后对齐)。
+    """Elliott Wave 结构分析,委托 tools/elliott_wave.py(1:1 移植自 elliott-wave.ts)。
 
-    输入为闭市 bar 的 close 序列;这里用局部高低点生成 swingPoints,
-    并给出保守的 validation 结果,足以支撑 StructureCache 的稳定哈希。
+    输入为闭市 bar 的 close 序列;返回 swingPoints / impulseWaves /
+    correctiveWaves / validation / confidence 的纯 dict 形式。
     """
     if len(prices) < 2:
         return build_unavailable_wave_structure()
-    swing_points: list[dict[str, Any]] = []
-    lookback = 2
-    for i in range(lookback, len(prices) - lookback):
-        window = prices[i - lookback : i + lookback + 1]
-        if prices[i] == max(window):
-            swing_points.append({"index": i, "price": prices[i], "type": "high"})
-        if prices[i] == min(window):
-            swing_points.append({"index": i, "price": prices[i], "type": "low"})
-    direction = "bearish" if prices[-1] < prices[0] else "bullish"
-    return {
-        "direction": direction,
-        "swingPoints": swing_points,
-        "impulseWaves": [],
-        "correctiveWaves": [],
-        "validation": {
-            "isValid": len(swing_points) >= 3,
-            "violations": (
-                [] if len(swing_points) >= 3 else ["Insufficient swing points for Elliott Wave labeling."]
-            ),
-        },
-        "confidence": len(swing_points) >= 3,
-    }
+    from backend.agents.tools.elliott_wave import analyze_elliott_wave as _analyze
+
+    return _structure_to_dict(_analyze(prices))
 
 
 def analyze_chanlun(bars: list[dict[str, Any]]) -> dict[str, Any]:
-    """最小缠论结构分析(确定性实现,待 tools/chanlun-core.ts 移植后对齐)。
+    """缠论结构分析,委托 tools/chanlun_core.py(1:1 移植自 chanlun-core.ts)。
 
-    bars 为 {index, open, high, low, close};生成分型(fractals),笔(strokes)
-    与中枢(hubs)为空,足以支撑 StructureCache 的稳定哈希。
+    bars 为 {index, open, high, low, close};返回 processedBars / fractals /
+    strokes / hubs 的纯 dict 形式。
     """
     if len(bars) < 3:
         return build_unavailable_chanlun_structure()
-    fractals: list[dict[str, Any]] = []
-    for i in range(1, len(bars) - 1):
-        prev_bar = bars[i - 1]
-        bar = bars[i]
-        next_bar = bars[i + 1]
-        if bar["high"] > prev_bar["high"] and bar["high"] > next_bar["high"]:
-            fractals.append({"type": "top", "index": bar["index"], "price": bar["high"]})
-        if bar["low"] < prev_bar["low"] and bar["low"] < next_bar["low"]:
-            fractals.append({"type": "bottom", "index": bar["index"], "price": bar["low"]})
-    return {
-        "processedBars": bars,
-        "fractals": fractals,
-        "strokes": [],
-        "hubs": [],
-    }
+    from backend.agents.tools.chanlun_core import analyze_chanlun as _analyze
+    from backend.agents.types.analysis import ChanlunBar
+
+    chanlun_bars = [
+        ChanlunBar(
+            index=int(bar["index"]),
+            open=float(bar["open"]),
+            high=float(bar["high"]),
+            low=float(bar["low"]),
+            close=float(bar["close"]),
+        )
+        for bar in bars
+    ]
+    return _structure_to_dict(_analyze(chanlun_bars))

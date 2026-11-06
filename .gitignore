@@ -18,3 +18,8 @@ frontend/dist/
 .idea
 .workbuddy
 docs/*
+
+# Local runtime data (sqlite scratch DBs)
+data/*.sqlite
+data/*.sqlite-journal
+data/*.sqlite-wal
