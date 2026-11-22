@@ -1,10 +1,40 @@
 # 默认拉取 GHCR 发布镜像。本地构建使用：
 # docker compose -f docker-compose.yml -f docker-compose.build.yml up --build
 #
-# 日常更新只拉取自家镜像（backend/frontend 常变，infra 镜像固定版本）：
-#   docker compose pull backend frontend && docker compose up -d
+# 日常更新只拉取自家镜像（backend/frontend/pi-runtime 常变，infra 镜像固定版本）：
+#   docker compose pull backend frontend pi-runtime && docker compose up -d
 # 不要用裸 `docker compose pull`，它会把 redis/prometheus/grafana 也全拉一遍。
 services:
+  pi-runtime:
+    image: ${GOLDBOT_PI_RUNTIME_IMAGE:-ghcr.io/sunnchao/gold-bot-py-pi-runtime:latest}
+    pull_policy: always
+    container_name: gold-bot-pi-runtime
+    environment:
+      TZ: Asia/Shanghai
+      PI_RUNTIME_HOST: 0.0.0.0
+      LLM_BASE_URL: ${LLM_BASE_URL:-https://api.openai.com/v1}
+      LLM_API_KEY: ${LLM_API_KEY:?LLM_API_KEY is required}
+      LLM_MODEL: ${LLM_MODEL:-kimi-k3.1-pro}
+      LLM_TRADE_MODEL: ${LLM_TRADE_MODEL:-deepseek-v4-flash-0731}
+      LLM_FALLBACK_MODEL: ${LLM_FALLBACK_MODEL:-gpt-4o-mini}
+      LLM_TIMEOUT: ${LLM_TIMEOUT:-120000}
+      LLM_MAX_RETRIES: ${LLM_MAX_RETRIES:-3}
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "fetch('http://127.0.0.1:3000/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))",
+        ]
+      interval: 30s
+      timeout: 5s
+      start_period: 10s
+      retries: 3
+    restart: unless-stopped
+    networks:
+      - pi-runtime-net
+
   backend:
     image: ${GOLDBOT_BACKEND_IMAGE:-ghcr.io/sunnchao/gold-bot-py-backend:latest}
     pull_policy: always
@@ -23,8 +53,8 @@ services:
       GB_REDIS_URL: redis://gold-bot-redis:6379
       REDIS_URL: redis://gold-bot-redis:6379
       GOLDBOT_API_URL: http://gold-bot-backend:8000
-      LLM_API_KEY: sk-d38DUi1xUI4UMtfMDkV6kKeUgsYANNMoNxcIIBStDf3NL7k4
-      LLM_MODEL: kimi-k3.1-pro
+      PI_RUNTIME_URL: http://pi-runtime:3000
+      LLM_MODEL: ${LLM_MODEL:-kimi-k3.1-pro}
     ports:
       - "127.0.0.1:8881:8000"
     volumes:
@@ -44,6 +74,7 @@ services:
     restart: unless-stopped
     networks:
       - 1panel-network
+      - pi-runtime-net
 
   frontend:
     image: ${GOLDBOT_FRONTEND_IMAGE:-ghcr.io/sunnchao/gold-bot-py-frontend:latest}
@@ -125,3 +156,5 @@ volumes:
 networks:
   1panel-network:
     external: true
+  pi-runtime-net:
+    driver: bridge

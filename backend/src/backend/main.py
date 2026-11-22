@@ -1,6 +1,7 @@
 import os
 from typing import Literal
 
+import httpx
 import uvicorn
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -23,7 +24,8 @@ agent_env = dict(os.environ)
 agent_token = (agent_env.get("GOLDBOT_API_TOKEN") or runtime_env.GB_ADMIN_TOKEN).strip()
 if agent_token:
     agent_env["GOLDBOT_API_TOKEN"] = agent_token
-agent_workflow = create_agent_workflow(agent_env)
+pi_http_client = httpx.AsyncClient(trust_env=False)
+agent_workflow = create_agent_workflow(agent_env, pi_http_client=pi_http_client)
 
 
 async def trigger_llm_analysis(account_id: str, symbol: str, timeframe: str, bar_time: str) -> None:
@@ -52,6 +54,7 @@ if agent_token:
         }
     )
 app = create_api_app(app_options)
+app.router.add_event_handler("shutdown", pi_http_client.aclose)
 
 
 @app.on_event("startup")

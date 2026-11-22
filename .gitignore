@@ -8,6 +8,7 @@ backend/**/__pycache__/
 # Node
 frontend/node_modules/
 frontend/dist/
+pi-runtime/node_modules/
 
 # Local environment
 .env

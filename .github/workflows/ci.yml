@@ -72,6 +72,23 @@ jobs:
           retention-days: 1
           if-no-files-found: error
 
+  pi-runtime:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: pi-runtime
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: pi-runtime/package-lock.json
+      - name: Install
+        run: npm ci
+      - name: Unit tests
+        run: npm test
+
   docker:
     name: Docker (${{ matrix.image }}/${{ matrix.arch }})
     if: >-
@@ -82,6 +99,7 @@ jobs:
     needs:
       - backend
       - frontend
+      - pi-runtime
     runs-on: ${{ matrix.runner }}
     permissions:
       contents: read
@@ -89,7 +107,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        image: [backend, frontend]
+        image: [backend, frontend, pi-runtime]
         arch: [amd64, arm64]
         include:
           - arch: amd64
@@ -128,7 +146,7 @@ jobs:
         id: build
         uses: docker/build-push-action@v7
         with:
-          context: ${{ matrix.image == 'frontend' && 'frontend' || '.' }}
+          context: ${{ matrix.image == 'backend' && '.' || matrix.image }}
           file: ${{ matrix.image }}/Dockerfile
           platforms: ${{ matrix.platform }}
           outputs: type=image,name=ghcr.io/${{ github.repository }}-${{ matrix.image }},push-by-digest=true,name-canonical=true,push=true
@@ -162,7 +180,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        image: [backend, frontend]
+        image: [backend, frontend, pi-runtime]
     steps:
       - name: Download digests
         uses: actions/download-artifact@v7

@@ -231,4 +231,10 @@ default_metrics_registry: MetricsRegistry = create_metrics_registry(enable_defau
 
 async def metrics_text() -> str:
     from prometheus_client import generate_latest
-    return generate_latest(default_metrics_registry.registry).decode()
+
+    from backend.agents.metrics.llm_cache_metrics import llm_cache_registry
+
+    return (
+        generate_latest(default_metrics_registry.registry).decode()
+        + generate_latest(llm_cache_registry()).decode()
+    )

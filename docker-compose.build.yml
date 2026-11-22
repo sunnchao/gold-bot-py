@@ -14,3 +14,10 @@ services:
       dockerfile: Dockerfile
     image: gold-bot-frontend:local
     pull_policy: build
+
+  pi-runtime:
+    build:
+      context: ./pi-runtime
+      dockerfile: Dockerfile
+    image: gold-bot-pi-runtime:local
+    pull_policy: build

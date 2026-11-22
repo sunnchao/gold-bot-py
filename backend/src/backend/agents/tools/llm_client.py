@@ -1,49 +1,51 @@
-"""基于 langchain-openai 的 OpenAI Chat Completions 客户端。
+"""基于 Pi AI runtime 的 OpenAI Chat Completions 业务客户端。
 
-镜像 apps/app-agent/src/tools/llm-client.ts 的业务语义,但请求层改用成熟的
-langchain-openai(ChatOpenAI),替代自研 httpx + SSE 解析:
-
-- 请求组装 / 流式解析 / 工具调用 / 重试 / 超时交给 langchain-openai
+保留原业务契约:
 - 分层请求(system 首条 / user 分层 / tools + tool_choice 映射)语义保留
-- 缓存策略探测保留(deepseek/gpt→auto_prefix;kimi/moonshot→prompt_cache_key
-  (通过 extra_body 下发 prompt_cache_key);glm→auto_prefix_unstable;
-  minimax/abab→none;其余→auto_prefix)
-- cache usage 读取:流式取 langchain 的标准 usage_metadata(input_tokens +
-  input_token_details.cache_read / cache_creation,对应 OpenAI 标准
-  prompt_tokens_details.cached_tokens);非流式响应中原始 usage 完整保留在
-  message.response_metadata["token_usage"],可经 _read_cache_usage 解析
-  DeepSeek native / billing_usage.openai_usage 嵌套 / Kimi cached_tokens
-- fallback 模型兜底(本项目扩展,启用闲置的 LLM_FALLBACK_MODEL):请求抛错时自动
-  改用 fallback 模型重试一次;流式路径下空响应(无内容且无 tool_use)同样触发回退,
-  非流式路径仅在异常时回退(保留内容为 null 时返回空串的原语义);
-  fallback 与主模型相同(或为空)时不启用。DeepSeek 专属参数按实际请求的模型生效
-
-HTTP 层托管于 langchain-openai;测试通过注入 httpx.MockTransport 完全离线。
+- 缓存策略探测保留(deepseek/gpt→auto_prefix;kimi/moonshot→prompt_cache_key;
+  glm→auto_prefix_unstable;minimax/abab→none;其余→auto_prefix)
+- 模型专属参数保留(DeepSeek reasoning_effort=max + thinking=disabled;
+  Kimi/Moonshot reasoning_effort=max + thinking=enabled + maxTokens=32768)
+- fallback 模型兜底:请求抛错时自动改用 fallback 模型重试一次;流式路径下空响应
+  (无内容且无 tool_use)同样触发回退,非流式路径仅在异常时回退;fallback 与
+  主模型相同(或为空)时不启用。
 """
 
 from __future__ import annotations
 
-import importlib
-import json
 from collections.abc import Awaitable, Callable
-from dataclasses import asdict, dataclass, field, replace
+from dataclasses import dataclass
 from typing import Any, TypeVar
 
 import httpx
-from langchain_openai import ChatOpenAI
-from openai import APIStatusError
 
+from backend.agents.tools.pi_client import (
+    DEFAULT_PI_RUNTIME_URL,
+    CacheStats,
+    CompleteOnce,
+    CompletionRequest,
+    PiClient,
+    StreamLayeredResult,
+    StreamOnce,
+    StreamRequest,
+    StreamResultDict,
+    ToolUse,
+)
 from backend.agents.utils.logger import get_logger
 
 __all__ = [
     "CacheStats",
     "CacheStrategy",
     "ChatCompletionsStreamResult",
+    "CompleteOnce",
+    "CompletionRequest",
     "LLMClient",
     "LLMClientConfig",
     "LAYER_SEPARATOR",
     "LlmClientService",
     "StreamLayeredResult",
+    "StreamOnce",
+    "StreamRequest",
     "StreamResultDict",
     "SystemBlock",
     "ToolUse",
@@ -86,15 +88,6 @@ class UserLayer:
     cacheable: bool
 
 
-@dataclass(frozen=True)
-class CacheStats:
-    readTokens: int = 0
-    creationTokens: int = 0
-    hitTokens: int = 0
-    missTokens: int = 0
-    inputTokens: int = 0
-
-
 def compute_cache_hit_rate(stats: Any) -> float:
     """缓存命中率 = cache_read_input_tokens / input_tokens。"""
     if not stats.inputTokens or stats.inputTokens <= 0:
@@ -124,7 +117,7 @@ def detect_cache_strategy(model: str, enable_prompt_caching: bool) -> CacheStrat
 
 
 def _is_deepseek_model(model: str) -> bool:
-    """DeepSeek 推理模型:reasoning_effort=high + 关闭 thinking 输出。"""
+    """DeepSeek 推理模型:reasoning_effort=max + 关闭 thinking 输出。"""
     return "deepseek" in model.lower()
 
 
@@ -146,54 +139,14 @@ class LLMClientConfig:
     enablePromptCaching: bool
 
 
-@dataclass(frozen=True)
-class ToolUse:
-    id: str
-    name: str
-    input: dict[str, Any]
-
-
-@dataclass
-class PendingToolUse:
-    id: str
-    name: str
-    inputJson: str
-
-
 @dataclass
 class ChatCompletionsStreamResult:
     """兼容导出:streamLayered 的返回值形态(content + cacheStats + toolUse)。"""
 
     content: str
     chunks: int = 0
-    cacheStats: CacheStats = field(default_factory=CacheStats)
+    cacheStats: CacheStats = CacheStats()
     toolUse: ToolUse | None = None
-
-
-class StreamResultDict(dict[str, Any]):
-    """stream_layered 返回值:dict 接口(兼容旧测试) + 属性访问(兼容调用方)。
-
-    - dict 键保持旧 camelCase:content / cacheStats / toolUse
-    - 属性保持 _support.StreamResult 契约:content / cache_stats / tool_use
-    """
-
-    def __init__(self, content: str, cache_stats: CacheStats, tool_use: ToolUse | None = None) -> None:
-        super().__init__(content=content, cacheStats=cache_stats, toolUse=tool_use)
-
-    @property
-    def content(self) -> str:
-        return self["content"]
-
-    @property
-    def cache_stats(self) -> CacheStats:
-        return self["cacheStats"]
-
-    @property
-    def tool_use(self) -> ToolUse | None:
-        return self["toolUse"]
-
-
-StreamLayeredResult = StreamResultDict
 
 
 def _as_blocks(items: Any, block_type: Any) -> list[Any]:
@@ -208,22 +161,33 @@ def _as_blocks(items: Any, block_type: Any) -> list[Any]:
     return result
 
 
-def _as_number(value: Any) -> int | float | None:
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        return None
-    return value
-
-
 class LLMClient:
-    """基于 langchain-openai ChatOpenAI 的 OpenAI Chat Completions 客户端。"""
+    """通过 Pi AI runtime 发起流式与非流式 Chat Completions 调用。"""
 
-    def __init__(self, config: LLMClientConfig, *, transport: httpx.AsyncBaseTransport | None = None) -> None:
+    def __init__(
+        self,
+        config: LLMClientConfig,
+        *,
+        pi_runtime_url: str = DEFAULT_PI_RUNTIME_URL,
+        http_client: httpx.AsyncClient | None = None,
+        transport: httpx.AsyncBaseTransport | None = None,
+        complete_once: CompleteOnce | None = None,
+        stream_once: CompleteOnce | None = None,
+    ) -> None:
         self._config = config
         self._cache_strategy = detect_cache_strategy(config.model, config.enablePromptCaching)
-        self._transport = transport
-        self._timeout = config.timeout / 1000.0
-        self._chat = self._build_chat()
-        self._fallback_chat = self._build_fallback_chat()
+        injected = complete_once or stream_once
+        self._owned_pi_client: PiClient | None = None
+        if injected is not None:
+            self._complete_once = injected
+        else:
+            pi_client = PiClient(pi_runtime_url, client=http_client, transport=transport)
+            self._owned_pi_client = pi_client
+            self._complete_once = pi_client
+
+    async def aclose(self) -> None:
+        if self._owned_pi_client is not None:
+            await self._owned_pi_client.aclose()
 
     # ------------------------------------------------------------------ 纯逻辑
 
@@ -233,17 +197,8 @@ class LLMClient:
     def get_model(self) -> str:
         return self._config.model
 
-    def _build_chat(self, model: str | None = None) -> ChatOpenAI:
-        model = model or self._config.model
-        params: dict[str, Any] = {
-            "model": model,
-            "api_key": self._config.apiKey,
-            "base_url": self._config.baseUrl,
-            "temperature": DEFAULT_TEMPERATURE,
-            "max_tokens": DEFAULT_MAX_TOKENS,
-            "request_timeout": self._timeout,
-            "max_retries": self._config.maxRetries,
-        }
+    def _model_parameters(self, model: str) -> dict[str, Any]:
+        params: dict[str, Any] = {"temperature": DEFAULT_TEMPERATURE, "max_tokens": DEFAULT_MAX_TOKENS}
         if detect_cache_strategy(model, self._config.enablePromptCaching).type == "prompt_cache_key":
             params["extra_body"] = {"prompt_cache_key": "gold-analysis"}
         if _is_deepseek_model(model):
@@ -252,31 +207,19 @@ class LLMClient:
             extra_body["thinking"] = {"type": "disabled"}
             params["extra_body"] = extra_body
         if _is_kimi_thinking_model(model):
-            # 老板要求:kimi-k3.1-pro 开启 max 思考(thinking 打开 + effort 拉满),
-            # 并放大 max_tokens,避免思考 token 挤占正文导致 JSON 截断。
             extra_body = params.get("extra_body") or {}
             extra_body["reasoning_effort"] = MAX_REASONING_EFFORT
             extra_body["thinking"] = {"type": "enabled"}
             params["extra_body"] = extra_body
             params["max_tokens"] = max(int(params["max_tokens"]), KIMI_THINKING_MAX_TOKENS)
-        if self._transport is not None:
-            # httpx.MockTransport 同时实现 BaseTransport 与 AsyncBaseTransport
-            params["http_client"] = httpx.Client(transport=self._transport, timeout=self._timeout)  # type: ignore[arg-type]
-            params["http_async_client"] = httpx.AsyncClient(transport=self._transport, timeout=self._timeout)
-        return ChatOpenAI(**params)
+        return params
 
-    def _build_fallback_chat(self) -> ChatOpenAI | None:
-        """fallback 模型与主模型相同(或为空)时不构建,避免同一模型重复请求。"""
+    def _model_chain(self) -> list[str]:
+        """按优先级排列的模型名:主模型在前,fallback 模型在后。"""
+        chain = [self._config.model]
         fallback_model = (self._config.fallbackModel or "").strip()
-        if not fallback_model or fallback_model == self._config.model:
-            return None
-        return self._build_chat(model=fallback_model)
-
-    def _chat_chain(self) -> list[tuple[str, ChatOpenAI]]:
-        """按优先级排列的 (model, client):主模型在前,fallback 模型在后。"""
-        chain: list[tuple[str, ChatOpenAI]] = [(self._config.model, self._chat)]
-        if self._fallback_chat is not None:
-            chain.append((self._config.fallbackModel, self._fallback_chat))
+        if fallback_model and fallback_model != self._config.model:
+            chain.append(fallback_model)
         return chain
 
     def _build_messages(self, prompt: str, system_message: str | None = None) -> list[dict[str, str]]:
@@ -332,142 +275,36 @@ class LLMClient:
             return choice_type
         return "auto"
 
-    def _with_tools(self, chat: ChatOpenAI, opts: dict[str, Any]) -> Any:
-        """bind_tools 返回 Runnable,仍提供 astream/ainvoke,标注 Any 便于调用。"""
-        tools = opts.get("tools")
-        if not tools or len(tools) == 0:
-            return chat
-        openai_tools = self._to_openai_tools(tools)
-        return chat.bind_tools(openai_tools, tool_choice=self._resolve_tool_choice(opts))
-
-    # ------------------------------------------------------------------ usage
-
-    def _read_cache_usage(self, usage: Any, current: CacheStats) -> CacheStats:
-        if usage is None or not isinstance(usage, dict):
-            return current
-
-        read_tokens = _as_number(usage.get("cache_read_input_tokens"))
-        creation_tokens = _as_number(usage.get("cache_creation_input_tokens"))
-        input_tokens = _as_number(usage.get("input_tokens"))
-        prompt_tokens = _as_number(usage.get("prompt_tokens"))
-
-        # DeepSeek-native cache fields
-        deepseek_hit_tokens = _as_number(usage.get("prompt_cache_hit_tokens"))
-        deepseek_miss_tokens = _as_number(usage.get("prompt_cache_miss_tokens"))
-
-        # OpenAI-style cached tokens: top-level prompt_tokens_details,及嵌套
-        # billing_usage.openai_usage.prompt_tokens_details(网关位置)
-        prompt_details = usage.get("prompt_tokens_details")
-        openai_cached_tokens = (
-            _as_number(prompt_details.get("cached_tokens")) if isinstance(prompt_details, dict) else None
-        )
-        billing_usage = usage.get("billing_usage")
-        openai_usage = billing_usage.get("openai_usage") if isinstance(billing_usage, dict) else None
-        nested_details = openai_usage.get("prompt_tokens_details") if isinstance(openai_usage, dict) else None
-        nested_cached_tokens = (
-            _as_number(nested_details.get("cached_tokens")) if isinstance(nested_details, dict) else None
-        )
-
-        kimi_cached_tokens = _as_number(usage.get("cached_tokens"))
-
-        read = read_tokens if read_tokens is not None else current.readTokens
-        created = creation_tokens if creation_tokens is not None else current.creationTokens
-        fresh = (
-            input_tokens
-            if input_tokens is not None
-            else (prompt_tokens if prompt_tokens is not None else current.inputTokens)
-        )
-        hit = (
-            deepseek_hit_tokens
-            if deepseek_hit_tokens is not None
-            else (
-                openai_cached_tokens
-                if openai_cached_tokens is not None
-                else (
-                    nested_cached_tokens
-                    if nested_cached_tokens is not None
-                    else (kimi_cached_tokens if kimi_cached_tokens is not None else current.hitTokens)
-                )
-            )
-        )
-        miss = deepseek_miss_tokens if deepseek_miss_tokens is not None else current.missTokens
-
-        return CacheStats(
-            readTokens=int(read),
-            creationTokens=int(created),
-            hitTokens=int(hit),
-            missTokens=int(miss),
-            inputTokens=int(fresh),
-        )
-
-    def _cache_stats_from_usage_metadata(self, usage: Any) -> CacheStats:
-        """流式路径:langchain usage_metadata 只含标准字段。
-
-        input_tokens 对应 prompt_tokens;input_token_details.cache_read 对应
-        OpenAI 标准 prompt_tokens_details.cached_tokens(DeepSeek native /
-        网关嵌套缓存字段在流式下不可得,指标退化为标准字段,非流式完整)。
-        """
-        if usage is None or not isinstance(usage, dict):
-            return CacheStats()
-        input_tokens = int(usage.get("input_tokens") or 0)
-        details = usage.get("input_token_details")
-        cache_read = int(details.get("cache_read") or 0) if isinstance(details, dict) else 0
-        cache_creation = int(details.get("cache_creation") or 0) if isinstance(details, dict) else 0
-        return CacheStats(
-            readTokens=cache_read,
-            creationTokens=cache_creation,
-            hitTokens=cache_read,
-            inputTokens=input_tokens,
-        )
-
-    # ------------------------------------------------------------------ 流式聚合
-
-    @staticmethod
-    def _accumulate_tool_call_chunks(
-        chunk: Any,
-        pending: dict[int, PendingToolUse],
-    ) -> None:
-        for raw in chunk.tool_call_chunks or []:
-            index = raw.get("index")
-            if index is None:
-                continue
-            current = pending.get(index, PendingToolUse(id="", name="", inputJson=""))
-            if isinstance(raw.get("id"), str):
-                current = replace(current, id=raw["id"])
-            if isinstance(raw.get("name"), str):
-                current = replace(current, name=raw["name"])
-            if isinstance(raw.get("args"), str):
-                current = replace(current, inputJson=current.inputJson + raw["args"])
-            pending[index] = current
-
-    @staticmethod
-    def _finalize_tool_use(pending: dict[int, PendingToolUse]) -> ToolUse | None:
-        for index in sorted(pending.keys()):
-            pending_tool_use = pending[index]
-            try:
-                parsed_input = json.loads(pending_tool_use.inputJson)
-            except (ValueError, TypeError) as err:
-                get_logger().warn(
-                    {"err": str(err), "rawJson": pending_tool_use.inputJson},
-                    "tool_use input parse failed",
-                )
-                continue
-            if isinstance(parsed_input, dict):
-                return ToolUse(id=pending_tool_use.id, name=pending_tool_use.name, input=parsed_input)
-        return None
-
-    @staticmethod
-    def _rethrow(err: APIStatusError) -> RuntimeError:
-        body = err.body
-        text = body if isinstance(body, str) else (json.dumps(body) if body else "no body")
-        return RuntimeError(f"OpenAI Chat Completions API {err.status_code}: {text}")
+    def _build_request(
+        self,
+        model: str,
+        messages: list[dict[str, str]],
+        opts: dict[str, Any],
+        *,
+        stream: bool,
+    ) -> CompletionRequest:
+        params = self._model_parameters(model)
+        request: CompletionRequest = {
+            "model": model,
+            "messages": messages,
+            "stream": stream,
+            "temperature": params["temperature"],
+            "maxTokens": params["max_tokens"],
+            "timeoutMs": self._config.timeout,
+            "maxRetries": self._config.maxRetries,
+            "parameters": params.get("extra_body", {}),
+        }
+        if tools := opts.get("tools"):
+            request["tools"] = self._to_openai_tools(tools)
+            request["toolChoice"] = self._resolve_tool_choice(opts)
+        return request
 
     # ------------------------------------------------------------------ 对外方法
 
     async def _run_with_fallback(
         self,
         label: str,
-        run: Callable[[str, ChatOpenAI], Awaitable[ResponseT]],
+        run: Callable[[str], Awaitable[ResponseT]],
         *,
         is_empty: Callable[[Any], bool] | None = None,
     ) -> ResponseT:
@@ -478,12 +315,11 @@ class LLMClient:
         - 最后一个模型的结果总是采纳(含空结果,交由调用方兜底)
         """
         logger = get_logger()
-        chain = self._chat_chain()
-        result: ResponseT | None = None
-        for index, (model, chat) in enumerate(chain):
+        chain = self._model_chain()
+        for index, model in enumerate(chain):
             is_last = index == len(chain) - 1
             try:
-                result = await run(model, chat)
+                result = await run(model)
             except Exception as err:
                 logger.warn({"model": model, "err": str(err)}, f"{label}: request failed")
                 if is_last:
@@ -491,50 +327,36 @@ class LLMClient:
                 continue
             if not is_last and result is not None and is_empty is not None and is_empty(result):
                 logger.warn(
-                    {"model": model, "fallbackModel": chain[index + 1][0]},
+                    {"model": model, "fallbackModel": chain[index + 1]},
                     f"{label}: empty result, retrying with fallback model",
                 )
                 continue
             return result
-        raise RuntimeError("unreachable: chat chain is never empty")
+        raise RuntimeError("unreachable: model chain is never empty")
 
     async def invoke(self, prompt: str, system_message: str | None = None) -> str:
-        """非流式 invoke:发送 Chat Completions 请求返回文本;请求异常时回退 fallback 模型。
-
-        内容为 null/缺失时仍按原语义返回空串,不触发回退。
-        """
+        """非流式 invoke:发送 stream=false 请求返回文本;请求异常时回退 fallback 模型。"""
         messages = self._build_messages(prompt, system_message)
         return await self._run_with_fallback(
             "invoke",
-            lambda _model, chat: self._invoke_text(chat, messages),
+            lambda model: self._invoke_once(model, messages, {}),
         )
 
-    async def _invoke_text(self, chat: Any, messages: list[dict[str, str]]) -> str:
-        try:
-            message = await chat.ainvoke(messages)
-        except APIStatusError as err:
-            raise self._rethrow(err) from err
-        content = message.content
-        return content if isinstance(content, str) else ""
+    async def _invoke_once(self, model: str, messages: list[dict[str, str]], opts: dict[str, Any]) -> str:
+        result = await self._complete_once(self._build_request(model, messages, opts, stream=False))
+        return result.content
 
     async def stream_invoke(self, prompt: str, system_message: str | None = None) -> str:
-        """流式 invoke:收集 OpenAI Chat Completions SSE 文本块;异常或空响应时回退 fallback 模型。"""
+        """流式 invoke:收集 SSE 文本;异常或空响应时回退 fallback 模型。"""
         messages = self._build_messages(prompt, system_message)
         return await self._run_with_fallback(
             "streamInvoke",
-            lambda _model, chat: self._stream_text(chat, messages),
+            lambda model: self._stream_text(model, messages),
             is_empty=lambda text: text.strip() == "",
         )
 
-    async def _stream_text(self, chat: Any, messages: list[dict[str, str]]) -> str:
-        parts: list[str] = []
-        try:
-            async for chunk in chat.astream(messages, stream_options={"include_usage": True}):
-                if isinstance(chunk.content, str) and chunk.content:
-                    parts.append(chunk.content)
-        except APIStatusError as err:
-            raise self._rethrow(err) from err
-        return "".join(parts)
+    async def _stream_text(self, model: str, messages: list[dict[str, str]]) -> str:
+        return (await self._complete_once(self._build_request(model, messages, {}, stream=True))).content
 
     async def stream_layered(
         self,
@@ -550,39 +372,9 @@ class LLMClient:
         )
         return await self._run_with_fallback(
             "streamLayered",
-            lambda model, chat: self._stream_layered_once(model, chat, messages, opts),
+            lambda model: self._complete_once(self._build_request(model, messages, opts, stream=True)),
             is_empty=lambda result: result.content.strip() == "" and result.tool_use is None,
         )
-
-    async def _stream_layered_once(
-        self,
-        model: str,
-        chat: ChatOpenAI,
-        messages: list[dict[str, str]],
-        opts: dict[str, Any],
-    ) -> StreamResultDict:
-        """单次模型的流式请求:汇总 content / tool_use / 缓存用量并按模型上报指标。"""
-        target = self._with_tools(chat, opts)
-
-        content_parts: list[str] = []
-        pending: dict[int, PendingToolUse] = {}
-        usage: Any | None = None
-        try:
-            async for chunk in target.astream(messages, stream_options={"include_usage": True}):
-                if isinstance(chunk.content, str) and chunk.content:
-                    content_parts.append(chunk.content)
-                self._accumulate_tool_call_chunks(chunk, pending)
-                if chunk.usage_metadata:
-                    usage = chunk.usage_metadata
-        except APIStatusError as err:
-            raise self._rethrow(err) from err
-
-        cache_stats = self._cache_stats_from_usage_metadata(usage)
-        tool_use = self._finalize_tool_use(pending)
-
-        _record_llm_cache_usage(cache_stats, model)
-
-        return StreamResultDict(content="".join(content_parts), cache_stats=cache_stats, tool_use=tool_use)
 
     async def stream_invoke_layered(self, system_message: str, user_messages: list[str]) -> str:
         """@deprecated 兼容包装:保持旧的合并单 user 消息请求形态。"""
@@ -606,36 +398,33 @@ class LLMClient:
             )
             return await self._run_with_fallback(
                 "invokeLayered",
-                lambda _model, chat: self._invoke_text(chat, messages),
+                lambda model: self._invoke_once(model, messages, {}),
             )
 
         messages = self._build_layered_messages(
             _as_blocks(system_message, SystemBlock),
             _as_blocks(user_messages, UserLayer),
         )
-
-        async def run_with_tools(_model: str, chat: ChatOpenAI) -> str:
-            return await self._invoke_text(self._with_tools(chat, opts), messages)
-
-        return await self._run_with_fallback("invokeLayered", run_with_tools)
-
-
-def _record_llm_cache_usage(stats: CacheStats, model: str) -> None:
-    """镜像 metrics.recordLlmCacheUsage;metrics 模块由其他 worker 移植,
-    通过 importlib 动态接入,缺失时静默跳过。"""
-    try:
-        module = importlib.import_module("backend.agents.metrics.llm_cache_metrics")
-        record = module.record_llm_cache_usage
-        record(asdict(stats), model)
-    except (ImportError, AttributeError):
-        pass
+        return await self._run_with_fallback(
+            "invokeLayered",
+            lambda model: self._invoke_once(model, messages, opts),
+        )
 
 
 class LlmClientService(LLMClient):
     """镜像 LlmClientService:由 AppConfigService 构造。"""
 
-    def __init__(self, config: Any) -> None:
+    def __init__(
+        self,
+        config: Any,
+        *,
+        pi_runtime_url: str | None = None,
+        http_client: httpx.AsyncClient | None = None,
+        complete_once: CompleteOnce | None = None,
+        stream_once: CompleteOnce | None = None,
+    ) -> None:
         llm = config.llm
+        resolved_url = pi_runtime_url or getattr(config, "pi_runtime_url", None) or DEFAULT_PI_RUNTIME_URL
         super().__init__(
             LLMClientConfig(
                 provider=llm["provider"],
@@ -646,5 +435,9 @@ class LlmClientService(LLMClient):
                 timeout=llm["timeout"],
                 maxRetries=llm["maxRetries"],
                 enablePromptCaching=llm["enablePromptCaching"],
-            )
+            ),
+            pi_runtime_url=resolved_url,
+            http_client=http_client,
+            complete_once=complete_once,
+            stream_once=stream_once,
         )

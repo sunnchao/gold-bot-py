@@ -1,7 +1,7 @@
-"""LangGraph state definition (mirror of apps/app-agent/src/graph/state.ts).
+"""Workflow state definition (mirror of apps/app-agent/src/graph/state.ts).
 
-Uses a TypedDict schema with Annotated list reducers for the accumulated
-``logs`` / ``errors`` channels, matching the Annotation.Root reducer semantics.
+Uses a TypedDict schema with list reducers for the accumulated ``logs`` and
+``errors`` channels, matching the Annotation.Root reducer semantics.
 Field values use the shared dataclass types from ``backend.agents.types``.
 """
 

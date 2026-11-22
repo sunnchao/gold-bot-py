@@ -14,3 +14,4 @@ backend/tests
 docs
 # frontend/dist 由 CI 的 web-dist 产物提供，构建时必须进上下文，不忽略
 frontend/node_modules
+pi-runtime/node_modules
