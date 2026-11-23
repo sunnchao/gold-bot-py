@@ -2078,7 +2078,8 @@ async def test_ai_result_dual_plan_queues_first_and_cooldown() -> None:
     assert body["received"] is True
     assert body["command_status"] == "queued"
     assert body["risk_gate"]["status"] == "accepted"
-    assert body["risk_gate"]["allowed_lots"] > 0
+    # 仓位由 EA 决定:服务端不再输出 allowed_lots,只标记 lots.ea_managed
+    assert "lots.ea_managed" in body["risk_gate"]["reason_codes"]
 
     commands = await store.list_commands(ACCOUNT_ID)
     assert len(commands) == 1

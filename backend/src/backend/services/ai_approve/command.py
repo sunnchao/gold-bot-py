@@ -89,7 +89,7 @@ def build_ai_approve_command_candidate(command_input: AIApproveCommandInput) -> 
         plan_expires_at = _string_field(trade_plan, "expires_at")
         if plan_expires_at:
             candidate["expiration"] = min(expiration, _unix_seconds(plan_expires_at))
-        apply_event_order_limits(candidate, risk_gate["allowed_lots"], risk_gate["event_cutoff"])
+        apply_event_order_limits(candidate, risk_gate["event_cutoff"])
 
     add_on_type = _string_field(trade_plan, "add_on_type")
     if (add_on_type in ("favorable", "adverse")) and command_input.get("positions") is not None:

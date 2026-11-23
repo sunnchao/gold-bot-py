@@ -529,7 +529,7 @@ class SchedulerService:
         if order_type != "market":
             candidate["expiration"] = _unix_seconds(now_iso) + 24 * 60 * 60
         if reduced_window:
-            apply_event_order_limits(candidate, risk_gate["allowedLots"], risk_gate["eventCutoff"])
+            apply_event_order_limits(candidate, risk_gate["eventCutoff"])
         await self._command_lifecycle.accept_candidate(account_id, candidate)
 
     async def _queue_ai_stop_loss_adjust(self, account_id: str, symbol: str) -> None:

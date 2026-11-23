@@ -91,7 +91,7 @@ def trade_plan(**overrides):
         (-120, {}, False, "reduced"),
         (-120, {"expires_at": at(-60)}, False, "reduced"),
         (-120, {"add_on": True}, False, "event.add_on_not_allowed"),
-        (-120, {"max_lots": 0.01}, False, "lots.below_min_after_scale"),
+        (-120, {"max_lots": 0.01}, False, "reduced"),
         (-120, {}, True, "event.dual_pending_not_allowed"),
         (-15, {}, False, EVENT_BLACKOUT),
         (20, {}, True, EVENT_BLACKOUT),
@@ -126,7 +126,8 @@ async def test_ai_route_enforces_calendar(calendar, setup_account, minutes, plan
                 assert command["tp_split"] is True
             else:
                 assert command["lot_scale"] == 0.5
-                assert command["lots"] == pytest.approx(0.05)
+                # 仓位由 EA 决定:服务端不再把 allowed_lots 写进指令
+                assert command["lots"] == 0
                 assert command["tp_split"] is False
                 earlier_deadline = min(at(-30), plan["expires_at"])
                 assert command["expiration"] == int(datetime.fromisoformat(earlier_deadline).timestamp())

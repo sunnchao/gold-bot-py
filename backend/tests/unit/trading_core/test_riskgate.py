@@ -157,7 +157,7 @@ class TestRiskGateParity:
 
         assert result["status"] == "accepted"
         assert result["auditOnly"] is False
-        assert "lots.accepted" in result["reasonCodes"]
+        assert "lots.ea_managed" in result["reasonCodes"]
 
     @pytest.mark.parametrize("mode", ["observe", "veto"])
     def test_keeps_mode_audit_only(self, mode: str) -> None:
@@ -266,14 +266,16 @@ class TestRiskGateParity:
         assert "position.add_not_allowed" not in result["reasonCodes"]
         assert "position.hedge_not_allowed" not in result["reasonCodes"]
 
-    def test_clamps_oversized_lots_using_go_compatible_risk_and_margin_limits(self) -> None:
+    def test_reports_lot_ceiling_without_blocking_ea_managed_sizing(self) -> None:
+        # 老板决策:服务端不再收敛/拒绝手数,只把上限算出来供策略信号路径参考。
         input_ = valid_input()
         input_["plan"]["maxLots"] = 3.77
 
         result = evaluate_risk_gate(input_)
 
-        assert result["status"] == "clamped"
-        assert "lots.clamped" in result["reasonCodes"]
+        assert result["status"] == "accepted"
+        assert "lots.clamped" not in result["reasonCodes"]
+        assert "lots.ea_managed" in result["reasonCodes"]
         assert result["allowedLots"] > 0
         assert result["allowedLots"] < input_["plan"]["maxLots"]
 

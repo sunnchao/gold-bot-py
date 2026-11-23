@@ -86,9 +86,8 @@ async def evaluate_ai_approve_pending_gate(gate_input: AIApprovePendingGateInput
     if entry <= 0:
         return _reject("entry_zone.invalid")
 
+    # 手数由 EA 决定(FixedLots/SymbolLotsMap/StrategyLotsMap),服务端不再校验或收敛。
     max_lots = _number_field(trade_plan, "max_lots")
-    if max_lots <= 0:
-        return _reject("lots.too_small")
     lots: float = calc_ai_approve_lots(max_lots)
 
     h1_bars = await store.get_bars(account_id, tradable_symbol, "H1", limit=300)
@@ -125,13 +124,7 @@ async def evaluate_ai_approve_pending_gate(gate_input: AIApprovePendingGateInput
             and _number_field(trade_plan, "confidence") < 75
         ):
             return _reject("trend.inverse_confidence")
-        if trend["consensusStrength"] < 0.3:
-            # 手数由 EA 决定时服务端无法减半,弱趋势直接拒绝
-            if lots <= 0:
-                return _reject("trend.weak_lots_below_min")
-            lots /= 2.0
-            if lots < 0.01:
-                return _reject("trend.weak_lots_below_min")
+        # 弱趋势不再按手数减半/拒绝:仓位由 EA 决定,服务端只做方向性拦截。
 
     if gate_input.get("enforceSopLedger") is True:
         watch_ledger = await store.get_watch_ledger(account_id, tradable_symbol)

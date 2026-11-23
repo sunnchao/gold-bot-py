@@ -240,12 +240,13 @@ async def test_no_longer_rejects_when_per_symbol_daily_ai_signal_limit_was_remov
     assert result.get("reason") != "daily_limit.symbol"
 
 
-async def test_rejects_weak_trend_consensus_after_the_go_lots_halving_rule() -> None:
+async def test_accepts_weak_trend_consensus_because_ea_owns_position_size() -> None:
+    # 老板决策:仓位由 EA 参数决定,服务端不再因弱趋势拒绝或减半。
     store = create_in_memory_store()
     await seed_strong_trend_state(store, trend="neutral")
 
     result = await evaluate(store)
-    assert result == {"accepted": False, "reason": "trend.weak_lots_below_min"}
+    assert result["accepted"] is True
 
 
 async def test_mirrors_go_same_side_and_add_on_distance_gates() -> None:

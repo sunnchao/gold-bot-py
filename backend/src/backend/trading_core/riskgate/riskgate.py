@@ -216,10 +216,11 @@ def market_event_window(symbol: str | None, now: str | datetime | None) -> Event
     return event_window_for(normalized, now if isinstance(now, datetime) else _as_utc_dt(now))
 
 
-def apply_event_order_limits(candidate: dict[str, Any], allowed_lots: float, cutoff: int) -> None:
+def apply_event_order_limits(candidate: dict[str, Any], cutoff: int) -> None:
+    """事件窗口缩量:不改写 lots(仓位由 EA 决定),只下发 lot_scale 让 EA 自行缩放。"""
     expiration = candidate.get("expiration") or cutoff
     candidate.update(
-        lots=allowed_lots, lot_scale=EVENT_LOT_SCALE, tp_split=False,
+        lot_scale=EVENT_LOT_SCALE, tp_split=False,
         expiration=min(expiration, cutoff), event_cutoff=cutoff,
     )
 
@@ -475,7 +476,12 @@ def collect_tradeability_rejects(input_: dict[str, Any], now: datetime, meta: di
 
 
 def validate_expandable_risk(input_: dict[str, Any], meta: dict[str, Any]) -> dict[str, Any]:
-    """镜像 validateExpandableRisk():风险/保证金约束下的手数校验与收敛。"""
+    """镜像 validateExpandableRisk():风险/保证金约束下的手数校验与收敛。
+
+    老板决策(2026-11-23):开单仓位完全由 EA 参数决定(FixedLots / SymbolLotsMap /
+    StrategyLotsMap / MaxRiskPercent),服务端只下发开单指令(lots=0),不再审计或拦截
+    手数。因此手数上限仅作为策略信号路径的参考值计算,不再计入 rejects。
+    """
     plan = _get(input_, "plan", {})
     state = _get(input_, "state", {})
     tick = _get(state, "tick", {})
@@ -510,11 +516,7 @@ def validate_expandable_risk(input_: dict[str, Any], meta: dict[str, Any]) -> di
             (_nullish_or(runtime.get("equity"), 0) * default_max_risk_pct) / (distance * meta.get("contractSize", 0)),
             meta.get("lotStep", 0),
         )
-    if requested_lots <= 0:
-        rejects.append("lots.missing")
     free_margin = _nullish_or(runtime.get("freeMargin"), 0)
-    if free_margin <= 0:
-        rejects.append("margin.free_margin_missing")
     if entry > 0 and free_margin > 0:
         leverage_raw = _nullish_or(account.get("leverage"), 0)
         leverage = leverage_raw if leverage_raw > 0 else 1
@@ -545,22 +547,12 @@ def validate_expandable_risk(input_: dict[str, Any], meta: dict[str, Any]) -> di
             "rejects": rejects,
         }
 
-    allowed_lots = round_down_lot(
-        min_positive(requested_lots, meta.get("maxLot", 0), max_risk_lots, max_margin_lots),
-        meta.get("lotStep", 0),
-    )
-    if allowed_lots < meta.get("minLot", 0):
-        rejects.append("lots.below_min_after_clamp")
-        return {
-            "requestedLots": requested_lots,
-            "allowedLots": allowed_lots,
-            "maxRiskLots": max_risk_lots,
-            "maxMarginLots": max_margin_lots,
-            "clamped": clamped,
-            "rejects": rejects,
-        }
-
-    clamped = allowed_lots < requested_lots
+    if requested_lots > 0:
+        allowed_lots = round_down_lot(
+            min_positive(requested_lots, meta.get("maxLot", 0), max_risk_lots, max_margin_lots),
+            meta.get("lotStep", 0),
+        )
+    clamped = 0 < allowed_lots < requested_lots
     return {
         "requestedLots": requested_lots,
         "allowedLots": allowed_lots,
@@ -637,23 +629,8 @@ def evaluate_risk_gate(input_: dict[str, Any]) -> dict[str, Any]:
         result["status"] = "rejected"
         result["reasonCodes"].extend(validation["rejects"])
         return result
-    if "lotScale" in result:
-        min_lots = 0.10 if "#" in raw_symbol or raw_symbol.strip().upper().endswith("M") else meta["minLot"]
-        base_lots = min(validation["allowedLots"], validation["maxRiskLots"], validation["maxMarginLots"])
-        scaled_lots = round_down_lot(base_lots * EVENT_LOT_SCALE, meta["lotStep"])
-        result["allowedLots"] = scaled_lots
-        if scaled_lots < min_lots:
-            result["status"] = "rejected"
-            result["reasonCodes"].append("lots.below_min_after_scale")
-        else:
-            result["status"] = "clamped"
-        return result
-    if validation["clamped"]:
-        result["status"] = "clamped"
-        result["reasonCodes"].append("lots.clamped")
-        return result
-
-    result["reasonCodes"].append("lots.accepted")
+    # 手数由 EA 决定:服务端不再收敛/拒绝;事件窗口缩量通过 lot_scale 下发给 EA 执行。
+    result["reasonCodes"].append("lots.ea_managed")
     return result
 
 

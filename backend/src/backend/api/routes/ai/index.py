@@ -1249,10 +1249,6 @@ async def ai_trade_plan_risk_gate(
         "symbol": result.get("symbol", ""),
         "status": result.get("status", ""),
         "reason_codes": result.get("reasonCodes", []),
-        "requested_lots": result.get("requestedLots", 0),
-        "allowed_lots": result.get("allowedLots", 0),
-        "max_risk_lots": result.get("maxRiskLots", 0),
-        "max_margin_lots": result.get("maxMarginLots", 0),
         "canProduceLiveCommands": result.get("canProduceLiveCommands", False),
         **(
             {"lot_scale": result["lotScale"], "event_cutoff": result["eventCutoff"]}
@@ -1312,10 +1308,6 @@ async def record_ai_decision_timeline(
                 "symbol": _string_field(risk_gate, "symbol") or symbol,
                 "status": _string_field(risk_gate, "status"),
                 "audit_only": boolean_field(risk_gate, "audit_only"),
-                "requested_lots": number_field(risk_gate, "requested_lots"),
-                "allowed_lots": number_field(risk_gate, "allowed_lots"),
-                "max_risk_lots": number_field(risk_gate, "max_risk_lots"),
-                "max_margin_lots": number_field(risk_gate, "max_margin_lots"),
             },
             "related_command_id": "",
             "created_at": created_at,

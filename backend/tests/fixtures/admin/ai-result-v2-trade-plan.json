@@ -29,12 +29,17 @@
         "max_lots": 0.02,
         "mode": "approve",
         "narrative": "multi-timeframe bullish setup, waiting for Go risk gate",
-        "reason_codes": ["mode.approve", "side.buy"],
+        "reason_codes": [
+          "mode.approve",
+          "side.buy"
+        ],
         "schema_version": "trade_plan.v1",
         "side": "buy",
         "stop_loss": 3328,
         "symbol": "XAUUSD",
-        "take_profit": [3350]
+        "take_profit": [
+          3350
+        ]
       }
     }
   },
@@ -52,15 +57,13 @@
       },
       "received": true,
       "risk_gate": {
-        "allowed_lots": 0.02,
         "audit_only": false,
         "canProduceLiveCommands": false,
         "decision_id": "tpv1_abc123",
-        "max_margin_lots": 0.74,
-        "max_risk_lots": 0.02,
         "mode": "approve",
-        "reason_codes": ["lots.accepted"],
-        "requested_lots": 0.02,
+        "reason_codes": [
+          "lots.ea_managed"
+        ],
         "status": "accepted",
         "symbol": "XAUUSD"
       },
