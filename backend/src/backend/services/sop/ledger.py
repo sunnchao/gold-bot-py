@@ -514,6 +514,37 @@ def _extract_targets(review_result: dict[str, Any], tp_key: str, default_val: fl
     return out
 
 
+def _compact_text(value: Any, *, max_len: int = 160) -> str:
+    if not isinstance(value, str):
+        return ""
+    collapsed = " ".join(value.split())
+    if len(collapsed) <= max_len:
+        return collapsed
+    return collapsed[: max(1, max_len - 3)].rstrip() + "..."
+
+
+def _direction_from_bias(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    norm = value.strip().lower()
+    if norm in ("long", "buy", "bullish", "bull", "bullish_breakout"):
+        return "long"
+    if norm in ("short", "sell", "bearish", "bear", "bearish_breakout"):
+        return "short"
+    return None
+
+
+def _is_protective_level(price: float, direction: str, current_price: float | None) -> bool:
+    if price <= 0 or not isfinite(price):
+        return False
+    if current_price is not None and current_price > 0:
+        if direction == "long":
+            return price < current_price
+        if direction == "short":
+            return price > current_price
+    return True
+
+
 def reconcile_ledger_after_review(
     existing_ledger: dict[str, Any] | None,
     *,
@@ -533,7 +564,6 @@ def reconcile_ledger_after_review(
     raw_sop = review_result.get("sop_context")
     sop_ctx: dict[str, Any] = raw_sop if isinstance(raw_sop, dict) else {}
     bias = str(review_result.get("bias") or "neutral").lower()
-    direction_from_bias = "long" if bias == "bullish" else ("short" if bias == "bearish" else "wait")
     raw_plan = review_result.get("trade_plan")
     plan: dict[str, Any] = raw_plan if isinstance(raw_plan, dict) else {}
 
@@ -543,50 +573,7 @@ def reconcile_ledger_after_review(
     tp_list = _extract_targets(review_result, "take_profits", suggested_tp)
 
     if role == "htf_anchor":
-        anchor = dict(working["htf_anchor"])
-        intraday_dir = str(sop_ctx.get("intraday_direction") or direction_from_bias).lower()
-        macro_bias = str(
-            sop_ctx.get("macro_bias")
-            or (daily_structure or {}).get("macro_bias")
-            or bias
-        ).lower()
-        short_targets = [
-            float(x) for x in (sop_ctx.get("short_term_targets") or tp_list) if _to_float(x) is not None
-        ]
-        long_targets = [
-            float(x) for x in (sop_ctx.get("long_term_targets") or []) if _to_float(x) is not None
-        ]
-        if not long_targets and isinstance(daily_structure, dict):
-            long_targets = [
-                float(t["price"])
-                for t in (daily_structure.get("measured_targets") or [])[:3]
-                if isinstance(t, dict) and _to_float(t.get("price")) is not None
-            ]
-        veto = sop_ctx.get("veto_boundary")
-        if not isinstance(veto, dict):
-            veto = {
-                "long_invalid_below": stop_loss if intraday_dir == "long" else None,
-                "short_invalid_above": stop_loss if intraday_dir == "short" else None,
-                "reason": str(sop_ctx.get("veto_reason") or "HTF 结构失效止损边界"),
-            }
-        anchor.update(
-            {
-                "macro_bias": macro_bias,
-                "intraday_direction": intraday_dir,
-                "short_term_targets": short_targets,
-                "long_term_targets": long_targets,
-                "veto_boundary": veto,
-                "vacuum_zone": (daily_structure or {}).get("vacuum_zone") or anchor.get("vacuum_zone"),
-                "rationale": str(sop_ctx.get("htf_rationale") or review_result.get("alert_reason") or ""),
-                "confidence": _to_float(review_result.get("confidence")) or 0.0,
-                "reviewed_at": ts_iso,
-                "anchor_price": current_price if current_price is not None else anchor.get("anchor_price"),
-            }
-        )
-        working["htf_anchor"] = anchor
-        working["htf_reviewed_at"] = ts_iso
-
-        # 更新多源共振关键位
+        # 先更新多源共振关键位, 以便后续回退推导目标位与否决边界
         if isinstance(confluence_levels, list) and confluence_levels:
             working["key_levels"] = [
                 {
@@ -601,6 +588,117 @@ def reconcile_ledger_after_review(
                 for idx, item in enumerate(confluence_levels[:10])
                 if isinstance(item, dict) and _to_float(item.get("price")) is not None
             ]
+
+        anchor = dict(working["htf_anchor"])
+        macro_bias = str(
+            sop_ctx.get("macro_bias")
+            or (daily_structure or {}).get("macro_bias")
+            or bias
+        ).lower()
+        intraday_dir = (
+            _direction_from_bias(sop_ctx.get("intraday_direction"))
+            or _direction_from_bias(bias)
+            or _direction_from_bias(macro_bias)
+            or "wait"
+        )
+        short_targets = [
+            float(x) for x in (sop_ctx.get("short_term_targets") or tp_list) if _to_float(x) is not None
+        ]
+        if not short_targets and intraday_dir in ("long", "short"):
+            tgt_pool: list[float] = []
+            for lv in working["key_levels"]:
+                lp = _to_float(lv.get("price"))
+                if lp is None or lp <= 0:
+                    continue
+                if current_price is not None and current_price > 0:
+                    if (intraday_dir == "long" and lp > current_price) or (
+                        intraday_dir == "short" and lp < current_price
+                    ):
+                        tgt_pool.append(lp)
+                else:
+                    lv_role = str(lv.get("role") or "").lower()
+                    if (intraday_dir == "long" and lv_role == "resistance") or (
+                        intraday_dir == "short" and lv_role == "support"
+                    ):
+                        tgt_pool.append(lp)
+            short_targets = sorted(set(tgt_pool), reverse=(intraday_dir == "short"))[:2]
+
+        long_targets = [
+            float(x) for x in (sop_ctx.get("long_term_targets") or []) if _to_float(x) is not None
+        ]
+        if not long_targets and isinstance(daily_structure, dict):
+            long_targets = [
+                float(t["price"])
+                for t in (daily_structure.get("measured_targets") or [])[:3]
+                if isinstance(t, dict) and _to_float(t.get("price")) is not None
+            ]
+
+        raw_veto = sop_ctx.get("veto_boundary")
+        has_valid_veto = False
+        if isinstance(raw_veto, dict):
+            if intraday_dir == "long" and _to_float(raw_veto.get("long_invalid_below")) is not None:
+                has_valid_veto = True
+            elif intraday_dir == "short" and _to_float(raw_veto.get("short_invalid_above")) is not None:
+                has_valid_veto = True
+
+        veto: dict[str, Any]
+        if has_valid_veto and isinstance(raw_veto, dict):
+            veto = dict(raw_veto)
+            veto["reason"] = _compact_text(veto.get("reason") or "HTF 结构边界", max_len=160)
+        elif intraday_dir in ("long", "short"):
+            chosen_veto: float | None = None
+            veto_label = "HTF 结构失效止损边界"
+            if stop_loss is not None and _is_protective_level(stop_loss, intraday_dir, current_price):
+                chosen_veto = stop_loss
+                veto_label = "HTF 止损边界"
+            else:
+                all_kl: list[float] = []
+                core_kl: list[float] = []
+                for lv in working["key_levels"]:
+                    lp = _to_float(lv.get("price"))
+                    if lp is None or not _is_protective_level(lp, intraday_dir, current_price):
+                        continue
+                    all_kl.append(lp)
+                    if str(lv.get("tier") or "").lower() == "core":
+                        core_kl.append(lp)
+                pool = core_kl or all_kl
+                if pool:
+                    chosen_veto = max(pool) if intraday_dir == "long" else min(pool)
+                    veto_label = "HTF 共振支撑否决位" if intraday_dir == "long" else "HTF 共振阻力否决位"
+            veto = {
+                "long_invalid_below": chosen_veto if intraday_dir == "long" else None,
+                "short_invalid_above": chosen_veto if intraday_dir == "short" else None,
+                "reason": _compact_text(
+                    f"{veto_label} {chosen_veto}" if chosen_veto is not None else "HTF 结构失效止损边界",
+                    max_len=160,
+                ),
+            }
+        else:
+            veto = {
+                "long_invalid_below": None,
+                "short_invalid_above": None,
+                "reason": _compact_text(sop_ctx.get("veto_reason") or "HTF 结构失效止损边界", max_len=160),
+            }
+
+        anchor.update(
+            {
+                "macro_bias": macro_bias,
+                "intraday_direction": intraday_dir,
+                "short_term_targets": short_targets,
+                "long_term_targets": long_targets,
+                "veto_boundary": veto,
+                "vacuum_zone": (daily_structure or {}).get("vacuum_zone") or anchor.get("vacuum_zone"),
+                "rationale": _compact_text(
+                    sop_ctx.get("htf_rationale") or review_result.get("alert_reason") or "",
+                    max_len=240,
+                ),
+                "confidence": _to_float(review_result.get("confidence")) or 0.0,
+                "reviewed_at": ts_iso,
+                "anchor_price": current_price if current_price is not None else anchor.get("anchor_price"),
+            }
+        )
+        working["htf_anchor"] = anchor
+        working["htf_reviewed_at"] = ts_iso
 
         # 合并 LLM 给出的剧本(若有)
         incoming_playbooks = sop_ctx.get("playbooks")
@@ -661,9 +759,22 @@ def reconcile_ledger_after_review(
     # 无孤儿剧本保底: 若所有剧本均已失效/穷尽或列表为空, 创建兜底观测剧本
     active_pbs = [pb for pb in working["playbooks"] if str(pb.get("state") or "").lower() in ACTIVE_PLAYBOOK_STATES]
     if not active_pbs:
-        fallback_dir = str(working["htf_anchor"].get("intraday_direction") or direction_from_bias).lower()
-        if fallback_dir not in ("long", "short"):
-            fallback_dir = "long" if bias != "bearish" else "short"
+        fallback_dir = (
+            _direction_from_bias(working["htf_anchor"].get("intraday_direction"))
+            or _direction_from_bias(bias)
+            or _direction_from_bias(working["htf_anchor"].get("macro_bias"))
+            or "long"
+        )
+        raw_vb = working["htf_anchor"].get("veto_boundary")
+        veto_b: dict[str, Any] = raw_vb if isinstance(raw_vb, dict) else {}
+        veto_sl = (
+            _to_float(veto_b.get("long_invalid_below"))
+            if fallback_dir == "long"
+            else _to_float(veto_b.get("short_invalid_above"))
+        )
+        safe_sl: float | None = veto_sl
+        if safe_sl is None and stop_loss is not None and _is_protective_level(stop_loss, fallback_dir, current_price):
+            safe_sl = stop_loss
         anchor_px = entry_price or current_price
         fallback_targets = tp_list or list(working["htf_anchor"].get("short_term_targets") or [])
         had_prior = bool(working["playbooks"])
@@ -678,13 +789,13 @@ def reconcile_ledger_after_review(
             if anchor_px is not None
             else None,
             "entry_price": anchor_px,
-            "stop_loss": stop_loss,
+            "stop_loss": safe_sl,
             "targets": fallback_targets,
             "targets_hit": [],
             "invalid_if": (
-                {"price_below": stop_loss}
-                if (fallback_dir == "long" and stop_loss is not None)
-                else ({"price_above": stop_loss} if (fallback_dir == "short" and stop_loss is not None) else None)
+                {"price_below": safe_sl}
+                if (fallback_dir == "long" and safe_sl is not None)
+                else ({"price_above": safe_sl} if (fallback_dir == "short" and safe_sl is not None) else None)
             ),
             "updated_at": ts_iso,
         }

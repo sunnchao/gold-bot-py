@@ -776,12 +776,12 @@ class SchedulerService:
         if store is None:
             return {}
         return {
-            "H1": await store.get_bars(account_id, symbol, "H1"),
-            "H4": await store.get_bars(account_id, symbol, "H4"),
-            "M30": await store.get_bars(account_id, symbol, "M30"),
-            "M15": await store.get_bars(account_id, symbol, "M15"),
-            "M5": await store.get_bars(account_id, symbol, "M5"),
-            "M1": await store.get_bars(account_id, symbol, "M1"),
+            "H1": await store.get_bars(account_id, symbol, "H1", limit=500),
+            "H4": await store.get_bars(account_id, symbol, "H4", limit=500),
+            "M30": await store.get_bars(account_id, symbol, "M30", limit=500),
+            "M15": await store.get_bars(account_id, symbol, "M15", limit=500),
+            "M5": await store.get_bars(account_id, symbol, "M5", limit=500),
+            "M1": await store.get_bars(account_id, symbol, "M1", limit=500),
         }
 
     async def _evaluate_signal_market_filters(

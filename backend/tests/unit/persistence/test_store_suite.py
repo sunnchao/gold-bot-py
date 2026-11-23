@@ -143,14 +143,22 @@ async def test_variant_snapshots_coexist_read_deterministic(store: EaStore) -> N
     tick = await store.get_latest_tick("acc-1", "GOLDM#")
     assert tick is not None and tick["bid"] == 222.0
 
-    # bars & claim_bar_close_event 同时折叠 symbol 和 timeframe
+    # bars & claim_bar_close_event 同时折叠 symbol 和 timeframe (增量合并 + 同时间覆盖)
     await store.save_bars(
         {"account_id": "acc-1", "symbol": "GOLDM#", "timeframe": "h1", "bars": [{"time": "1", "close": 10.0}]}
     )
     await store.save_bars(
-        {"account_id": "acc-1", "symbol": "GOLDm#", "timeframe": "H1", "bars": [{"time": "2", "close": 20.0}]}
+        {
+            "account_id": "acc-1",
+            "symbol": "GOLDm#",
+            "timeframe": "H1",
+            "bars": [{"time": "1", "close": 15.0}, {"time": "2", "close": 20.0}],
+        }
     )
-    assert (await store.get_bars("acc-1", " goldm# ", "h1")) == [{"time": "2", "close": 20.0}]
+    assert (await store.get_bars("acc-1", " goldm# ", "h1")) == [
+        {"time": "1", "close": 15.0},
+        {"time": "2", "close": 20.0},
+    ]
     assert await store.claim_bar_close_event("acc-1", "GOLDm#", "m15", "2026-08-25T08:00:00Z") is True
     assert await store.claim_bar_close_event("acc-1", "GOLDM#", "M15", "2026-08-25T08:00:00Z") is False
 
@@ -851,3 +859,70 @@ async def test_patrol_logs_append_and_query(store: EaStore) -> None:
 
     all_since = await store.list_patrol_logs("acc-1", since="2026-11-19T08:15:00Z", limit=10)
     assert [row["id"] for row in all_since] == ["pl-3", "pl-2"]
+
+
+async def test_save_bars_merges_deduplicates_and_windowed_limit(store: EaStore) -> None:
+    await store.save_bars(
+        {
+            "account_id": "acc-bars",
+            "symbol": "XAUUSD",
+            "timeframe": "M15",
+            "bars": [
+                {"time": "1735689600", "open": 4000, "high": 4010, "low": 3995, "close": 4005, "volume": 10},
+                {"time": "1735690500", "open": 4005, "high": 4015, "low": 4000, "close": 4012, "volume": 12},
+                {"time": "1735690500", "open": 4005, "high": 4018, "low": 4000, "close": 4016, "volume": 15},
+            ],
+        }
+    )
+    await store.save_bars(
+        {
+            "account_id": "acc-bars",
+            "symbol": "XAUUSD",
+            "timeframe": "M15",
+            "bars": [
+                {"time": "1735690500", "open": 4005, "high": 4020, "low": 4000, "close": 4019, "volume": 20},
+                {"time": "1735691400", "open": 4019, "high": 4030, "low": 4015, "close": 4028, "volume": 30},
+            ],
+        }
+    )
+    # 空推送不得覆盖已有历史 K 线
+    await store.save_bars({"account_id": "acc-bars", "symbol": "XAUUSD", "timeframe": "M15", "bars": []})
+
+    all_bars = await store.get_bars("acc-bars", "XAUUSD", "M15")
+    assert [b["time"] for b in all_bars] == ["1735689600", "1735690500", "1735691400"]
+    assert all_bars[1]["close"] == 4019
+
+    recent_two = await store.get_bars("acc-bars", "XAUUSD", "M15", limit=2)
+    assert [b["time"] for b in recent_two] == ["1735690500", "1735691400"]
+    assert recent_two[1]["close"] == 4028
+
+
+async def test_save_bars_handles_synthetic_and_unix_timestamps(store: EaStore) -> None:
+    await store.save_bars(
+        {
+            "account_id": "acc-syn",
+            "symbol": "XAGUSD",
+            "timeframe": "H1",
+            "bars": [
+                {"time": "bar-9", "close": 61.0},
+                {"time": "bar-10", "close": 62.0},
+                {"time": "bar-100", "close": 63.0},
+            ],
+        }
+    )
+    bars = await store.get_bars("acc-syn", "XAGUSD", "H1")
+    assert [b["time"] for b in bars] == ["bar-9", "bar-10", "bar-100"]
+
+    await store.save_bars(
+        {
+            "account_id": "acc-syn",
+            "symbol": "XAUUSD",
+            "timeframe": "M30",
+            "bars": [
+                {"time": "2026.04.13 00:00", "close": 3300.0},
+                {"time": "2026.04.13 40:00", "close": 3340.0},
+            ],
+        }
+    )
+    overflow_bars = await store.get_bars("acc-syn", "XAUUSD", "M30", limit=1)
+    assert [b["time"] for b in overflow_bars] == ["2026.04.13 40:00"]

@@ -1119,6 +1119,139 @@ def _format_sop_realtime_section(
     return "\n".join(blocks) + "\n"
 
 
+def _normalize_sop_direction(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    norm = value.strip().lower()
+    if norm in ("long", "buy", "bullish", "bull", "bullish_breakout"):
+        return "long"
+    if norm in ("short", "sell", "bearish", "bear", "bearish_breakout"):
+        return "short"
+    return None
+
+
+def _compact_sop_text(value: Any, *, max_len: int = 160) -> str:
+    if not isinstance(value, str):
+        return ""
+    collapsed = " ".join(value.split())
+    if len(collapsed) <= max_len:
+        return collapsed
+    return collapsed[: max(1, max_len - 3)].rstrip() + "..."
+
+
+def _is_protective_stop(price: float, direction: str, current_price: float | None) -> bool:
+    if price <= 0 or price != price:
+        return False
+    if current_price is not None and current_price > 0:
+        if direction == "long":
+            return price < current_price
+        if direction == "short":
+            return price > current_price
+    return True
+
+
+def _extract_level_prices(items: Any) -> list[float]:
+    prices: list[float] = []
+    if not isinstance(items, list):
+        return prices
+    for item in items:
+        raw = item.get("price") if isinstance(item, dict) else item
+        num = to_finite_number(raw)
+        if num is not None and num > 0:
+            prices.append(float(num))
+    return prices
+
+
+def _pick_protective_veto_level(
+    *,
+    direction: str,
+    current_price: float | None,
+    trade: JSONDict,
+    risk: JSONDict,
+    confluence: list[Any] | None,
+    tech: JSONDict,
+    daily: JSONDict | None,
+) -> tuple[float | None, str]:
+    sl = to_finite_number(trade.get("stop_loss"))
+    if sl is not None and _is_protective_stop(float(sl), direction, current_price):
+        return float(sl), "HTF 计划止损边界"
+
+    risk_sl = to_finite_number(risk.get("suggestedSL") if "suggestedSL" in risk else risk.get("suggested_sl"))
+    if risk_sl is not None and _is_protective_stop(float(risk_sl), direction, current_price):
+        return float(risk_sl), "HTF 风控止损边界"
+
+    if isinstance(confluence, list) and confluence:
+        all_candidates: list[float] = []
+        core_candidates: list[float] = []
+        for item in confluence:
+            if not isinstance(item, dict):
+                continue
+            p = to_finite_number(item.get("price"))
+            if p is None or not _is_protective_stop(float(p), direction, current_price):
+                continue
+            pf = float(p)
+            all_candidates.append(pf)
+            if str(item.get("tier") or "").lower() == "core":
+                core_candidates.append(pf)
+        pool = core_candidates or all_candidates
+        if pool:
+            chosen = max(pool) if direction == "long" else min(pool)
+            label = "HTF 共振支撑否决位" if direction == "long" else "HTF 共振阻力否决位"
+            return chosen, label
+
+    tech_items = tech.get("support_levels") if direction == "long" else tech.get("resistance_levels")
+    tech_pool = [p for p in _extract_level_prices(tech_items) if _is_protective_stop(p, direction, current_price)]
+    if tech_pool:
+        chosen = max(tech_pool) if direction == "long" else min(tech_pool)
+        return chosen, "HTF 技术结构否决位"
+
+    if isinstance(daily, dict):
+        major_key = "prior_major_low" if direction == "long" else "prior_major_high"
+        major = to_finite_number(daily.get(major_key))
+        if major is not None and _is_protective_stop(float(major), direction, current_price):
+            return float(major), "D1 结构否决位"
+
+    return None, ""
+
+
+def _pick_directional_short_targets(
+    *,
+    direction: str,
+    current_price: float | None,
+    confluence: list[Any] | None,
+    tech: JSONDict,
+) -> list[float]:
+    pool: list[float] = []
+    if isinstance(confluence, list):
+        for item in confluence:
+            if not isinstance(item, dict):
+                continue
+            p = to_finite_number(item.get("price"))
+            if p is None or p <= 0:
+                continue
+            pf = float(p)
+            if current_price is not None and current_price > 0:
+                if direction == "long" and pf > current_price:
+                    pool.append(pf)
+                elif direction == "short" and pf < current_price:
+                    pool.append(pf)
+            else:
+                role = str(item.get("role") or "").lower()
+                if (direction == "long" and role == "resistance") or (direction == "short" and role == "support"):
+                    pool.append(pf)
+
+    if not pool:
+        tech_items = tech.get("resistance_levels") if direction == "long" else tech.get("support_levels")
+        for pf in _extract_level_prices(tech_items):
+            if current_price is None or current_price <= 0:
+                pool.append(pf)
+            elif (direction == "long" and pf > current_price) or (direction == "short" and pf < current_price):
+                pool.append(pf)
+
+    deduped = sorted(set(pool), reverse=(direction == "short"))
+    return deduped[:2]
+
+
 def _build_sop_context(
     *,
     result: JSONDict,
@@ -1130,27 +1263,43 @@ def _build_sop_context(
     arb: JSONDict = raw_arb if isinstance(raw_arb, dict) else {}
     raw_trade = arb.get("trade_recommendation")
     trade: JSONDict = raw_trade if isinstance(raw_trade, dict) else {}
+    raw_tech = result.get("technical")
+    tech: JSONDict = raw_tech if isinstance(raw_tech, dict) else {}
+    raw_risk = result.get("risk")
+    risk: JSONDict = raw_risk if isinstance(raw_risk, dict) else {}
+    raw_dow = arb.get("dow_theory")
+    dow: JSONDict = raw_dow if isinstance(raw_dow, dict) else {}
+    raw_tc = payload.get("trend_context")
+    trend_ctx: JSONDict = raw_tc if isinstance(raw_tc, dict) else {}
     raw_daily = payload.get("daily_structure")
     daily: JSONDict | None = raw_daily if isinstance(raw_daily, dict) else None
     raw_dr = payload.get("day_range")
     day_range: JSONDict | None = raw_dr if isinstance(raw_dr, dict) else None
+    raw_conf = payload.get("confluence_levels")
+    confluence: list[Any] | None = raw_conf if isinstance(raw_conf, list) else None
     raw_pl = options.get("previousLedger")
     prev_ledger: JSONDict | None = raw_pl if isinstance(raw_pl, dict) else None
     role = str(options.get("analysisRole") or "standard")
 
-    raw_dir = str(arb.get("final_direction") or trade.get("direction") or "hold").lower()
-    if raw_dir in ("long", "buy", "bullish"):
-        inferred_dir = "long"
-    elif raw_dir in ("short", "sell", "bearish"):
-        inferred_dir = "short"
-    else:
-        inferred_dir = "wait"
+    px_val = current_price_from_payload(payload)
+    current_px: float | None = float(px_val) if px_val > 0 else None
 
-    # 若处于 M15 切入层且既有 HTF 锚定存在, 优先保留既有 HTF 锚定方向作审计对照
+    inferred_dir = (
+        _normalize_sop_direction(arb.get("final_direction"))
+        or _normalize_sop_direction(trade.get("direction"))
+        or _normalize_sop_direction(tech.get("bias"))
+        or _normalize_sop_direction(dow.get("primary_trend"))
+        or _normalize_sop_direction(trend_ctx.get("consensus_direction"))
+        or _normalize_sop_direction((daily or {}).get("macro_bias"))
+        or "wait"
+    )
+
+    # 若处于 M15 切入层且既有 HTF 锚定已确立方向, 优先保留既有 HTF 锚定方向作审计对照
     htf_anchor = prev_ledger.get("htf_anchor") if isinstance(prev_ledger, dict) else None
+    existing_htf_dir = htf_anchor.get("intraday_direction") if isinstance(htf_anchor, dict) else None
     htf_dir = (
-        str(htf_anchor.get("intraday_direction") or inferred_dir)
-        if role == "m15_entry" and isinstance(htf_anchor, dict)
+        str(existing_htf_dir)
+        if role == "m15_entry" and existing_htf_dir in ("long", "short")
         else inferred_dir
     )
 
@@ -1159,6 +1308,13 @@ def _build_sop_context(
         val = trade.get(k)
         if isinstance(val, (int, float)) and val > 0:
             short_targets.append(float(val))
+    if not short_targets and htf_dir in ("long", "short"):
+        short_targets = _pick_directional_short_targets(
+            direction=htf_dir,
+            current_price=current_px,
+            confluence=confluence,
+            tech=tech,
+        )
 
     long_targets: list[float] = []
     if daily and isinstance(daily.get("measured_targets"), list):
@@ -1166,21 +1322,30 @@ def _build_sop_context(
             if isinstance(t, dict) and isinstance(t.get("price"), (int, float)):
                 long_targets.append(float(t["price"]))
 
-    sl = trade.get("stop_loss")
-    sl_num = float(sl) if isinstance(sl, (int, float)) and sl > 0 else None
     veto_boundary: JSONDict | None = None
     if role == "m15_entry" and isinstance(htf_anchor, dict) and isinstance(htf_anchor.get("veto_boundary"), dict):
         veto_boundary = dict(htf_anchor["veto_boundary"])
-    elif sl_num is not None:
-        veto_boundary = {
-            "long_invalid_below": sl_num if htf_dir == "long" else None,
-            "short_invalid_above": sl_num if htf_dir == "short" else None,
-            "reason": str(arb.get("reasoning") or "HTF 结构边界"),
-        }
+    elif htf_dir in ("long", "short"):
+        veto_price, veto_label = _pick_protective_veto_level(
+            direction=htf_dir,
+            current_price=current_px,
+            trade=trade,
+            risk=risk,
+            confluence=confluence,
+            tech=tech,
+            daily=daily,
+        )
+        if veto_price is not None:
+            veto_boundary = {
+                "long_invalid_below": veto_price if htf_dir == "long" else None,
+                "short_invalid_above": veto_price if htf_dir == "short" else None,
+                "reason": _compact_sop_text(f"{veto_label} {veto_price}", max_len=160),
+            }
 
     inferred_macro = (
         "bullish" if htf_dir == "long" else ("bearish" if htf_dir == "short" else "neutral")
     )
+    htf_rationale = _compact_sop_text(arb.get("reasoning") or tech.get("rationale") or "", max_len=240)
     return {
         "analysis_role": role,
         "macro_bias": (daily or {}).get("macro_bias") or inferred_macro,
@@ -1188,6 +1353,7 @@ def _build_sop_context(
         "short_term_targets": short_targets,
         "long_term_targets": long_targets,
         "veto_boundary": veto_boundary,
+        "htf_rationale": htf_rationale,
         "day_range": day_range,
         "daily_structure": daily,
     }

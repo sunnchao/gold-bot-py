@@ -186,13 +186,13 @@ async def trading_core_analysis(store: EaStore, account_id: str, symbol: str, ti
     latest_tick = (await store.get_latest_tick(account_id, symbol)) or {}
     positions = _filter_positions_for_symbol(symbol, await store.get_positions(account_id, symbol))
     replay_bars = {
-        "H1": await store.get_bars(account_id, symbol, "H1"),
-        "H4": await store.get_bars(account_id, symbol, "H4"),
-        "M30": await store.get_bars(account_id, symbol, "M30"),
-        "M15": await store.get_bars(account_id, symbol, "M15"),
-        "M5": await store.get_bars(account_id, symbol, "M5"),
-        "M1": await store.get_bars(account_id, symbol, "M1"),
-        "D1": await store.get_bars(account_id, symbol, "D1"),
+        "H1": await store.get_bars(account_id, symbol, "H1", limit=500),
+        "H4": await store.get_bars(account_id, symbol, "H4", limit=500),
+        "M30": await store.get_bars(account_id, symbol, "M30", limit=500),
+        "M15": await store.get_bars(account_id, symbol, "M15", limit=500),
+        "M5": await store.get_bars(account_id, symbol, "M5", limit=500),
+        "M1": await store.get_bars(account_id, symbol, "M1", limit=500),
+        "D1": await store.get_bars(account_id, symbol, "D1", limit=500),
     }
     return {
         "status": "OK",

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Protocol
 
+from backend.persistence.helpers import DEFAULT_MAX_BARS_PER_SERIES
 from backend.persistence.records import EaRecord, PersistenceStatus, StoredCommand
 
 persistence_status = PersistenceStatus()
@@ -23,7 +24,14 @@ class EaStore(Protocol):
     async def save_tick(self, payload: EaRecord) -> None: ...
     async def get_latest_tick(self, account_id: str, symbol: str) -> EaRecord | None: ...
     async def save_bars(self, payload: EaRecord) -> None: ...
-    async def get_bars(self, account_id: str, symbol: str, timeframe: str) -> list[EaRecord]: ...
+    async def get_bars(
+        self,
+        account_id: str,
+        symbol: str,
+        timeframe: str,
+        *,
+        limit: int | None = None,
+    ) -> list[EaRecord]: ...
     async def claim_bar_close_event(
         self, account_id: str, symbol: str, timeframe: str, bar_time: str
     ) -> bool: ...
@@ -116,23 +124,23 @@ class EaStore(Protocol):
     async def close(self) -> None: ...
 
 
-def create_in_memory_store() -> EaStore:
+def create_in_memory_store(*, max_bars_per_series: int = DEFAULT_MAX_BARS_PER_SERIES) -> EaStore:
     from backend.persistence.inmemory import InMemoryEaStore
 
-    return InMemoryEaStore()
+    return InMemoryEaStore(max_bars_per_series=max_bars_per_series)
 
 
-def create_sqlite_store(path: str) -> EaStore:
+def create_sqlite_store(path: str, *, max_bars_per_series: int = DEFAULT_MAX_BARS_PER_SERIES) -> EaStore:
     """创建 SQLite store;初始化时先执行全部未应用 migration(与 TS 一致)。"""
     from backend.persistence.migrate import run_migrations_sync
     from backend.persistence.sqlite_store import SqliteEaStore
 
     run_migrations_sync(db_path=path)
-    return SqliteEaStore(path)
+    return SqliteEaStore(path, max_bars_per_series=max_bars_per_series)
 
 
-def create_postgres_store(dsn: str) -> EaStore:
+def create_postgres_store(dsn: str, *, max_bars_per_series: int = DEFAULT_MAX_BARS_PER_SERIES) -> EaStore:
     """创建 PostgreSQL store;生产 DSN 存在时优先使用。"""
     from backend.persistence.postgres_store import PostgresEaStore
 
-    return PostgresEaStore(dsn)
+    return PostgresEaStore(dsn, max_bars_per_series=max_bars_per_series)

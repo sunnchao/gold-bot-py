@@ -47,7 +47,7 @@ class AnalysisService:
             ),
             None,
         )
-        h1_bars = await self.store.get_bars(account_id, symbol, "H1")
+        h1_bars = await self.store.get_bars(account_id, symbol, "H1", limit=500)
         return {
             "replay": run_replay(
                 {
@@ -57,12 +57,12 @@ class AnalysisService:
                     "current_price": _current_price_for_replay(_current_price_from_tick(latest_tick), h1_bars),
                     "bars": {
                         "H1": h1_bars,
-                        "H4": await self.store.get_bars(account_id, symbol, "H4"),
-                        "M30": await self.store.get_bars(account_id, symbol, "M30"),
-                        "M15": await self.store.get_bars(account_id, symbol, "M15"),
-                        "M5": await self.store.get_bars(account_id, symbol, "M5"),
-                        "M1": await self.store.get_bars(account_id, symbol, "M1"),
-                        "D1": await self.store.get_bars(account_id, symbol, "D1"),
+                        "H4": await self.store.get_bars(account_id, symbol, "H4", limit=500),
+                        "M30": await self.store.get_bars(account_id, symbol, "M30", limit=500),
+                        "M15": await self.store.get_bars(account_id, symbol, "M15", limit=500),
+                        "M5": await self.store.get_bars(account_id, symbol, "M5", limit=500),
+                        "M1": await self.store.get_bars(account_id, symbol, "M1", limit=500),
+                        "D1": await self.store.get_bars(account_id, symbol, "D1", limit=500),
                     },
                     "positions": positions,
                     "position_states": await self.store.load_position_states(account_id, symbol),

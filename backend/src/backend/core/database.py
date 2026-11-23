@@ -12,10 +12,14 @@ def create_store_from_env(env: GoldBotEnv | None = None) -> EaStore:
     loaded = env if env is not None else load_gold_bot_env()
     postgres_dsn = loaded.GB_EA_STORE_POSTGRES_DSN.strip()
     if postgres_dsn:
-        return create_postgres_store(postgres_dsn)
+        return create_postgres_store(
+            postgres_dsn, max_bars_per_series=loaded.GB_MAX_BARS_PER_SERIES
+        )
     if loaded.GB_EA_STORE_SQLITE_PATH.strip():
-        return create_sqlite_store(loaded.GB_EA_STORE_SQLITE_PATH)
-    return create_in_memory_store()
+        return create_sqlite_store(
+            loaded.GB_EA_STORE_SQLITE_PATH, max_bars_per_series=loaded.GB_MAX_BARS_PER_SERIES
+        )
+    return create_in_memory_store(max_bars_per_series=loaded.GB_MAX_BARS_PER_SERIES)
 
 
 async def ensure_store_schema(store: EaStore) -> None:

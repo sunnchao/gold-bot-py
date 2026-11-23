@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 from backend.persistence.helpers import (
+    DEFAULT_MAX_BARS_PER_SERIES,
     account_id,
     build_closed_trade_stats,
     build_stored_command,
@@ -28,6 +29,7 @@ from backend.persistence.helpers import (
     normalize_timeframe,
     numeric_field,
     position_state_from_row,
+    prepare_bar_rows,
     requires_batch_cancel,
     resolve_display_symbols,
     string_array_field,
@@ -50,10 +52,12 @@ SnapshotKey = tuple[str, str, str, str]  # (kind, account_id, symbol, timeframe)
 class InMemoryEaStore(EaStore):
     """dict 驱动的 EaStore;与 SQLite 版共享同一测试套件。"""
 
-    def __init__(self) -> None:
+    def __init__(self, *, max_bars_per_series: int = DEFAULT_MAX_BARS_PER_SERIES) -> None:
+        self._max_bars_per_series = max(1, int(max_bars_per_series))
         self._snapshots: dict[SnapshotKey, EaRecord] = {}
         self._snapshot_order: dict[SnapshotKey, int] = {}
         self._snapshot_seq = 0
+        self._market_bars: dict[tuple[str, str, str], dict[str, tuple[int, EaRecord]]] = {}
         self._events: list[EaRecord] = []  # {kind, account_id, symbol, payload, delivered}
         self._position_states: dict[str, EaRecord] = {}  # key account:symbol:ticket
         self._runtime_modes: dict[str, str] = {}
@@ -107,14 +111,62 @@ class InMemoryEaStore(EaStore):
         return self._snapshot("tick", account_id_, symbol)
 
     async def save_bars(self, payload: EaRecord) -> None:
-        self._save_snapshot(
-            "bars", account_id(payload), symbol_default(payload), payload, string_field(payload, "timeframe")
-        )
+        acc = account_id(payload)
+        raw_sym = symbol_default(payload)
+        norm_sym = normalize_symbol(raw_sym)
+        norm_tf = normalize_timeframe(string_field(payload, "timeframe"))
+        raw_bars = payload.get("bars")
+        incoming = [clone_record(b) for b in raw_bars if isinstance(b, dict)] if isinstance(raw_bars, list) else []
 
-    async def get_bars(self, account_id_: str, symbol: str, timeframe: str) -> list[EaRecord]:
+        if incoming:
+            series_key = (acc, norm_sym, norm_tf)
+            bucket = self._market_bars.setdefault(series_key, {})
+            combined = incoming
+            if not bucket:
+                legacy = self._snapshot("bars", acc, norm_sym, norm_tf)
+                if legacy is not None and isinstance(legacy.get("bars"), list) and legacy["bars"]:
+                    legacy_bars = [clone_record(b) for b in legacy["bars"] if isinstance(b, dict)]
+                    combined = [*legacy_bars, *incoming]
+            for bar_time, bar_time_ms, bar in prepare_bar_rows(combined):
+                bucket[bar_time] = (bar_time_ms, clone_record(bar))
+            if len(bucket) > self._max_bars_per_series:
+                newest = sorted(
+                    bucket.items(),
+                    key=lambda kv: (kv[1][0], kv[0]),
+                    reverse=True,
+                )[: self._max_bars_per_series]
+                self._market_bars[series_key] = dict(newest)
+
+        marker: EaRecord = {
+            "account_id": acc,
+            "symbol": raw_sym,
+            "timeframe": norm_tf,
+            "bars": [],
+            "stored_in": "market_bars",
+        }
+        self._save_snapshot("bars", acc, raw_sym, marker, norm_tf)
+
+    async def get_bars(
+        self,
+        account_id_: str,
+        symbol: str,
+        timeframe: str,
+        *,
+        limit: int | None = None,
+    ) -> list[EaRecord]:
+        series_key = (account_id_, normalize_symbol(symbol), normalize_timeframe(timeframe))
+        bucket = self._market_bars.get(series_key)
+        if bucket:
+            ordered = sorted(bucket.items(), key=lambda kv: (kv[1][0], kv[0]))
+            selected = ordered[-int(limit) :] if (limit is not None and limit > 0) else ordered
+            return [clone_record(bar) for _, (_, bar) in selected]
+
         record = self._snapshot("bars", account_id_, symbol, timeframe)
         bars = record.get("bars") if record is not None else None
-        return clone_array(bars) if isinstance(bars, list) else []
+        if isinstance(bars, list) and bars:
+            sliced = bars[-int(limit) :] if (limit is not None and limit > 0) else bars
+            return clone_array(sliced)
+        return []
 
     async def claim_bar_close_event(
         self, account_id_: str, symbol: str, timeframe: str, bar_time: str

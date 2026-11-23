@@ -161,3 +161,32 @@ async def test_legacy_mixed_case_rows_read_newest_and_deduplicate(db_path: str) 
         assert await reopened.list_symbols("acc-1") == ["GOLDm#"]
     finally:
         await reopened.close()
+
+
+async def test_sqlite_save_bars_prunes_to_max_bars_per_series_and_defaults_to_10000(tmp_path) -> None:
+    db_path = str(tmp_path / "prune_bars.db")
+    default_store = create_sqlite_store(db_path)
+    try:
+        assert default_store._max_bars_per_series == 10_000  # type: ignore[attr-defined]
+    finally:
+        await default_store.close()
+
+    pruned_store = create_sqlite_store(db_path, max_bars_per_series=5)
+    try:
+        batch1 = [
+            {"time": str(1735689600 + i * 900), "open": 4000 + i, "high": 4005 + i, "low": 3995 + i, "close": 4001 + i}
+            for i in range(4)
+        ]
+        batch2 = [
+            {"time": str(1735689600 + i * 900), "open": 4000 + i, "high": 4006 + i, "low": 3995 + i, "close": 4002 + i}
+            for i in range(3, 8)
+        ]
+        await pruned_store.save_bars({"account_id": "acc-1", "symbol": "XAUUSD", "timeframe": "M15", "bars": batch1})
+        await pruned_store.save_bars({"account_id": "acc-1", "symbol": "XAUUSD", "timeframe": "M15", "bars": batch2})
+
+        kept = await pruned_store.get_bars("acc-1", "XAUUSD", "M15")
+        assert len(kept) == 5
+        assert [b["time"] for b in kept] == [str(1735689600 + i * 900) for i in range(3, 8)]
+        assert kept[0]["close"] == 4005  # 第 3 号 K 线按第二批新值覆盖更新
+    finally:
+        await pruned_store.close()

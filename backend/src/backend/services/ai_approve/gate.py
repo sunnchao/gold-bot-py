@@ -91,7 +91,7 @@ async def evaluate_ai_approve_pending_gate(gate_input: AIApprovePendingGateInput
         return _reject("lots.too_small")
     lots: float = calc_ai_approve_lots(max_lots)
 
-    h1_bars = await store.get_bars(account_id, tradable_symbol, "H1")
+    h1_bars = await store.get_bars(account_id, tradable_symbol, "H1", limit=300)
     h1_atr = _latest_atr(h1_bars)
     order_intent = resolve_ai_approve_order_intent(trade_plan, execution_price, entry, h1_atr)
     if not order_intent["accepted"]:
@@ -101,11 +101,11 @@ async def evaluate_ai_approve_pending_gate(gate_input: AIApprovePendingGateInput
         return _reject(str(protection["reason"]))
 
     bars = {
-        "D1": await store.get_bars(account_id, tradable_symbol, "D1"),
-        "H4": await store.get_bars(account_id, tradable_symbol, "H4"),
+        "D1": await store.get_bars(account_id, tradable_symbol, "D1", limit=300),
+        "H4": await store.get_bars(account_id, tradable_symbol, "H4", limit=300),
         "H1": h1_bars,
-        "M30": await store.get_bars(account_id, tradable_symbol, "M30"),
-        "M15": await store.get_bars(account_id, tradable_symbol, "M15"),
+        "M30": await store.get_bars(account_id, tradable_symbol, "M30", limit=300),
+        "M15": await store.get_bars(account_id, tradable_symbol, "M15", limit=300),
     }
     if order_intent["orderType"] == "market":
         reference_price = _number_field(tick, "bid") or current_price
@@ -159,7 +159,7 @@ async def evaluate_ai_approve_pending_gate(gate_input: AIApprovePendingGateInput
         average_price = _average_entry_price(positions, tradable_symbol, side)
         if average_price <= 0:
             return _reject("position.average_entry_missing")
-        m30_atr = _latest_atr(await store.get_bars(account_id, tradable_symbol, "M30"))
+        m30_atr = _latest_atr(await store.get_bars(account_id, tradable_symbol, "M30", limit=300))
         if m30_atr <= 0:
             return _reject("position.m30_atr_missing")
         add_on_type = _string_field(trade_plan, "add_on_type")

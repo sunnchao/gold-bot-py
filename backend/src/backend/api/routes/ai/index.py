@@ -50,6 +50,7 @@ ALLOWED_STRATEGY_MAPPING_KEYS = [
     "20250238",
 ]
 ANALYSIS_PAYLOAD_BARS_LIMIT = 1000
+ANALYSIS_BARS_FETCH_LIMIT = 1200
 MARKET_STATUS_TICK_TTL_MS = 15 * 60 * 1000
 MARKET_STATUS_HEARTBEAT_TTL_MS = 15 * 60 * 1000
 TIME_ONLY_PATTERN = re.compile(r"^\d{1,2}:\d{2}(?::\d{2})?$")
@@ -815,10 +816,10 @@ async def analysis_payload(store: EaStore, account_id: str, symbol: str, timesta
     latest_tick = (await store.get_latest_tick(account_id, symbol)) or {}
     positions = await store.get_positions(account_id, symbol)
     bars_by_timeframe = {
-        "M15": flatten_bar_records(await store.get_bars(account_id, symbol, "M15")),
-        "M30": flatten_bar_records(await store.get_bars(account_id, symbol, "M30")),
-        "H1": flatten_bar_records(await store.get_bars(account_id, symbol, "H1")),
-        "H4": flatten_bar_records(await store.get_bars(account_id, symbol, "H4")),
+        "M15": flatten_bar_records(await store.get_bars(account_id, symbol, "M15", limit=ANALYSIS_BARS_FETCH_LIMIT)),
+        "M30": flatten_bar_records(await store.get_bars(account_id, symbol, "M30", limit=ANALYSIS_BARS_FETCH_LIMIT)),
+        "H1": flatten_bar_records(await store.get_bars(account_id, symbol, "H1", limit=ANALYSIS_BARS_FETCH_LIMIT)),
+        "H4": flatten_bar_records(await store.get_bars(account_id, symbol, "H4", limit=ANALYSIS_BARS_FETCH_LIMIT)),
     }
     enriched = {tf: enrich_analysis_bars(bars) for tf, bars in bars_by_timeframe.items()}
     payload_bars = {
@@ -826,7 +827,7 @@ async def analysis_payload(store: EaStore, account_id: str, symbol: str, timesta
         for tf, bars in enriched.items()
     }
     market_status = analysis_market_status(heartbeat, latest_tick, timestamp)
-    d1_bars = flatten_bar_records(await store.get_bars(account_id, symbol, "D1"))
+    d1_bars = flatten_bar_records(await store.get_bars(account_id, symbol, "D1", limit=1000))
     enriched_d1 = enrich_analysis_bars(d1_bars)
     trend_bars = {**enriched, "D1": enriched_d1}
     harmonic_context = build_harmonic_context_payload(enriched)

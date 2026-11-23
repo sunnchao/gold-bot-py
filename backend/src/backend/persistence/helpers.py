@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import math
+import re
 from collections.abc import Iterable
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from backend.persistence.records import (
@@ -595,3 +596,84 @@ def build_runtime_command(command_id: str, row: EaRecord) -> tuple[StoredCommand
         command["error_text"] = string_field(row, "error_text")
     payload_source_visible = "source" in payload
     return command, payload_source_visible
+
+
+# ---------------------------------------------------------------- K 线标准化 & 排序时间
+
+
+DEFAULT_MAX_BARS_PER_SERIES = 10_000
+
+_NUMERIC_TIME_RE = re.compile(r"^-?\d+(?:\.\d+)?$")
+_DATE_BAR_TIME_RE = re.compile(
+    r"^(\d{4})[-.](\d{1,2})[-.](\d{1,2})(?:[ T](\d{1,2}):(\d{2})(?::(\d{2})(?:\.\d+)?)?)?"
+)
+_TRAILING_INT_RE = re.compile(r"(\d+)$")
+
+
+def parse_bar_time_ms(bar_time: str) -> int:
+    """将各类 K 线时间字符串解析为单调可比的毫秒整数。
+
+    支持：
+    1) Unix 秒/毫秒数值字符串（如 "1735689600"、"1"、"2"）；
+    2) ISO/MT4 日期时间（含单测中的溢出合成时间如 "2026.04.13 40:00" 或 "2026-04-40T00:00:00Z"）；
+    3) 尾缀编号（如 "bar-0".."bar-1000"）；
+    4) 其他标签回退 0。
+    """
+    text_val = bar_time.strip()
+    if not text_val:
+        return 0
+    if _NUMERIC_TIME_RE.match(text_val):
+        num = float(text_val)
+        if not math.isfinite(num):
+            return 0
+        if abs(num) < 10**11:
+            return int(num * 1000)
+        return int(num)
+
+    date_match = _DATE_BAR_TIME_RE.match(text_val)
+    if date_match is not None:
+        year = int(date_match.group(1))
+        month = int(date_match.group(2))
+        day = int(date_match.group(3))
+        hour = int(date_match.group(4) or 0)
+        minute = int(date_match.group(5) or 0)
+        second = int(date_match.group(6) or 0)
+        try:
+            dt = datetime(year, month, day, hour, minute, second, tzinfo=UTC)
+            return int(dt.timestamp() * 1000)
+        except ValueError:
+            try:
+                base_month = max(1, min(month, 12))
+                dt = datetime(year, base_month, 1, tzinfo=UTC) + timedelta(
+                    days=day - 1, hours=hour, minutes=minute, seconds=second
+                )
+                return int(dt.timestamp() * 1000)
+            except (ValueError, OverflowError):
+                return 0
+
+    suffix_match = _TRAILING_INT_RE.search(text_val)
+    if suffix_match is not None:
+        return int(suffix_match.group(1))
+    return 0
+
+
+def prepare_bar_rows(bars: list[EaRecord]) -> list[tuple[str, int, EaRecord]]:
+    """标准化 K 线序列并按 bar_time 批内去重（后者覆盖前者）, 保留原有相对顺序。"""
+    deduped: dict[str, tuple[str, int, EaRecord]] = {}
+    for idx, bar in enumerate(bars):
+        if not isinstance(bar, dict):
+            continue
+        cloned = dict(bar)
+        raw_time = cloned.get("time")
+        if isinstance(raw_time, str) and raw_time.strip():
+            bar_time = raw_time.strip()
+        elif isinstance(raw_time, (int, float)) and not isinstance(raw_time, bool) and math.isfinite(raw_time):
+            bar_time = str(int(raw_time)) if float(raw_time).is_integer() else str(raw_time)
+            cloned["time"] = bar_time
+        else:
+            bar_time = f"bar-idx-{idx}"
+        bar_time_ms = parse_bar_time_ms(bar_time)
+        if bar_time in deduped:
+            del deduped[bar_time]
+        deduped[bar_time] = (bar_time, bar_time_ms, cloned)
+    return list(deduped.values())

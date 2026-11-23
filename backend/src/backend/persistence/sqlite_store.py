@@ -5,12 +5,14 @@ DDL 完全由 migrations/ 控制;本模块只做查询层。
 
 from __future__ import annotations
 
+import math
 from typing import Any
 
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncConnection, create_async_engine
 
 from backend.persistence.helpers import (
+    DEFAULT_MAX_BARS_PER_SERIES,
     account_id,
     build_runtime_command,
     build_stored_command,
@@ -32,6 +34,7 @@ from backend.persistence.helpers import (
     normalize_timeframe,
     numeric_field,
     position_state_from_row,
+    prepare_bar_rows,
     requires_batch_cancel,
     resolve_display_symbols,
     string_array_field,
@@ -45,9 +48,22 @@ from backend.persistence.helpers import (
 from backend.persistence.records import EaRecord, StoredCommand, is_runtime_mode
 
 
+def _bar_opt_float(value: Any) -> float | None:
+    if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value):
+        return float(value)
+    return None
+
+
+def _bar_opt_int(value: Any) -> int | None:
+    if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value):
+        return int(value)
+    return None
+
+
 class SqliteEaStore:
-    def __init__(self, path: str) -> None:
+    def __init__(self, path: str, *, max_bars_per_series: int = DEFAULT_MAX_BARS_PER_SERIES) -> None:
         self._path = path
+        self._max_bars_per_series = max(1, int(max_bars_per_series))
         self._engine = create_async_engine(f"sqlite+aiosqlite:///{path}")
 
     # ------------------------------------------------------------------ 基础
@@ -145,17 +161,187 @@ class SqliteEaStore:
             return await self._get_snapshot(conn, "tick", account_id_, symbol)
 
     async def save_bars(self, payload: EaRecord) -> None:
+        acc = account_id(payload)
+        raw_sym = symbol_default(payload)
+        norm_sym = normalize_symbol(raw_sym)
+        norm_tf = normalize_timeframe(string_field(payload, "timeframe"))
+        raw_bars = payload.get("bars")
+        incoming = [b for b in raw_bars if isinstance(b, dict)] if isinstance(raw_bars, list) else []
+
         async with self._connect() as conn:
-            await self._save_snapshot(
-                conn, "bars", account_id(payload), symbol_default(payload), payload, string_field(payload, "timeframe")
-            )
+            if incoming:
+                cnt_row = await self._row(
+                    conn,
+                    """
+                    SELECT COUNT(*) AS cnt FROM market_bars
+                    WHERE account_id = :account AND symbol = :symbol AND timeframe = :timeframe
+                    """,
+                    account=acc,
+                    symbol=norm_sym,
+                    timeframe=norm_tf,
+                )
+                existing_cnt = int(cnt_row["cnt"]) if cnt_row is not None else 0
+                combined = incoming
+                if existing_cnt == 0:
+                    legacy = await self._get_snapshot(conn, "bars", acc, norm_sym, norm_tf)
+                    if legacy is not None and isinstance(legacy.get("bars"), list) and legacy["bars"]:
+                        legacy_bars = [b for b in legacy["bars"] if isinstance(b, dict)]
+                        combined = [*legacy_bars, *incoming]
+
+                prepared = prepare_bar_rows(combined)
+                if prepared:
+                    now_iso = current_timestamp()
+                    await conn.execute(
+                        text(
+                            """
+                            INSERT INTO market_bars (
+                                account_id, symbol, timeframe, bar_time, bar_time_ms,
+                                open, high, low, close, volume, payload_json, updated_at
+                            ) VALUES (
+                                :account_id, :symbol, :timeframe, :bar_time, :bar_time_ms,
+                                :open, :high, :low, :close, :volume, :payload_json, :updated_at
+                            )
+                            ON CONFLICT(account_id, symbol, timeframe, bar_time) DO UPDATE SET
+                                bar_time_ms = excluded.bar_time_ms,
+                                open = excluded.open,
+                                high = excluded.high,
+                                low = excluded.low,
+                                close = excluded.close,
+                                volume = excluded.volume,
+                                payload_json = excluded.payload_json,
+                                updated_at = excluded.updated_at
+                            """
+                        ),
+                        [
+                            {
+                                "account_id": acc,
+                                "symbol": norm_sym,
+                                "timeframe": norm_tf,
+                                "bar_time": bar_time,
+                                "bar_time_ms": bar_time_ms,
+                                "open": _bar_opt_float(bar.get("open")),
+                                "high": _bar_opt_float(bar.get("high")),
+                                "low": _bar_opt_float(bar.get("low")),
+                                "close": _bar_opt_float(bar.get("close")),
+                                "volume": _bar_opt_int(bar.get("volume")),
+                                "payload_json": to_json(bar),
+                                "updated_at": now_iso,
+                            }
+                            for bar_time, bar_time_ms, bar in prepared
+                        ],
+                    )
+                    total_row = await self._row(
+                        conn,
+                        """
+                        SELECT COUNT(*) AS cnt FROM market_bars
+                        WHERE account_id = :account AND symbol = :symbol AND timeframe = :timeframe
+                        """,
+                        account=acc,
+                        symbol=norm_sym,
+                        timeframe=norm_tf,
+                    )
+                    total_cnt = int(total_row["cnt"]) if total_row is not None else 0
+                    if total_cnt > self._max_bars_per_series:
+                        cutoff = await self._row(
+                            conn,
+                            """
+                            SELECT bar_time_ms, bar_time FROM market_bars
+                            WHERE account_id = :account AND symbol = :symbol AND timeframe = :timeframe
+                            ORDER BY bar_time_ms DESC, bar_time DESC
+                            LIMIT 1 OFFSET :offset
+                            """,
+                            account=acc,
+                            symbol=norm_sym,
+                            timeframe=norm_tf,
+                            offset=self._max_bars_per_series - 1,
+                        )
+                        if cutoff is not None:
+                            await conn.execute(
+                                text(
+                                    """
+                                    DELETE FROM market_bars
+                                    WHERE account_id = :account AND symbol = :symbol AND timeframe = :timeframe
+                                      AND (
+                                          bar_time_ms < :cut_ms
+                                          OR (bar_time_ms = :cut_ms AND bar_time < :cut_time)
+                                      )
+                                    """
+                                ),
+                                {
+                                    "account": acc,
+                                    "symbol": norm_sym,
+                                    "timeframe": norm_tf,
+                                    "cut_ms": int(cutoff["bar_time_ms"]),
+                                    "cut_time": str(cutoff["bar_time"]),
+                                },
+                            )
+
+            marker: EaRecord = {
+                "account_id": acc,
+                "symbol": raw_sym,
+                "timeframe": norm_tf,
+                "bars": [],
+                "stored_in": "market_bars",
+            }
+            await self._save_snapshot(conn, "bars", acc, raw_sym, marker, norm_tf)
             await conn.commit()
 
-    async def get_bars(self, account_id_: str, symbol: str, timeframe: str) -> list[EaRecord]:
+    async def get_bars(
+        self,
+        account_id_: str,
+        symbol: str,
+        timeframe: str,
+        *,
+        limit: int | None = None,
+    ) -> list[EaRecord]:
+        norm_sym = normalize_symbol(symbol)
+        norm_tf = normalize_timeframe(timeframe)
         async with self._connect() as conn:
+            if limit is not None and limit > 0:
+                rows = await self._rows(
+                    conn,
+                    """
+                    SELECT payload_json FROM market_bars
+                    WHERE account_id = :account AND symbol = :symbol AND timeframe = :timeframe
+                    ORDER BY bar_time_ms DESC, bar_time DESC
+                    LIMIT :limit
+                    """,
+                    account=account_id_,
+                    symbol=norm_sym,
+                    timeframe=norm_tf,
+                    limit=int(limit),
+                )
+                rows.reverse()
+            else:
+                rows = await self._rows(
+                    conn,
+                    """
+                    SELECT payload_json FROM market_bars
+                    WHERE account_id = :account AND symbol = :symbol AND timeframe = :timeframe
+                    ORDER BY bar_time_ms ASC, bar_time ASC
+                    """,
+                    account=account_id_,
+                    symbol=norm_sym,
+                    timeframe=norm_tf,
+                )
+
+            if rows:
+                out: list[EaRecord] = []
+                for row in rows:
+                    raw_json = row.get("payload_json")
+                    if not isinstance(raw_json, str):
+                        continue
+                    parsed = from_json(raw_json)
+                    if isinstance(parsed, dict):
+                        out.append(parsed)
+                return out
+
             record = await self._get_snapshot(conn, "bars", account_id_, symbol, timeframe)
             bars = record.get("bars") if record is not None else None
-            return [clone_record(b) for b in bars] if isinstance(bars, list) else []
+            if isinstance(bars, list) and bars:
+                sliced = bars[-int(limit) :] if (limit is not None and limit > 0) else bars
+                return [clone_record(b) for b in sliced if isinstance(b, dict)]
+            return []
 
     async def claim_bar_close_event(
         self, account_id_: str, symbol: str, timeframe: str, bar_time: str

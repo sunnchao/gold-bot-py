@@ -146,6 +146,89 @@ def test_compose_blocks_counter_htf_m15_and_exhausted_logic_unless_double_eviden
     assert exhausted.sop_context is not None
     assert "sop.logic_exhausted" in exhausted.sop_context["sop_blocks"]
 
+    # 4. 从 HTF hold + bearish 实盘推导出的空头账本能成功拦截 M15 逆势做多
+    from datetime import UTC, datetime
+
+    from backend.agents.agents.comprehensive_analyst import _build_sop_context
+    from backend.services.sop.ledger import reconcile_ledger_after_review
+
+    live_payload = {
+        "market": {"bid": 3610.0, "ask": 3610.5},
+        "daily_structure": {"status": "ok", "macro_bias": "bearish", "prior_major_high": 3650.0},
+        "confluence_levels": [
+            {"price": 3630.2, "role": "resistance", "tier": "core", "sources": ["H1_SWING"]},
+            {"price": 3596.08, "role": "support", "tier": "core", "sources": ["H4_SWING"]},
+        ],
+    }
+    live_res = {
+        "technical": {"bias": "bearish", "confidence": 74},
+        "risk": {},
+        "arbitration": {"final_direction": "hold", "action": "hold", "reasoning": "需等待反弹拒绝确认"},
+    }
+    live_sop_ctx = _build_sop_context(
+        result=live_res,
+        payload=live_payload,
+        options={"analysisRole": "htf_anchor"},
+    )
+    reconciled_short = reconcile_ledger_after_review(
+        None,
+        account_id="81124211",
+        symbol="GOLDM#",
+        role="htf_anchor",
+        review_result={"bias": "bearish", "confidence": 74, "sop_context": live_sop_ctx},
+        daily_structure=live_payload["daily_structure"],
+        confluence_levels=live_payload["confluence_levels"],
+        current_price=3610.0,
+        now=datetime(2026, 11, 23, 9, 36, tzinfo=UTC),
+    )
+    assert reconciled_short["htf_anchor"]["intraday_direction"] == "short"
+    assert reconciled_short["htf_anchor"]["veto_boundary"]["short_invalid_above"] == 3630.2
+
+    counter_buy = compose_final_signal(
+        {
+            "accountId": "81124211",
+            "symbol": "GOLDM#",
+            "analysisRole": "m15_entry",
+            "previousLedger": reconciled_short,
+            "patrolContext": {"trigger_reasons": ["m15_close"]},
+            "technicalAnalysis": TechnicalAnalysis(
+                bias="bullish",
+                confidence=80,
+                phase="consolidation",
+                indicators_summary="M15 bounce",
+                support_levels=[],
+                resistance_levels=[],
+                recommendation="none",
+                rationale="M15 bounce",
+            ),
+            "arbitration": ArbitrationResult(
+                final_direction="buy",
+                action="open",
+                confidence=80,
+                reasoning="M15 短线反弹尝试做多",
+                phase="correction",
+                primary_contradiction="none",
+                united_front_analysis="none",
+                trade_recommendation=TradeRecommendation(
+                    direction="buy",
+                    entry_price=3611.0,
+                    stop_loss=3602.0,
+                    take_profit_1=3625.0,
+                    take_profit_2=None,
+                    risk_reward_ratio=1.6,
+                    position_size_lots=0.1,
+                    rationale="M15 bounce buy",
+                ),
+            ),
+        }
+    )
+    assert counter_buy is not None
+    assert counter_buy.arbitration is not None
+    assert counter_buy.arbitration["action"] == "hold"
+    assert counter_buy.trade_plan is None
+    assert counter_buy.sop_context is not None
+    assert "sop.m15_counter_htf_blocked" in counter_buy.sop_context["sop_blocks"]
+
 
 async def test_sqlite_closed_loop_replay_and_admin_endpoints(tmp_path) -> None:
     db_path = tmp_path / "sop_replay.db"

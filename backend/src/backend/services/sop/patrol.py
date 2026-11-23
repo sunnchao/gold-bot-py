@@ -133,7 +133,7 @@ class PatrolService:
         heartbeat = await self._store.get_heartbeat(account_id)
         bars_by_tf: dict[str, Sequence[dict[str, Any]]] = {}
         for tf in ("M15", "H1", "H4", "D1"):
-            bars_by_tf[tf] = await self._store.get_bars(account_id, norm_sym, tf)
+            bars_by_tf[tf] = await self._store.get_bars(account_id, norm_sym, tf, limit=200)
 
         price: float | None = None
         if isinstance(tick, dict):

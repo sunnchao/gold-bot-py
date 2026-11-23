@@ -182,3 +182,84 @@ def test_reconcile_m15_strictly_preserves_htf_anchor_and_never_leaves_orphan_pla
     assert "HARD PREMISE FOR M15 ENTRY" in prompt_txt
     assert "4080.0" in prompt_txt
     assert empty_watch_ledger("acc-1", "xauusd")["symbol"] == "XAUUSD"
+
+
+def test_htf_hold_with_bearish_bias_preserves_short_direction_compact_veto_and_armed_playbook() -> None:
+    from backend.agents.agents.comprehensive_analyst import _build_sop_context
+
+    long_reasoning = (
+        "技术面显示 H4 宏观偏空但短线反弹，需等待阻力带收盘拒绝确认，鉴于市场未开最终观望。" * 8
+    )
+    payload = {
+        "market": {"bid": 3610.0, "ask": 3610.5},
+        "daily_structure": {
+            "status": "ok",
+            "macro_bias": "bearish",
+            "prior_major_high": 3650.0,
+            "measured_targets": [{"ratio": 1.618, "price": 3440.0}],
+        },
+        "confluence_levels": [
+            {"price": 3630.2, "role": "resistance", "tier": "core", "sources": ["H1_SWING", "PSYCH_ROUND"]},
+            {"price": 3596.08, "role": "support", "tier": "core", "sources": ["H4_SWING", "D1_PDH_PDL"]},
+            {"price": 3585.76, "role": "support", "tier": "secondary", "sources": ["H1_SWING"]},
+        ],
+    }
+    analyst_result = {
+        "technical": {
+            "bias": "bearish",
+            "confidence": 75,
+            "support_levels": [{"price": 3596.08}],
+            "resistance_levels": [{"price": 3630.2}, {"price": 3634.94}],
+            "rationale": long_reasoning,
+        },
+        "risk": {"suggestedSL": 3637.0},
+        "arbitration": {
+            "final_direction": "hold",
+            "action": "hold",
+            "confidence": 65,
+            "reasoning": long_reasoning,
+            "trade_recommendation": None,
+        },
+    }
+
+    sop_ctx = _build_sop_context(
+        result=analyst_result,
+        payload=payload,
+        options={"analysisRole": "htf_anchor"},
+    )
+    assert sop_ctx["intraday_direction"] == "short"
+    assert sop_ctx["short_term_targets"] == [3596.08, 3585.76]
+    assert sop_ctx["veto_boundary"] is not None
+    assert sop_ctx["veto_boundary"]["short_invalid_above"] == 3637.0
+    assert sop_ctx["veto_boundary"]["long_invalid_below"] is None
+    assert len(sop_ctx["veto_boundary"]["reason"]) <= 160
+    assert len(sop_ctx["htf_rationale"]) <= 240
+
+    t0 = datetime(2026, 11, 23, 9, 36, tzinfo=UTC)
+    reconciled = reconcile_ledger_after_review(
+        None,
+        account_id="81124211",
+        symbol="GOLDM#",
+        role="htf_anchor",
+        review_result={**analyst_result, "bias": "bearish", "sop_context": sop_ctx},
+        daily_structure=payload["daily_structure"],
+        confluence_levels=payload["confluence_levels"],
+        current_price=3610.0,
+        now=t0,
+    )
+    anchor = reconciled["htf_anchor"]
+    assert anchor["intraday_direction"] == "short"
+    assert anchor["veto_boundary"]["short_invalid_above"] == 3637.0
+    assert len(anchor["rationale"]) <= 240
+    assert reconciled["playbooks"][0]["direction"] == "short"
+    assert reconciled["playbooks"][0]["state"] == "armed"
+    assert reconciled["playbooks"][0]["invalid_if"] == {"price_above": 3637.0}
+
+    # 下一次平盘/微反弹巡检进入 watching 观察态(而非误触发 invalidated)
+    next_patrol = evaluate_ledger_patrol(
+        reconciled,
+        current_price=3612.0,
+        bars_by_tf={"M15": [{"close": 3612.0}], "H1": [{"close": 3612.0}]},
+        now=t0 + timedelta(minutes=15),
+    )
+    assert next_patrol["updated_ledger"]["playbooks"][0]["state"] in ("armed", "watching")

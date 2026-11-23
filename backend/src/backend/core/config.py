@@ -28,6 +28,7 @@ class GoldBotEnv:
     GB_SOP_HTF_REVIEW_MINUTES: int = 60
     GB_SOP_MOVE_TRIGGER_PCT: float = 0.5
     GB_SOP_M15_ALWAYS_RUN_ENTRY: bool = False
+    GB_MAX_BARS_PER_SERIES: int = 10_000
 
 
 def _parse_int_default(raw: str | None, default: int, *, minimum: int) -> int:
@@ -84,6 +85,9 @@ def load_gold_bot_env(source: Mapping[str, str | None] | None = None) -> GoldBot
             env.get("GB_SOP_MOVE_TRIGGER_PCT"), 0.5, minimum=0.05
         ),
         GB_SOP_M15_ALWAYS_RUN_ENTRY=_parse_boolean(env.get("GB_SOP_M15_ALWAYS_RUN_ENTRY"), False),
+        GB_MAX_BARS_PER_SERIES=_parse_int_default(
+            env.get("GB_MAX_BARS_PER_SERIES"), 10_000, minimum=50
+        ),
     )
 
 

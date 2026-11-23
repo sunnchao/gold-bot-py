@@ -13,14 +13,16 @@ from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncConnection, create_async_engine
 
+from backend.persistence.helpers import DEFAULT_MAX_BARS_PER_SERIES
 from backend.persistence.migrate import load_migrations
 from backend.persistence.records import Migration
 from backend.persistence.sqlite_store import SqliteEaStore
 
 
 class PostgresEaStore(SqliteEaStore):
-    def __init__(self, dsn: str) -> None:
+    def __init__(self, dsn: str, *, max_bars_per_series: int = DEFAULT_MAX_BARS_PER_SERIES) -> None:
         self._path = dsn
+        self._max_bars_per_series = max(1, int(max_bars_per_series))
         self._engine = create_async_engine(_sqlalchemy_asyncpg_url(dsn), pool_pre_ping=True)
         self._schema_ready = False
 
