@@ -1,5 +1,6 @@
 """镜像 gold-bot `apps/app-agent/src/config/symbol-profile.test.ts`。"""
-from backend.agents.config.symbol_profile import get_symbol_profile
+from backend.agents.agents import _support
+from backend.agents.config.symbol_profile import detect_cross_instrument_price, get_symbol_profile
 
 
 def test_keeps_standard_gold_at_the_default_minimum_lot_size():
@@ -34,3 +35,16 @@ def test_resolves_lowercase_xm_style_micro_silver_symbols_to_the_xagusd_profile(
     assert profile.minLots == 0.1
     assert profile.assetClass == "metal"
     assert profile.priceRange == (15, 50)
+
+
+def test_support_symbol_profile_preserves_mixed_case_and_micro_suffix():
+    us100 = _support.get_symbol_profile("US100Cash")
+    assert us100["symbol"] == "US100CASH"
+    assert us100["asset_class"] == "index"
+    assert _support._has_micro_contract_suffix("XAUUSDm") is True
+    assert _support._has_micro_contract_suffix("XAUUSD") is False
+
+
+def test_detect_cross_instrument_price_skips_self_case_variants():
+    assert detect_cross_instrument_price("GOLDM#", 3600.0, 3600.0, {"GOLDm#": 3600.0}) is None
+    assert _support.detect_cross_instrument_price("GOLDM#", 3600.0, 3600.0, {"GOLDm#": 3600.0}) is None

@@ -28,9 +28,12 @@ from backend.persistence.helpers import (
     normalize_decision_event,
     normalize_pending_signal,
     normalize_position_state,
+    normalize_symbol,
+    normalize_timeframe,
     numeric_field,
     position_state_from_row,
     requires_batch_cancel,
+    resolve_display_symbols,
     string_array_field,
     string_field,
     summarize_shadow_comparisons,
@@ -81,27 +84,36 @@ class SqliteEaStore:
                 DO UPDATE SET payload_json = excluded.payload_json, updated_at = CURRENT_TIMESTAMP
                 """
             ),
-            {"kind": kind, "account": account, "symbol": symbol, "timeframe": timeframe, "payload": to_json(payload)},
+            {
+                "kind": kind,
+                "account": account,
+                # 写侧统一 upper():GOLDM#(bars) 与 GOLDm#(tick/positions) 曾分裂成两行,
+                # 只有折叠后才能收敛为单一行,避免陈旧变体被读侧命中。
+                "symbol": normalize_symbol(symbol),
+                "timeframe": normalize_timeframe(timeframe),
+                "payload": to_json(payload),
+            },
         )
 
     async def _get_snapshot(
         self, conn: AsyncConnection, kind: str, account: str, symbol: str, timeframe: str = ""
     ) -> EaRecord | None:
-        # 大小写不敏感匹配:/bars 入库 upper() 而 /tick /positions 保留 EA 原样,
-        # 查询侧统一折叠,避免 GOLDM#(bars) 与 GOLDm#(tick/positions) 分裂。
+        # 大小写不敏感匹配(写侧已 upper,读侧兜底折叠以兼容历史数据)。
+        # 历史库可能残留同品种的大小写变体,按 updated_at 倒序取最新一条 —— 若取最旧
+        # 会读到几个月前的陈旧 K 线,分析引擎拿到与实时价脱节的价格后直接降级不可用。
         row = await self._row(
             conn,
             f"""
             SELECT payload_json FROM ea_snapshots
             WHERE kind = :kind AND account_id = :account
-              AND upper(symbol) = upper(:symbol) AND timeframe = :timeframe
-            ORDER BY {self._row_order_column} ASC
+              AND upper(trim(symbol)) = :symbol AND upper(trim(timeframe)) = :timeframe
+            ORDER BY updated_at DESC, {self._row_order_column} DESC
             LIMIT 1
             """,
             kind=kind,
             account=account,
-            symbol=symbol,
-            timeframe=timeframe,
+            symbol=normalize_symbol(symbol),
+            timeframe=normalize_timeframe(timeframe),
         )
         return from_json(row["payload_json"]) if row is not None and isinstance(row.get("payload_json"), str) else None
 
@@ -159,8 +171,9 @@ class SqliteEaStore:
                 ),
                 {
                     "account": account_id_,
-                    "symbol": symbol,
-                    "timeframe": timeframe,
+                    # 折叠大小写,避免同一根 K 线因 GOLDM#/GOLDm# 变体被重复 claim
+                    "symbol": normalize_symbol(symbol),
+                    "timeframe": normalize_timeframe(timeframe),
                     "bar_time": bar_time,
                 },
             )
@@ -175,19 +188,19 @@ class SqliteEaStore:
     async def get_positions(self, account_id_: str, symbol: str | None = None) -> list[EaRecord]:
         async with self._connect() as conn:
             if symbol is not None and len(symbol) > 0:
-                # 大小写不敏感匹配;变体并存(如 GOLDM#/GOLDm# 各存一份)时取最早
-                # 写入的快照(ORDER BY rowid LIMIT 1),避免重复持仓/选行不确定。
+                # 大小写不敏感匹配;历史变体并存(如 GOLDM#/GOLDm# 各存一份)时取
+                # 最新写入的快照,保证读到的是当前持仓而不是陈旧快照。
                 row = await self._row(
                     conn,
                     f"""
                     SELECT payload_json FROM ea_snapshots
                     WHERE kind = 'positions' AND account_id = :account
-                      AND upper(symbol) = upper(:symbol)
-                    ORDER BY {self._row_order_column} ASC
+                      AND upper(trim(symbol)) = :symbol
+                    ORDER BY updated_at DESC, {self._row_order_column} DESC
                     LIMIT 1
                     """,
                     account=account_id_,
-                    symbol=symbol,
+                    symbol=normalize_symbol(symbol),
                 )
                 payload_str = row.get("payload_json") if row is not None else None
                 record = (
@@ -198,8 +211,19 @@ class SqliteEaStore:
             row_order = self._row_order_column
             rows = await self._rows(
                 conn,
-                f"SELECT payload_json FROM ea_snapshots "
-                f"WHERE kind = 'positions' AND account_id = :account ORDER BY {row_order} ASC",
+                f"""
+                SELECT payload_json FROM (
+                    SELECT {row_order} AS rid, payload_json,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY upper(trim(symbol))
+                               ORDER BY updated_at DESC, {row_order} DESC
+                           ) AS rn
+                    FROM ea_snapshots
+                    WHERE kind = 'positions' AND account_id = :account
+                ) ranked
+                WHERE rn = 1
+                ORDER BY rid ASC
+                """,
                 account=account_id_,
             )
             out: list[EaRecord] = []
@@ -238,7 +262,9 @@ class SqliteEaStore:
                 ),
                 {
                     "account_id": account_id_,
-                    "symbol": symbol,
+                    # 折叠大小写:position_states 主键含 symbol,变体并存会让保本/移动止损
+                    # 状态分裂成两套,导致同一持仓的状态读不到。
+                    "symbol": normalize_symbol(symbol),
                     "ticket": int(normalized["ticket"]),
                     "tp1_hit": 1 if normalized["tp1_hit"] else 0,
                     "tp2_hit": 1 if normalized["tp2_hit"] else 0,
@@ -264,43 +290,53 @@ class SqliteEaStore:
             rows = await self._rows(
                 conn,
                 f"""
-                SELECT p.ticket, p.tp1_hit, p.tp2_hit, p.max_profit_atr, p.be_moved, p.be_trigger_atr, p.best_sl,
-                       p.open_time, p.last_modify_time, p.add_on_count, p.last_add_on_time, p.last_add_on_price,
-                       p.group_id, p.group_avg_entry, p.group_best_sl, p.trailing_closed
-                FROM position_states p
-                WHERE p.account_id = :account AND upper(p.symbol) = upper(:symbol)
-                  AND p.{self._row_order_column} = (
-                      SELECT MIN(q.{self._row_order_column}) FROM position_states q
-                      WHERE q.account_id = p.account_id AND upper(q.symbol) = upper(p.symbol)
-                        AND q.ticket = p.ticket
-                  )
-                ORDER BY p.ticket ASC
+                SELECT ticket, tp1_hit, tp2_hit, max_profit_atr, be_moved, be_trigger_atr, best_sl,
+                       open_time, last_modify_time, add_on_count, last_add_on_time, last_add_on_price,
+                       group_id, group_avg_entry, group_best_sl, trailing_closed
+                FROM (
+                    SELECT ticket, tp1_hit, tp2_hit, max_profit_atr, be_moved, be_trigger_atr, best_sl,
+                           open_time, last_modify_time, add_on_count, last_add_on_time, last_add_on_price,
+                           group_id, group_avg_entry, group_best_sl, trailing_closed,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY upper(trim(symbol)), ticket
+                               ORDER BY last_modify_time DESC, {self._row_order_column} DESC
+                           ) AS rn
+                    FROM position_states
+                    WHERE account_id = :account AND upper(trim(symbol)) = :symbol
+                ) ranked
+                WHERE rn = 1
+                ORDER BY ticket ASC
                 """,
                 account=account_id_,
-                symbol=symbol,
+                symbol=normalize_symbol(symbol),
             )
             states = [position_state_from_row(row) for row in rows]
             states.sort(key=lambda s: int(s["ticket"]))
             return states
 
     async def delete_stale_position_states(self, account_id_: str, symbol: str, active_tickets: list[int]) -> None:
+        normalized_symbol = normalize_symbol(symbol)
         async with self._connect() as conn:
             if not active_tickets:
                 await conn.execute(
                     text(
-                        "DELETE FROM position_states WHERE account_id = :account AND upper(symbol) = upper(:symbol)"
+                        "DELETE FROM position_states WHERE account_id = :account AND upper(trim(symbol)) = :symbol"
                     ),
-                    {"account": account_id_, "symbol": symbol},
+                    {"account": account_id_, "symbol": normalized_symbol},
                 )
             else:
                 placeholders = ", ".join(f":t{i}" for i in range(len(active_tickets)))
                 await conn.execute(
                     text(
                         f"DELETE FROM position_states WHERE account_id = :account "
-                        f"AND upper(symbol) = upper(:symbol) "
+                        f"AND upper(trim(symbol)) = :symbol "
                         f"AND ticket NOT IN ({placeholders})"
                     ),
-                    {"account": account_id_, "symbol": symbol, **{f"t{i}": t for i, t in enumerate(active_tickets)}},
+                    {
+                        "account": account_id_,
+                        "symbol": normalized_symbol,
+                        **{f"t{i}": t for i, t in enumerate(active_tickets)},
+                    },
                 )
             await conn.commit()
 
@@ -676,7 +712,7 @@ class SqliteEaStore:
                 ),
                 {
                     "account_id": payload.get("account_id", ""),
-                    "symbol": payload.get("symbol", ""),
+                    "symbol": normalize_symbol(string_field(payload, "symbol")),
                     "source": payload.get("source", ""),
                     "payload": to_json(payload),
                 },
@@ -687,10 +723,14 @@ class SqliteEaStore:
         async with self._connect() as conn:
             row = await self._row(
                 conn,
-                "SELECT payload_json FROM shadow_snapshots "
-                "WHERE account_id = :account AND symbol = :symbol AND source = :source",
+                f"""
+                SELECT payload_json FROM shadow_snapshots
+                WHERE account_id = :account AND upper(trim(symbol)) = :symbol AND source = :source
+                ORDER BY updated_at DESC, {self._row_order_column} DESC
+                LIMIT 1
+                """,
                 account=account_id_,
-                symbol=symbol,
+                symbol=normalize_symbol(symbol),
                 source=source,
             )
             value = row.get("payload_json") if row is not None else None
@@ -733,9 +773,10 @@ class SqliteEaStore:
     async def list_decision_events(self, filter_: EaRecord) -> list[EaRecord]:
         clauses = ["account_id = :account"]
         params: dict[str, Any] = {"account": string_field(filter_, "account_id")}
-        if len(string_field(filter_, "symbol")) > 0:
-            clauses.append("upper(symbol) = upper(:symbol)")
-            params["symbol"] = string_field(filter_, "symbol")
+        normalized_symbol = normalize_symbol(string_field(filter_, "symbol"))
+        if len(normalized_symbol) > 0:
+            clauses.append("upper(trim(symbol)) = :symbol")
+            params["symbol"] = normalized_symbol
         if len(string_field(filter_, "status")) > 0:
             clauses.append("status = :status")
             params["status"] = string_field(filter_, "status")
@@ -787,7 +828,9 @@ class SqliteEaStore:
                 await conn.commit()
                 return
             signal["id"] = await self._next_pending_signal_id_in_sqlite(conn)
-            await self._insert_event(conn, "pending_signal", account_id(signal), symbol_default(signal), signal, 1)
+            await self._insert_event(
+                conn, "pending_signal", account_id(signal), normalize_symbol(symbol_default(signal)), signal, 1
+            )
             event = candidate_signal_decision_event(signal)
             if event is not None:
                 await self._insert_decision_event(conn, event)
@@ -822,7 +865,7 @@ class SqliteEaStore:
                     ),
                     {
                         "account": account_id(signal),
-                        "symbol": symbol_default(signal),
+                        "symbol": normalize_symbol(symbol_default(signal)),
                         "payload": to_json(signal),
                         "row_id": row["row_id"],
                     },
@@ -836,11 +879,11 @@ class SqliteEaStore:
                 conn,
                 f"""
                 SELECT payload_json FROM ea_events
-                WHERE kind = 'pending_signal' AND account_id = :account AND upper(symbol) = upper(:symbol)
+                WHERE kind = 'pending_signal' AND account_id = :account AND upper(trim(symbol)) = :symbol
                 ORDER BY {self._row_order_column} ASC
                 """,
                 account=account_id_,
-                symbol=symbol,
+                symbol=normalize_symbol(symbol),
             )
             payloads: list[EaRecord] = []
             for row in rows:
@@ -914,8 +957,19 @@ class SqliteEaStore:
         async with self._connect() as conn:
             rows = await self._rows(
                 conn,
-                "SELECT payload_json FROM ea_snapshots "
-                f"WHERE kind = 'ai_result' AND account_id = :account ORDER BY {self._row_order_column} ASC",
+                f"""
+                SELECT payload_json FROM (
+                    SELECT {self._row_order_column} AS rid, payload_json,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY upper(trim(symbol))
+                               ORDER BY updated_at DESC, {self._row_order_column} DESC
+                           ) AS rn
+                    FROM ea_snapshots
+                    WHERE kind = 'ai_result' AND account_id = :account
+                ) ranked
+                WHERE rn = 1
+                ORDER BY rid ASC
+                """,
                 account=account_id_,
             )
             results: list[EaRecord] = []
@@ -1002,36 +1056,35 @@ class SqliteEaStore:
 
     async def list_symbols(self, account_id_: str) -> list[str]:
         async with self._connect() as conn:
-            # 大小写折叠去重;代表符号取首行(窗口函数 PG/SQLite 3.25+ 均支持)。
-            # 注意不能用 GROUP BY upper(symbol) 直接 SELECT symbol —— Postgres 会报
-            # "column must appear in GROUP BY",SQLite 宽松导致测试漏掉。
+            # 写侧将 symbol 折叠为大写;从 payload_json 还原 EA 原始大小写(如 GOLDm#),
+            # 并按首次出现顺序保留分组。
             rows = await self._rows(
                 conn,
                 f"""
-                SELECT symbol FROM (
-                    SELECT {self._row_order_column} AS rid, symbol,
-                           ROW_NUMBER() OVER (
-                               PARTITION BY upper(symbol)
-                               ORDER BY {self._row_order_column} ASC
-                           ) AS rn
-                    FROM ea_snapshots
-                    WHERE account_id = :account AND symbol <> '' AND kind IN ('tick', 'bars', 'positions')
-                ) ranked
-                WHERE rn = 1
-                ORDER BY rid ASC
+                SELECT kind, symbol, payload_json, updated_at
+                FROM ea_snapshots
+                WHERE account_id = :account AND symbol <> '' AND kind IN ('tick', 'bars', 'positions')
+                ORDER BY {self._row_order_column} ASC
                 """,
                 account=account_id_,
             )
-        out: list[str] = []
-        seen: set[str] = set()
-        for row in rows:
-            value = row["symbol"]
-            if isinstance(value, str) and len(value) > 0:
-                key = value.upper()
-                if key not in seen:
-                    seen.add(key)
-                    out.append(value)
-        return out
+        entries: list[tuple[str, str, str, str, int]] = []
+        for idx, row in enumerate(rows):
+            payload_str = row.get("payload_json")
+            payload = from_json(payload_str) if isinstance(payload_str, str) else None
+            payload_symbol = string_field(payload, "symbol") if isinstance(payload, dict) else ""
+            raw_updated_at = row.get("updated_at")
+            updated_at = raw_updated_at if isinstance(raw_updated_at, str) else ""
+            entries.append(
+                (
+                    str(row.get("kind") or ""),
+                    str(row.get("symbol") or ""),
+                    payload_symbol,
+                    updated_at,
+                    idx,
+                )
+            )
+        return resolve_display_symbols(entries)
 
     async def list_ai_symbols(self, account_id_: str) -> list[str]:
         registration_symbols = string_array_field(await self.get_registration(account_id_), "ai_symbols")

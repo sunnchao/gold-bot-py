@@ -29,6 +29,60 @@ def symbol_default(payload: EaRecord) -> str:
     return value if isinstance(value, str) and len(value) > 0 else DEFAULT_SYMBOL
 
 
+def normalize_symbol(symbol: str | None) -> str:
+    """统一品种键大小写。
+
+    EA 上报的 broker 原始名是混合大小写(如 XM 微合约 GOLDM#/SILVERm#),而部分
+    上报路径(/bars)与服务端内部映射用小写别名。若按原样写库,同一品种会分裂成
+    GOLDM# / GOLDm# 两行快照,读侧只能拿到其中一行(可能是三个月前的陈旧数据),
+    导致分析引擎拿到与实时价脱节的价格后降级为不可用。
+
+    因此所有以 symbol 为键的写入/查询统一走 upper()+strip(),只保留一套记录。
+    """
+    return symbol.strip().upper() if isinstance(symbol, str) else ""
+
+
+def normalize_timeframe(timeframe: str | None) -> str:
+    """统一周期键大小写(trim + upper)。"""
+    return timeframe.strip().upper() if isinstance(timeframe, str) else ""
+
+
+def resolve_display_symbols(entries: Iterable[tuple[str, str, str, str, int]]) -> list[str]:
+    """按归一化 symbol 分组并保留首次出现顺序,从快照载荷还原 EA 原始大小写展示名。
+
+    entries 元素为 (kind, key_symbol, payload_symbol, updated_at, order_seq)。
+    优先级: tick/positions 载荷中的 symbol(取最新) > bars 载荷中的 symbol(取最新) > 键本身。
+    """
+    groups: dict[str, dict[str, Any]] = {}
+    for kind, key_symbol, payload_symbol, updated_at, order_seq in entries:
+        canonical = normalize_symbol(key_symbol)
+        if not canonical:
+            continue
+        group = groups.get(canonical)
+        if group is None:
+            group = {
+                "fallback": key_symbol.strip(),
+                "tp_score": None,
+                "tp_symbol": "",
+                "bars_score": None,
+                "bars_symbol": "",
+            }
+            groups[canonical] = group
+        candidate = payload_symbol.strip() if isinstance(payload_symbol, str) else ""
+        if not candidate:
+            continue
+        score = (updated_at or "", order_seq)
+        if kind in ("tick", "positions"):
+            if group["tp_score"] is None or score >= group["tp_score"]:
+                group["tp_score"] = score
+                group["tp_symbol"] = candidate
+        elif kind == "bars":
+            if group["bars_score"] is None or score >= group["bars_score"]:
+                group["bars_score"] = score
+                group["bars_symbol"] = candidate
+    return [group["tp_symbol"] or group["bars_symbol"] or group["fallback"] for group in groups.values()]
+
+
 def string_field(payload: EaRecord, field: str) -> str:
     value = payload.get(field)
     return value if isinstance(value, str) else ""
@@ -427,7 +481,7 @@ def filter_decision_events(events: list[EaRecord], filter_: EaRecord) -> list[Ea
         e
         for e in events
         if e.get("account_id") == account
-        and (len(symbol) == 0 or str(e.get("symbol", "")).upper() == symbol.upper())
+        and (len(symbol) == 0 or equals_fold(str(e.get("symbol", "")), symbol))
         and (len(status) == 0 or e.get("status") == status)
     ]
     filtered.sort(key=lambda e: (e.get("created_at", ""), e.get("id", 0)), reverse=True)
@@ -441,7 +495,7 @@ def filter_shadow_comparisons(comparisons: list[EaRecord], filter_: EaRecord | N
     for c in comparisons:
         if "account_id" in filter_ and c.get("account_id") != filter_["account_id"]:
             continue
-        if "symbol" in filter_ and c.get("symbol") != filter_["symbol"]:
+        if "symbol" in filter_ and not equals_fold(str(c.get("symbol", "")), str(filter_["symbol"])):
             continue
         if "source" in filter_ and c.get("source") != filter_["source"]:
             continue

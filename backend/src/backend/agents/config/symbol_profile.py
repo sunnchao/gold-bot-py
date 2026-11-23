@@ -219,7 +219,7 @@ def detect_cross_instrument_price(
 
     for other_symbol, other_price in all_current_prices.items():
         # Skip self
-        if other_symbol == target_symbol:
+        if other_symbol.strip().upper() == target_symbol.strip().upper():
             continue
         # Skip if other price is unavailable
         if not _is_finite(other_price) or other_price <= 0:

@@ -942,7 +942,7 @@ def validate_trade_plan(trade_plan: dict, expected_account_id: str, expected_sym
     symbol = _string_field(trade_plan, "symbol")
     if len(symbol) == 0:
         return "trade_plan.symbol is required"
-    if len(expected_symbol) > 0 and symbol.upper() != expected_symbol.upper():
+    if len(expected_symbol) > 0 and symbol.strip().upper() != expected_symbol.strip().upper():
         return f"trade_plan.symbol = {_js_json(symbol)}, want {_js_json(expected_symbol)}"
 
     mode = _string_field(trade_plan, "mode")
@@ -1373,7 +1373,7 @@ async def build_close_short_risk_commands(
         if ticket <= 0:
             continue
         position_symbol = _string_field(position, "symbol")
-        if len(position_symbol) > 0 and position_symbol.upper() != symbol.upper():
+        if len(position_symbol) > 0 and position_symbol.strip().upper() != symbol.strip().upper():
             continue
         if _string_field(position, "type").upper() != "SELL":
             continue
@@ -1383,7 +1383,7 @@ async def build_close_short_risk_commands(
             "action": "CLOSE",
             "source": "ai_risk_alert",
             "ticket": ticket,
-            "symbol": symbol,
+            "symbol": position_symbol or symbol,
             "reason": f"AI风险警报(平空): {alert_reason}",
             "confidence": confidence,
         }

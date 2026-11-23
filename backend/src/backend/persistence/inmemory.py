@@ -24,9 +24,12 @@ from backend.persistence.helpers import (
     normalize_decision_event,
     normalize_pending_signal,
     normalize_position_state,
+    normalize_symbol,
+    normalize_timeframe,
     numeric_field,
     position_state_from_row,
     requires_batch_cancel,
+    resolve_display_symbols,
     string_array_field,
     string_field,
     summarize_shadow_comparisons,
@@ -49,6 +52,8 @@ class InMemoryEaStore(EaStore):
 
     def __init__(self) -> None:
         self._snapshots: dict[SnapshotKey, EaRecord] = {}
+        self._snapshot_order: dict[SnapshotKey, int] = {}
+        self._snapshot_seq = 0
         self._events: list[EaRecord] = []  # {kind, account_id, symbol, payload, delivered}
         self._position_states: dict[str, EaRecord] = {}  # key account:symbol:ticket
         self._runtime_modes: dict[str, str] = {}
@@ -68,20 +73,17 @@ class InMemoryEaStore(EaStore):
 
     # ------------------------------------------------------------------ 快照
     def _snapshot(self, kind: str, account: str, symbol: str, timeframe: str = "") -> EaRecord | None:
-        # 大小写不敏感匹配(与 SQLite 版一致):/bars 入库 upper 而 /tick 等保留 EA 原样
-        for key, value in self._snapshots.items():
-            if (
-                key[0] == kind
-                and key[1] == account
-                and key[2].upper() == symbol.upper()
-                and key[3] == timeframe
-            ):
-                return clone_record(value)
-        return None
+        key = (kind, account, normalize_symbol(symbol), normalize_timeframe(timeframe))
+        value = self._snapshots.get(key)
+        return None if value is None else clone_record(value)
 
     def _save_snapshot(self, kind: str, account: str, symbol: str, payload: EaRecord, timeframe: str = "") -> None:
-        # 存储时保留原样(读写都经大小写折叠),便于诊断时看到 EA 真实符号
-        self._snapshots[(kind, account, symbol, timeframe)] = clone_record(payload)
+        # 写侧统一折叠大小写(与 SQLite/PG 版一致),保证同品种只有一份快照;
+        # 否则 GOLDM#(bars) 与 GOLDm#(tick) 会共存,读侧只能命中其中一份(可能是旧数据)。
+        key = (kind, account, normalize_symbol(symbol), normalize_timeframe(timeframe))
+        self._snapshots[key] = clone_record(payload)
+        self._snapshot_seq += 1
+        self._snapshot_order[key] = self._snapshot_seq
 
     async def save_registration(self, payload: EaRecord) -> None:
         self._save_snapshot("registration", account_id(payload), "", payload)
@@ -114,7 +116,7 @@ class InMemoryEaStore(EaStore):
     async def claim_bar_close_event(
         self, account_id_: str, symbol: str, timeframe: str, bar_time: str
     ) -> bool:
-        key = (account_id_, symbol, timeframe, bar_time)
+        key = (account_id_, normalize_symbol(symbol), normalize_timeframe(timeframe), bar_time)
         if key in self._bar_close_events:
             return False
         self._bar_close_events.add(key)
@@ -124,22 +126,14 @@ class InMemoryEaStore(EaStore):
         self._save_snapshot("positions", account_id(payload), symbol_default(payload), payload)
 
     async def get_positions(self, account_id_: str, symbol: str | None = None) -> list[EaRecord]:
+        if symbol is not None and len(symbol) > 0:
+            record = self._snapshot("positions", account_id_, symbol)
+            positions = record.get("positions") if isinstance(record, dict) else None
+            return clone_array(positions) if isinstance(positions, list) else []
         records: list[EaRecord] = []
-        # 大小写折叠匹配;带 symbol 时与 SQLite 语义一致,命中多个变体快照只取
-        # 最早一个(dict 插入序 = 写入序),避免重复持仓。无 symbol 列出全部。
-        symbol_upper = symbol.upper() if symbol is not None and len(symbol) > 0 else None
-        matched: list[tuple[EaRecord, int]] = []
-        for index, ((kind, account, key_symbol, _), value) in enumerate(self._snapshots.items()):
+        for (kind, account, _key_symbol, _), value in self._snapshots.items():
             if kind != "positions" or account != account_id_:
                 continue
-            if symbol_upper is not None and key_symbol.upper() != symbol_upper:
-                continue
-            matched.append((value, index))
-        if not matched:
-            return []
-        if symbol_upper is not None:
-            matched = [min(matched, key=lambda pair: pair[1])]
-        for value, _index in matched:
             positions = value.get("positions")
             if isinstance(positions, list):
                 records.extend(clone_array(positions))
@@ -311,26 +305,22 @@ class InMemoryEaStore(EaStore):
     # ------------------------------------------------------------------ 持仓状态
     async def save_position_state(self, account_id_: str, symbol: str, state: EaRecord) -> None:
         normalized = normalize_position_state(state)
-        self._position_states[f"{account_id_}:{symbol}:{normalized['ticket']}"] = normalized
+        self._position_states[f"{account_id_}:{normalize_symbol(symbol)}:{normalized['ticket']}"] = normalized
 
     async def load_position_states(self, account_id_: str, symbol: str) -> list[EaRecord]:
         # 只折叠 symbol 段;account_id 精确匹配(大小写不同的账户是不同账户)。
-        # 同 ticket 变体并存时取首个(key 插入序),与 SQL MIN(rowid) 语义一致。
-        prefix = f"{account_id_}:{symbol}:".upper()
-        by_ticket: dict[int, EaRecord] = {}
-        for k, v in self._position_states.items():
-            if not k.upper().startswith(prefix) or not k.startswith(f"{account_id_}:"):
-                continue
-            state = position_state_from_row(v)
-            by_ticket.setdefault(int(state["ticket"]), state)
-        return sorted(by_ticket.values(), key=lambda s: int(s["ticket"]))
+        prefix = f"{account_id_}:{normalize_symbol(symbol)}:"
+        states = [position_state_from_row(v) for k, v in self._position_states.items() if k.startswith(prefix)]
+        return sorted(states, key=lambda s: int(s["ticket"]))
 
     async def delete_stale_position_states(self, account_id_: str, symbol: str, active_tickets: list[int]) -> None:
         active = set(active_tickets)
-        symbol_upper = symbol.upper()
+        prefix = f"{account_id_}:{normalize_symbol(symbol)}:"
         for key in list(self._position_states.keys()):
-            account, key_symbol, ticket = key.split(":")
-            if account == account_id_ and key_symbol.upper() == symbol_upper and int(ticket) not in active:
+            if not key.startswith(prefix):
+                continue
+            ticket = int(key[len(prefix) :])
+            if ticket not in active:
                 del self._position_states[key]
 
     # ------------------------------------------------------------------ 影子
@@ -344,11 +334,12 @@ class InMemoryEaStore(EaStore):
         return summarize_shadow_comparisons(filter_shadow_comparisons(self._shadow_comparisons, filter_))
 
     async def save_shadow_snapshot(self, payload: EaRecord) -> None:
-        key = f"{payload.get('account_id', '')}:{payload.get('symbol', '')}:{payload.get('source', '')}"
+        symbol_norm = normalize_symbol(string_field(payload, "symbol"))
+        key = f"{payload.get('account_id', '')}:{symbol_norm}:{payload.get('source', '')}"
         self._shadow_snapshots[key] = clone_record(payload)
 
     async def get_latest_shadow_snapshot(self, account_id_: str, symbol: str, source: str) -> EaRecord | None:
-        value = self._shadow_snapshots.get(f"{account_id_}:{symbol}:{source}")
+        value = self._shadow_snapshots.get(f"{account_id_}:{normalize_symbol(symbol)}:{source}")
         return None if value is None else clone_record(value)
 
     # ------------------------------------------------------------------ 决策时间线
@@ -375,7 +366,7 @@ class InMemoryEaStore(EaStore):
     async def save_pending_signal(self, payload: EaRecord) -> None:
         signal = normalize_pending_signal(payload)
         explicit_id = int(numeric_field(signal, "id"))
-        key = f"{account_id(signal)}:{symbol_default(signal)}"
+        key = f"{account_id(signal)}:{normalize_symbol(symbol_default(signal))}"
         if explicit_id > 0:
             if self._replace_pending_signal(signal, key):
                 self._next_pending_signal_id = max(self._next_pending_signal_id, explicit_id + 1)
@@ -407,27 +398,13 @@ class InMemoryEaStore(EaStore):
 
     async def get_pending_signals(self, account_id_: str, symbol: str) -> list[EaRecord]:
         # 大小写不敏感只作用于 symbol;account_id 精确匹配(与 SQLite 版语义对齐)。
-        prefix = f"{account_id_}:"
-        symbol_upper = symbol.upper()
-        entries = [
-            v
-            for k, vs in self._pending_signals.items()
-            if k.startswith(prefix) and k[len(prefix):].upper() == symbol_upper
-            for v in vs
-        ]
+        entries = self._pending_signals.get(f"{account_id_}:{normalize_symbol(symbol)}", [])
         pending = [e for e in entries if string_field(e, "status") == "pending"]
         pending.sort(key=lambda e: string_field(e, "created_at"), reverse=True)
         return [clone_record(e) for e in pending]
 
     async def get_pending_signal_by_id(self, account_id_: str, symbol: str, id_: int) -> EaRecord | None:
-        prefix = f"{account_id_}:"
-        symbol_upper = symbol.upper()
-        for entry in (
-            v
-            for k, vs in self._pending_signals.items()
-            if k.startswith(prefix) and k[len(prefix):].upper() == symbol_upper
-            for v in vs
-        ):
+        for entry in self._pending_signals.get(f"{account_id_}:{normalize_symbol(symbol)}", []):
             if int(numeric_field(entry, "id")) == id_:
                 return clone_record(entry)
         return None
@@ -453,7 +430,11 @@ class InMemoryEaStore(EaStore):
 
     # ------------------------------------------------------------------ AI 结果
     async def save_ai_result(self, account_id_: str, symbol: str, payload: EaRecord) -> None:
-        self._ai_results[(account_id_, symbol)] = {"account_id": account_id_, "symbol": symbol, **clone_record(payload)}
+        self._ai_results[(account_id_, normalize_symbol(symbol))] = {
+            "account_id": account_id_,
+            "symbol": symbol,
+            **clone_record(payload),
+        }
 
     async def get_ai_results(self, account_id_: str) -> list[EaRecord]:
         return [clone_record(v) for k, v in self._ai_results.items() if k[0] == account_id_]
@@ -484,15 +465,18 @@ class InMemoryEaStore(EaStore):
         return out
 
     async def list_symbols(self, account_id_: str) -> list[str]:
-        out: list[str] = []
-        seen: set[str] = set()
-        for (kind, account, symbol, _), _value in self._snapshots.items():
-            if kind in ("tick", "bars", "positions") and account == account_id_ and len(symbol) > 0:
-                key = symbol.upper()
-                if key not in seen:
-                    seen.add(key)
-                    out.append(symbol)
-        return out
+        entries = [
+            (
+                key[0],
+                key[2],
+                string_field(value, "symbol"),
+                string_field(value, "updated_at"),
+                self._snapshot_order.get(key, 0),
+            )
+            for key, value in self._snapshots.items()
+            if key[0] in ("tick", "bars", "positions") and key[1] == account_id_ and len(key[2]) > 0
+        ]
+        return resolve_display_symbols(entries)
 
     async def list_ai_symbols(self, account_id_: str) -> list[str]:
         registration_symbols = string_array_field(self._snapshot("registration", account_id_, ""), "ai_symbols")

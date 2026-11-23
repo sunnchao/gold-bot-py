@@ -675,7 +675,7 @@ def _has_micro_contract_suffix(raw_symbol: str) -> bool:
     normalized = raw_symbol.strip()
     if "#" in normalized:
         return True
-    return bool(re.match(r"m$", re.sub(r"[^A-Z0-9]", "", normalized), re.IGNORECASE))
+    return bool(re.search(r"m$", re.sub(r"[^A-Za-z0-9]", "", normalized), re.IGNORECASE))
 
 
 def _with_lot_bounds(profile: dict[str, Any], raw_symbol: str) -> dict[str, Any]:
@@ -695,7 +695,7 @@ def get_symbol_profile(raw_symbol: str) -> dict[str, Any]:
     if raw_symbol in _PROFILES:
         return _with_lot_bounds(_PROFILES[raw_symbol], raw_symbol)
 
-    base = re.sub(r"[^A-Z0-9]", "", raw_symbol).upper()
+    base = re.sub(r"[^A-Za-z0-9]", "", raw_symbol).upper()
     alias = _MICRO_BASE_ALIASES.get(base)
     if alias and alias in _PROFILES:
         return _with_lot_bounds(_PROFILES[alias], raw_symbol)
@@ -741,7 +741,7 @@ def detect_cross_instrument_price(
         return None
     target_profile = get_symbol_profile(target_symbol)
     for other_symbol, other_price in all_current_prices.items():
-        if other_symbol == target_symbol:
+        if other_symbol.strip().upper() == target_symbol.strip().upper():
             continue
         if not math.isfinite(other_price) or other_price <= 0:
             continue

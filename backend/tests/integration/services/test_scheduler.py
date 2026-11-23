@@ -1658,3 +1658,75 @@ async def test_persists_position_states_after_position_review() -> None:
     await scheduler.enqueue_position_review(ACCOUNT, "XAUUSD")
 
     assert analysis.persisted == (ACCOUNT, "XAUUSD", mock_position_states)
+
+
+async def test_scheduler_resolves_broker_symbol_casing_for_ea_commands() -> None:
+    store = create_in_memory_store()
+    await store.set_runtime_mode(ACCOUNT, "cutover")
+    await store.save_registration(
+        {"account_id": ACCOUNT, "leverage": 500, "ai_symbols": ["GOLDm#"]}
+    )
+    await store.save_heartbeat(
+        {"account_id": ACCOUNT, "market_open": True, "is_trade_allowed": True, "ai_symbols": ["GOLDm#"]}
+    )
+    await store.save_tick({"account_id": ACCOUNT, "symbol": "GOLDm#", "bid": 3600.0, "ask": 3600.2})
+    await store.save_bars(
+        {
+            "account_id": ACCOUNT,
+            "symbol": "GOLDM#",
+            "timeframe": "H1",
+            "bars": [
+                {"time": "2026-04-13T07:00:00.000Z", "open": 3599, "high": 3601, "low": 3598, "close": 3600, "atr": 2}
+            ],
+        }
+    )
+    await store.save_positions(
+        {
+            "account_id": ACCOUNT,
+            "symbol": "GOLDm#",
+            "positions": [
+                {
+                    "ticket": 889,
+                    "symbol": "GOLDm#",
+                    "type": "BUY",
+                    "open_price": 3595.0,
+                    "lots": 0.1,
+                    "sl": 3590.0,
+                    "tp": 3620.0,
+                }
+            ],
+        }
+    )
+
+    scheduler = SchedulerService(
+        FakeAnalysis(
+            lambda: {
+                "replay": {
+                    "signal": {
+                        "strategy": "pullback",
+                        "side": "BUY",
+                        "entry": 3598.0,
+                        "stop_loss": 3593.0,
+                        "tp1": 3608.0,
+                        "tp2": 3618.0,
+                        "score": 8,
+                        "atr": 2.0,
+                    },
+                    "position_commands": [
+                        {"action": "MODIFY", "ticket": 889, "new_sl": 3596.0, "reason": "breakeven_2.2ATR"}
+                    ],
+                }
+            }
+        ),
+        CommandLifecycleService(store),
+        None,
+        store,
+        lambda: "2026-07-17T06:13:55.000Z",
+    )
+
+    await scheduler.enqueue_analysis(ACCOUNT, "GOLDM#", "H1")
+    await scheduler.enqueue_position_review(ACCOUNT, "GOLDM#")
+
+    commands = await store.list_commands(ACCOUNT)
+    assert len(commands) == 2
+    assert {c["action"]: c["symbol"] for c in commands} == {"SIGNAL": "GOLDm#", "MODIFY": "GOLDm#"}

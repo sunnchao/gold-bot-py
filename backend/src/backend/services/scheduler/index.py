@@ -22,6 +22,7 @@ from typing import Any, Protocol
 
 from sqlalchemy.exc import IntegrityError
 
+from backend.persistence.helpers import normalize_symbol, string_array_field
 from backend.persistence.records import EaRecord, StoredCommand
 from backend.persistence.store import EaStore
 from backend.trading_core.indicators import atr
@@ -231,11 +232,12 @@ class SchedulerService:
                 if await store.get_command(command_id) is not None:
                     continue
                 try:
+                    command_symbol = await self._resolve_ea_symbol(account_id, symbol)
                     await self._command_lifecycle.accept_candidate(account_id, {
                         "command_id": command_id,
                         "action": "CANCEL_PENDING",
                         "source": "position_manager",
-                        "symbol": symbol,
+                        "symbol": command_symbol,
                         "ticket": 0,
                         "reason": EVENT_BLACKOUT,
                         "expiration": int(window.event.blackout_end.timestamp()),
@@ -406,13 +408,14 @@ class SchedulerService:
                 print(
                     f"[SCHED] signal_lots_clamped {payload}",
                 )
+        command_symbol = await self._resolve_ea_symbol(account_id, symbol)
         candidate: dict[str, Any] = {
             "command_id": command_id,
             "decision_id": command_id,
             "action": "SIGNAL",
             "source": "live_strategy",
             "strategy": _string_field(signal_record, "strategy"),
-            "symbol": symbol,
+            "symbol": command_symbol,
             "type": _string_field(signal_record, "side"),
             "entry": _number_field(signal_record, "entry"),
             "sl": _number_field(signal_record, "stop_loss"),
@@ -474,6 +477,7 @@ class SchedulerService:
             )
             return
         decision_id = _ai_decision_id(ai_result)
+        command_symbol = await self._resolve_ea_symbol(account_id, symbol)
         position_states = await self._load_position_states(account_id, symbol)
         states_by_ticket = {state.get("ticket"): state for state in position_states}
         for position in positions:
@@ -490,7 +494,7 @@ class SchedulerService:
                 )
                 continue
             candidate = self._ai_stop_loss_command_candidate(
-                account_id, symbol, position, ai_sl, atr_value, current_price, decision_id
+                account_id, symbol, position, ai_sl, atr_value, current_price, decision_id, command_symbol
             )
             if candidate is None:
                 self._log_ai_stop_loss_skip(
@@ -532,11 +536,12 @@ class SchedulerService:
         positions = await self._get_positions(account_id, symbol)
         bars = await self._bars_by_timeframe(account_id, symbol)
         current_price = _live_current_price(await self._get_latest_tick(account_id, symbol), bars)
+        command_symbol = await self._resolve_ea_symbol(account_id, symbol)
         for command in commands:
             if window is not None and window.stage == "blackout" and command.get("action") == "MODIFY":
                 continue
             candidate = self._position_manager_command_candidate(
-                account_id, symbol, command, positions, now_iso, current_price
+                account_id, symbol, command, positions, now_iso, current_price, command_symbol
             )
             if candidate is None or await self._get_command(candidate["command_id"]) is not None:
                 continue
@@ -550,7 +555,9 @@ class SchedulerService:
         positions: list[EaRecord],
         now_iso: str,
         current_price: float,
+        command_symbol: str | None = None,
     ) -> dict[str, Any] | None:
+        resolved_symbol = command_symbol or symbol
         ticket = command.get("ticket")
         if (
             isinstance(ticket, bool)
@@ -595,7 +602,7 @@ class SchedulerService:
                 "command_id": command_id,
                 "action": "MODIFY",
                 "source": "position_manager",
-                "symbol": symbol,
+                "symbol": resolved_symbol,
                 "ticket": ticket,
                 "new_sl": new_sl,
                 "sl": new_sl,
@@ -619,7 +626,7 @@ class SchedulerService:
                 "command_id": command_id,
                 "action": "CLOSE",
                 "source": "position_manager",
-                "symbol": symbol,
+                "symbol": resolved_symbol,
                 "ticket": ticket,
                 "lots": command.get("lots"),
                 "reason": command.get("reason"),
@@ -631,7 +638,7 @@ class SchedulerService:
                 "command_id": command_id,
                 "action": "CANCEL_PENDING",
                 "source": "position_manager",
-                "symbol": symbol,
+                "symbol": resolved_symbol,
                 "ticket": ticket,
                 "reason": command.get("reason"),
                 "trigger_time": now_iso,
@@ -674,6 +681,7 @@ class SchedulerService:
         atr_value: float,
         current_price: float,
         decision_id: str,
+        command_symbol: str | None = None,
     ) -> dict[str, Any] | None:
         ticket = _number_field(position, "ticket")
         old_sl = _number_field(position, "sl")
@@ -702,7 +710,7 @@ class SchedulerService:
             "command_id": _ai_stop_loss_command_id(account_id, symbol, ticket, trigger_time),
             "action": "MODIFY",
             "source": "ai_stop_loss",
-            "symbol": symbol,
+            "symbol": command_symbol or symbol,
             "ticket": ticket,
             "new_sl": new_sl,
             "sl": new_sl,
@@ -837,6 +845,29 @@ class SchedulerService:
         if store is None:
             return {}
         return (await store.get_registration(account_id)) or {}
+
+    async def _resolve_ea_symbol(self, account_id: str, symbol: str) -> str:
+        """解析账户真实注册/上报的 broker 品种名(如 GOLDm#),避免大写命令触发 EA symbol_mismatch。"""
+        store = self._store
+        target = normalize_symbol(symbol)
+        if store is None or not target:
+            return symbol
+        registration = await store.get_registration(account_id)
+        heartbeat = await store.get_heartbeat(account_id)
+        candidates: list[str] = [
+            *string_array_field(registration, "ai_symbols"),
+            *string_array_field(heartbeat, "ai_symbols"),
+        ]
+        latest_tick = await store.get_latest_tick(account_id, symbol)
+        if latest_tick is not None:
+            tick_symbol = _string_field(latest_tick, "symbol")
+            if tick_symbol:
+                candidates.append(tick_symbol)
+        candidates.extend(await store.list_symbols(account_id))
+        for candidate in candidates:
+            if normalize_symbol(candidate) == target:
+                return candidate.strip()
+        return symbol
 
 
 def create_scheduler_service(options: dict[str, Any]) -> SchedulerService:

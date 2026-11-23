@@ -127,28 +127,96 @@ async def test_symbol_lookup_is_case_insensitive_across_kinds(store: EaStore) ->
 
 
 async def test_variant_snapshots_coexist_read_deterministic(store: EaStore) -> None:
-    """变体并存(Codex 复核项):GOLDM# 与 GOLDm# 各存一份快照时,
-    折叠查询必须确定地取最早写入的一份,不得合并(重复持仓)或随机选行。"""
-    # positions:先 GOLDm#(EA 原样),后 GOLDM#
+    """写侧大小写折叠:先后用 GOLDm# / GOLDM# 写入同一品种时收敛为单一行(后者覆盖前者),
+    不重复持仓也不保留陈旧快照;list_symbols 优先从 tick/positions 载荷还原 EA 原始大小写。"""
+    # positions:先 GOLDm#,后 GOLDM# -> 折叠为单一行,最新写入胜出
     await store.save_positions({"account_id": "acc-1", "symbol": "GOLDm#", "positions": [{"ticket": 1}]})
     await store.save_positions({"account_id": "acc-1", "symbol": "GOLDM#", "positions": [{"ticket": 2}]})
-    assert (await store.get_positions("acc-1", "GOLDM#")) == [{"ticket": 1}]
-    assert (await store.get_positions("acc-1", "goldm#")) == [{"ticket": 1}]
-    # 无 symbol 列出全部(不折叠去重)
+    assert (await store.get_positions("acc-1", "GOLDM#")) == [{"ticket": 2}]
+    assert (await store.get_positions("acc-1", "goldm#")) == [{"ticket": 2}]
     all_pos = await store.get_positions("acc-1")
-    assert sorted(p["ticket"] for p in all_pos) == [1, 2]
+    assert all_pos == [{"ticket": 2}]
 
-    # tick:变体并存取最早
-    await store.save_tick({"account_id": "acc-1", "symbol": "GOLDm#", "bid": 111.0})
-    await store.save_tick({"account_id": "acc-1", "symbol": "GOLDM#", "bid": 222.0})
+    # tick:后写覆盖前写;payload 内保留最后写入的原始 symbol,bars 大写写入不覆盖 tick 原样
+    await store.save_tick({"account_id": "acc-1", "symbol": "GOLDM#", "bid": 111.0})
+    await store.save_tick({"account_id": "acc-1", "symbol": "GOLDm#", "bid": 222.0})
     tick = await store.get_latest_tick("acc-1", "GOLDM#")
-    assert tick is not None and tick["bid"] == 111.0
+    assert tick is not None and tick["bid"] == 222.0
 
-    # list_symbols 只返回一个代表(EA 原样)
+    # bars & claim_bar_close_event 同时折叠 symbol 和 timeframe
+    await store.save_bars(
+        {"account_id": "acc-1", "symbol": "GOLDM#", "timeframe": "h1", "bars": [{"time": "1", "close": 10.0}]}
+    )
+    await store.save_bars(
+        {"account_id": "acc-1", "symbol": "GOLDm#", "timeframe": "H1", "bars": [{"time": "2", "close": 20.0}]}
+    )
+    assert (await store.get_bars("acc-1", " goldm# ", "h1")) == [{"time": "2", "close": 20.0}]
+    assert await store.claim_bar_close_event("acc-1", "GOLDm#", "m15", "2026-08-25T08:00:00Z") is True
+    assert await store.claim_bar_close_event("acc-1", "GOLDM#", "M15", "2026-08-25T08:00:00Z") is False
+
+    # ai_result / position_state / shadow_snapshot 写侧折叠收敛
+    await store.save_ai_result("acc-1", "GOLDm#", {"bias": "bearish"})
+    await store.save_ai_result("acc-1", "GOLDM#", {"bias": "bullish"})
+    ai_results = await store.get_ai_results("acc-1")
+    assert len(ai_results) == 1
+    assert ai_results[0]["bias"] == "bullish"
+
+    await store.save_position_state("acc-1", "GOLDm#", {"ticket": 9, "tp1_hit": False})
+    await store.save_position_state("acc-1", "GOLDM#", {"ticket": 9, "tp1_hit": True})
+    states = await store.load_position_states("acc-1", "goldm#")
+    assert len(states) == 1
+    assert states[0]["tp1_hit"] is True
+    await store.delete_stale_position_states("acc-1", "GOLDm#", [])
+    assert await store.load_position_states("acc-1", "GOLDM#") == []
+
+    await store.save_shadow_snapshot(
+        {"account_id": "acc-1", "symbol": "GOLDm#", "source": "ea_analysis", "signal": {"side": "buy"}}
+    )
+    await store.save_shadow_snapshot(
+        {"account_id": "acc-1", "symbol": "GOLDM#", "source": "ea_analysis", "signal": {"side": "sell"}}
+    )
+    shadow = await store.get_latest_shadow_snapshot("acc-1", "goldm#", "ea_analysis")
+    assert shadow is not None and shadow["signal"] == {"side": "sell"}
+
+    # list_symbols 只返回一个代表,并优先从 tick/positions 还原 EA 原始大小写 GOLDm#
+    await store.save_positions({"account_id": "acc-1", "symbol": "GOLDm#", "positions": [{"ticket": 2}]})
     symbols = await store.list_symbols("acc-1")
     gold_variants = [s for s in symbols if s.upper() == "GOLDM#"]
-    assert len(gold_variants) == 1
-    assert gold_variants[0] == "GOLDm#"
+    assert gold_variants == ["GOLDm#"]
+
+
+async def test_case_insensitive_shadow_comparisons_and_pending_signals(store: EaStore) -> None:
+    await store.record_shadow_comparison(
+        {
+            "account_id": "acc-1",
+            "symbol": "GOLDM#",
+            "protocol_ok": True,
+            "signal_drift": False,
+            "command_drift": False,
+            "oracle_compared": True,
+            "source": "ea_analysis",
+            "created_at": "2026-08-22T00:00:00Z",
+        }
+    )
+    matched = await store.list_shadow_comparisons({"symbol": " goldm# "})
+    assert len(matched) == 1
+    assert matched[0]["symbol"] == "GOLDM#"
+
+    await store.save_pending_signal(
+        {
+            "account_id": "acc-1",
+            "symbol": "GOLDm#",
+            "side": "buy",
+            "score": 85,
+            "strategy": "pullback",
+            "expires_at": "2099-01-01T00:00:00Z",
+        }
+    )
+    pending = await store.get_pending_signals("acc-1", " goldm# ")
+    assert len(pending) == 1
+    assert pending[0]["symbol"] == "GOLDm#"
+    by_id = await store.get_pending_signal_by_id("acc-1", "GOLDM#", int(pending[0]["id"]))
+    assert by_id is not None and by_id["symbol"] == "GOLDm#"
 
 
 async def test_claims_each_bar_close_event_once(store: EaStore) -> None:
