@@ -1730,3 +1730,88 @@ async def test_scheduler_resolves_broker_symbol_casing_for_ea_commands() -> None
     commands = await store.list_commands(ACCOUNT)
     assert len(commands) == 2
     assert {c["action"]: c["symbol"] for c in commands} == {"SIGNAL": "GOLDm#", "MODIFY": "GOLDm#"}
+
+
+async def test_patrol_cycle_skips_inactive_accounts_and_only_patrols_active_accounts() -> None:
+    store = create_in_memory_store()
+    now_iso = "2026-11-23T10:40:00Z"
+
+    # Active account with fresh heartbeat (30s ago) and mixed-case symbol duplicates
+    await store.save_registration({"account_id": "81124211", "ai_symbols": ["GOLDm#"]})
+    await store.save_heartbeat(
+        {
+            "account_id": "81124211",
+            "connected": True,
+            "market_open": True,
+            "is_trade_allowed": True,
+            "last_heartbeat_at": "2026-11-23T10:39:30Z",
+            "ai_symbols": ["GOLDM#", "SILVERm#"],
+        }
+    )
+    await store.save_bars(
+        {
+            "account_id": "81124211",
+            "symbol": "GOLDM#",
+            "timeframe": "M15",
+            "bars": [{"time": "2026-11-23T10:30:00Z", "open": 4100, "high": 4101, "low": 4099, "close": 4100}],
+        }
+    )
+
+    # Inactive account with stale heartbeat (10 days old)
+    await store.save_registration({"account_id": "90011087", "ai_symbols": ["XAUUSD", "XAGUSD"]})
+    await store.save_heartbeat(
+        {
+            "account_id": "90011087",
+            "connected": True,
+            "market_open": True,
+            "is_trade_allowed": True,
+            "last_heartbeat_at": "2026-11-13T03:38:20Z",
+            "ai_symbols": ["XAUUSD", "XAGUSD"],
+        }
+    )
+
+    # Account with heartbeat lacking any timestamp (not eligible for scheduled SOP patrol)
+    await store.save_heartbeat({"account_id": "no-ts", "market_open": True, "is_trade_allowed": True})
+    await store.save_bars(
+        {
+            "account_id": "no-ts",
+            "symbol": "XAUUSD",
+            "timeframe": "M15",
+            "bars": [{"time": "2026-11-23T10:30:00Z", "open": 4100, "high": 4101, "low": 4099, "close": 4100}],
+        }
+    )
+
+    # Heartbeat-less account (spread-test)
+    await store.save_tick({"account_id": "spread-test", "symbol": "XAUUSD", "bid": 4100.0, "ask": 4100.2})
+
+    class SpyPatrol:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, str, str]] = []
+
+        async def run_patrol(self, acc: str, sym: str, *, trigger_type: str = "patrol") -> dict[str, Any]:
+            self.calls.append((acc, sym, trigger_type))
+            return {"status": "ok"}
+
+    spy_patrol = SpyPatrol()
+    analysis = FakeAnalysis()
+    scheduler = SchedulerService(
+        analysis,
+        CommandLifecycleService(store),
+        None,
+        store,
+        lambda: now_iso,
+        patrol=spy_patrol,
+        active_account_ttl_seconds=900,
+    )
+
+    await scheduler._patrol_cycle()
+
+    assert spy_patrol.calls == [
+        ("81124211", "GOLDm#", "patrol"),
+        ("81124211", "SILVERm#", "patrol"),
+    ]
+
+    # Live bar/position review paths also skip stale-heartbeat inactive account 90011087
+    await scheduler.enqueue_analysis("90011087", "XAUUSD", "H1")
+    await scheduler.enqueue_position_review("90011087", "XAUUSD")
+    assert analysis.calls == 0

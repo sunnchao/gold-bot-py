@@ -9,6 +9,7 @@ from datetime import UTC, datetime
 from math import isfinite
 from typing import Any, Literal
 
+from backend.persistence.helpers import DEFAULT_ACTIVE_ACCOUNT_TTL_SECONDS, is_heartbeat_active
 from backend.persistence.store import EaStore
 from backend.services.sop.alerts import AlertRouter
 from backend.services.sop.ledger import (
@@ -102,6 +103,7 @@ class PatrolService:
         htf_review_minutes: int = 60,
         move_trigger_pct: float = 0.5,
         m15_always_run_entry: bool = False,
+        active_account_ttl_seconds: int = DEFAULT_ACTIVE_ACCOUNT_TTL_SECONDS,
         queue_pending_fn: Callable[..., Awaitable[Any]] | None = None,
         snapshot_fn: Callable[[str, str], Awaitable[dict[str, Any]]] | None = None,
         now_fn: Callable[[], datetime] = _default_now,
@@ -115,6 +117,7 @@ class PatrolService:
         self.htf_review_minutes = max(5, int(htf_review_minutes))
         self.move_trigger_pct = max(0.05, float(move_trigger_pct))
         self.m15_always_run_entry = bool(m15_always_run_entry)
+        self.active_account_ttl_seconds = max(60, int(active_account_ttl_seconds))
         self._queue_pending_fn = queue_pending_fn
         self._snapshot_fn = snapshot_fn
         self._now_fn = now_fn
@@ -255,6 +258,27 @@ class PatrolService:
         now_dt = self._now_fn()
         if now_dt.tzinfo is None:
             now_dt = now_dt.replace(tzinfo=UTC)
+
+        if snapshot is None and self._snapshot_fn is None and trigger_type not in {"manual_htf", "manual_m15"}:
+            heartbeat = await self._store.get_heartbeat(account_id)
+            if not is_heartbeat_active(
+                heartbeat,
+                now=now_dt,
+                ttl_seconds=self.active_account_ttl_seconds,
+                require_timestamp=False,
+            ):
+                return {
+                    "status": "skipped",
+                    "reason": "inactive_account",
+                    "htf_ran": False,
+                    "m15_ran": False,
+                    "alert_level": "silent",
+                    "action_taken": "skipped_inactive_account",
+                    "cancelled_pending": False,
+                    "trigger_reasons": [],
+                    "ledger": None,
+                    "log": None,
+                }
 
         try:
             snap = snapshot if snapshot is not None else (

@@ -677,3 +677,90 @@ def prepare_bar_rows(bars: list[EaRecord]) -> list[tuple[str, int, EaRecord]]:
             del deduped[bar_time]
         deduped[bar_time] = (bar_time, bar_time_ms, cloned)
     return list(deduped.values())
+
+
+# ---------------------------------------------------------------- 活跃账户心跳判定
+
+
+DEFAULT_ACTIVE_ACCOUNT_TTL_SECONDS = 900
+_MT4_HEARTBEAT_WALL_CLOCK_RE = re.compile(
+    r"^(\d{4})\.(\d{2})\.(\d{2})(?:[ T](\d{1,2}):(\d{2})(?::(\d{2}))?)?$"
+)
+
+
+def _parse_iso_or_mt4_ms(value: Any, *, allow_mt4_wall_clock: bool = False) -> float | None:
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if not text:
+        return None
+    try:
+        dt = datetime.fromisoformat(text[:-1] + "+00:00" if text.endswith("Z") else text)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=UTC)
+        ms = dt.timestamp() * 1000.0
+        if math.isfinite(ms):
+            return ms
+    except ValueError:
+        pass
+    if allow_mt4_wall_clock:
+        match = _MT4_HEARTBEAT_WALL_CLOCK_RE.match(text)
+        if match is not None:
+            try:
+                dt = datetime(
+                    int(match.group(1)),
+                    int(match.group(2)),
+                    int(match.group(3)),
+                    int(match.group(4) or 0),
+                    int(match.group(5) or 0),
+                    int(match.group(6) or 0),
+                    tzinfo=UTC,
+                )
+                ms = dt.timestamp() * 1000.0
+                if math.isfinite(ms):
+                    return ms
+            except ValueError:
+                return None
+    return None
+
+
+def heartbeat_freshness_ms(heartbeat: EaRecord | None) -> float | None:
+    """提取心跳载荷中最近一次上报的 UTC 毫秒时间戳。"""
+    if not isinstance(heartbeat, dict) or len(heartbeat) == 0:
+        return None
+    for field in ("last_heartbeat_at", "updated_at", "received_at"):
+        ms = _parse_iso_or_mt4_ms(heartbeat.get(field), allow_mt4_wall_clock=False)
+        if ms is not None:
+            return ms
+    for field in ("server_time", "mt4_server_time"):
+        ms = _parse_iso_or_mt4_ms(heartbeat.get(field), allow_mt4_wall_clock=True)
+        if ms is not None:
+            return ms
+    return None
+
+
+def is_heartbeat_active(
+    heartbeat: EaRecord | None,
+    *,
+    now: datetime | str | None = None,
+    ttl_seconds: int = DEFAULT_ACTIVE_ACCOUNT_TTL_SECONDS,
+    require_timestamp: bool = True,
+) -> bool:
+    """判断账户心跳是否处于活跃在线窗口内。"""
+    if not isinstance(heartbeat, dict) or len(heartbeat) == 0:
+        return False
+    if heartbeat.get("connected") is False:
+        return False
+    hb_ms = heartbeat_freshness_ms(heartbeat)
+    if hb_ms is None:
+        return not require_timestamp
+    if now is None:
+        now_ms = datetime.now(UTC).timestamp() * 1000.0
+    elif isinstance(now, datetime):
+        now_dt = now if now.tzinfo is not None else now.replace(tzinfo=UTC)
+        now_ms = now_dt.timestamp() * 1000.0
+    else:
+        parsed_now = _parse_iso_or_mt4_ms(now, allow_mt4_wall_clock=False)
+        now_ms = parsed_now if parsed_now is not None else datetime.now(UTC).timestamp() * 1000.0
+    ttl_ms = max(60, int(ttl_seconds)) * 1000.0
+    return (now_ms - hb_ms) <= ttl_ms

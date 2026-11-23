@@ -56,6 +56,7 @@ if runtime_env.GB_SOP_PATROL_ENABLED:
         htf_review_minutes=runtime_env.GB_SOP_HTF_REVIEW_MINUTES,
         move_trigger_pct=runtime_env.GB_SOP_MOVE_TRIGGER_PCT,
         m15_always_run_entry=runtime_env.GB_SOP_M15_ALWAYS_RUN_ENTRY,
+        active_account_ttl_seconds=runtime_env.GB_SOP_ACTIVE_ACCOUNT_TTL_SECONDS,
     )
 
 
@@ -75,6 +76,7 @@ app_options: dict[str, object] = {
     "sop_patrol_enabled": runtime_env.GB_SOP_PATROL_ENABLED,
     "sop_execution_mode": runtime_env.GB_SOP_EXECUTION_MODE,
     "sop_patrol_interval_seconds": runtime_env.GB_SOP_PATROL_INTERVAL_SECONDS,
+    "sop_active_account_ttl_seconds": runtime_env.GB_SOP_ACTIVE_ACCOUNT_TTL_SECONDS,
     "feishu": feishu_notifier,
 }
 if agent_token:

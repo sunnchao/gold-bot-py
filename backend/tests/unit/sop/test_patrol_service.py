@@ -249,3 +249,112 @@ async def test_concurrent_patrol_cycles_serialize_cleanly_under_symbol_lock() ->
     ledger = await store.get_watch_ledger("acc-1", "XAUUSD")
     assert ledger is not None
     assert ledger["version"] >= 2
+
+
+async def test_patrol_service_skips_inactive_or_missing_heartbeat_account() -> None:
+    store = InMemoryEaStore()
+    feishu = FakeFeishu()
+    clock = [datetime(2026, 11, 23, 10, 40, tzinfo=UTC)]
+
+    calls: list[tuple[str, str, str | None]] = []
+
+    async def wf_handler(acc: str, sym: str, state: dict[str, Any]) -> dict[str, Any]:
+        calls.append((acc, sym, state.get("analysisRole")))
+        return {
+            "ai_result": {
+                "bias": "bearish",
+                "confidence": 80,
+                "trade_action": "HOLD",
+                "suggested_sl": 3650.0,
+            }
+        }
+
+    patrol = PatrolService(
+        store=store,
+        workflow_service=StubWorkflow(wf_handler),
+        alert_router=AlertRouter(feishu=feishu, now_fn=lambda: clock[0]),
+        active_account_ttl_seconds=900,
+        now_fn=lambda: clock[0],
+    )
+
+    # 1) Stale heartbeat account (90011087, 10 days old)
+    await store.save_heartbeat(
+        {
+            "account_id": "90011087",
+            "connected": True,
+            "market_open": True,
+            "is_trade_allowed": True,
+            "last_heartbeat_at": "2026-11-13T03:38:20Z",
+        }
+    )
+    await store.save_tick({"account_id": "90011087", "symbol": "XAUUSD", "bid": 4100.0, "ask": 4100.5})
+    await store.save_bars(
+        {
+            "account_id": "90011087",
+            "symbol": "XAUUSD",
+            "timeframe": "M15",
+            "bars": [{"time": "2026-11-23T10:30:00Z", "open": 4100, "high": 4101, "low": 4099, "close": 4100}],
+        }
+    )
+
+    # 2) Missing heartbeat (spread-test) and disconnected heartbeat
+    await store.save_tick({"account_id": "spread-test", "symbol": "XAUUSD", "bid": 4100.0, "ask": 4100.5})
+    await store.save_heartbeat(
+        {
+            "account_id": "disconnected-acc",
+            "connected": False,
+            "market_open": True,
+            "is_trade_allowed": True,
+            "last_heartbeat_at": clock[0].isoformat().replace("+00:00", "Z"),
+        }
+    )
+
+    # 3) Active account (81124211, 30 seconds old)
+    await store.save_heartbeat(
+        {
+            "account_id": "81124211",
+            "connected": True,
+            "market_open": True,
+            "is_trade_allowed": True,
+            "last_heartbeat_at": (clock[0] - timedelta(seconds=30)).isoformat().replace("+00:00", "Z"),
+        }
+    )
+    await store.save_tick({"account_id": "81124211", "symbol": "GOLDm#", "bid": 4100.0, "ask": 4100.2})
+    await store.save_bars(
+        {
+            "account_id": "81124211",
+            "symbol": "GOLDM#",
+            "timeframe": "M15",
+            "bars": [{"time": "2026-11-23T10:30:00Z", "open": 4100, "high": 4101, "low": 4099, "close": 4100}],
+        }
+    )
+
+    for ttype in ("patrol", "m15_close"):
+        res_stale = await patrol.run_patrol("90011087", "XAUUSD", trigger_type=ttype)
+        assert res_stale["status"] == "skipped"
+        assert res_stale["reason"] == "inactive_account"
+        assert res_stale["htf_ran"] is False
+        assert res_stale["m15_ran"] is False
+
+    res_missing = await patrol.run_patrol("spread-test", "XAUUSD", trigger_type="patrol")
+    assert res_missing["status"] == "skipped"
+    res_disconn = await patrol.run_patrol("disconnected-acc", "XAUUSD", trigger_type="patrol")
+    assert res_disconn["status"] == "skipped"
+
+    assert await store.get_watch_ledger("90011087", "XAUUSD") is None
+    assert await store.list_patrol_logs("90011087") == []
+    assert await store.list_patrol_logs("spread-test") == []
+    assert len(calls) == 0
+    assert len(feishu.messages) == 0
+
+    # Active account patrols and runs HTF anchor normally
+    res_active = await patrol.run_patrol("81124211", "GOLDm#", trigger_type="patrol")
+    assert res_active["status"] == "ok"
+    assert res_active["htf_ran"] is True
+    assert calls == [("81124211", "GOLDM#", "htf_anchor")]
+    assert await store.get_watch_ledger("81124211", "GOLDM#") is not None
+
+    # Explicit manual trigger still allowed on stale-heartbeat account
+    res_manual = await patrol.run_patrol("90011087", "XAUUSD", trigger_type="manual_htf")
+    assert res_manual["status"] == "ok"
+    assert res_manual["htf_ran"] is True

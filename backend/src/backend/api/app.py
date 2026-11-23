@@ -179,6 +179,7 @@ def create_api_app(options: dict) -> FastAPI:
             "now_iso": now_iso,
             "patrol": options.get("sop_patrol"),
             "patrol_interval_seconds": options.get("sop_patrol_interval_seconds", 300),
+            "active_account_ttl_seconds": options.get("sop_active_account_ttl_seconds", 900),
         }
     )
 

@@ -22,7 +22,12 @@ from typing import Any, Protocol
 
 from sqlalchemy.exc import IntegrityError
 
-from backend.persistence.helpers import normalize_symbol, string_array_field
+from backend.persistence.helpers import (
+    DEFAULT_ACTIVE_ACCOUNT_TTL_SECONDS,
+    is_heartbeat_active,
+    normalize_symbol,
+    string_array_field,
+)
 from backend.persistence.records import EaRecord, StoredCommand
 from backend.persistence.store import EaStore
 from backend.trading_core.indicators import atr
@@ -112,6 +117,7 @@ class SchedulerService:
         now_iso: Callable[[], str] | None = None,
         patrol: Any = None,
         patrol_interval_seconds: int = 300,
+        active_account_ttl_seconds: int = DEFAULT_ACTIVE_ACCOUNT_TTL_SECONDS,
     ) -> None:
         self._analysis = analysis
         self._command_lifecycle = command_lifecycle
@@ -120,6 +126,7 @@ class SchedulerService:
         self._now_iso = now_iso if now_iso is not None else _default_now_iso
         self._patrol = patrol
         self._patrol_interval_seconds = max(15, int(patrol_interval_seconds))
+        self._active_account_ttl_seconds = max(60, int(active_account_ttl_seconds))
         self._ai_stop_loss_queued_at_ms: dict[str, float] = {}
         self._started = False
         self._apscheduler: Any = None
@@ -209,20 +216,23 @@ class SchedulerService:
     async def _patrol_cycle(self) -> None:
         if self._patrol is None or self._store is None:
             return
+        now_iso = self._now_iso()
         for account_id in await self._store.list_account_ids():
-            if not await self._can_run_live_analysis(account_id):
+            hb = await self._get_heartbeat(account_id)
+            if not self._is_patrol_eligible_account(hb, now_iso):
                 continue
             reg = await self._get_registration(account_id)
-            hb = await self._get_heartbeat(account_id)
-            symbols = list(
-                dict.fromkeys(
-                    [
-                        *string_array_field(reg, "ai_symbols"),
-                        *string_array_field(hb, "ai_symbols"),
-                        *(await self._store.list_symbols(account_id)),
-                    ]
-                )
-            )
+            seen_syms: set[str] = set()
+            symbols: list[str] = []
+            for raw_sym in [
+                *string_array_field(reg, "ai_symbols"),
+                *string_array_field(hb, "ai_symbols"),
+                *(await self._store.list_symbols(account_id)),
+            ]:
+                norm = normalize_symbol(raw_sym)
+                if norm and norm not in seen_syms:
+                    seen_syms.add(norm)
+                    symbols.append(raw_sym)
             for symbol in symbols:
                 try:
                     await self._patrol.run_patrol(account_id, symbol, trigger_type="patrol")
@@ -252,6 +262,14 @@ class SchedulerService:
         if store is None or window is None or window.stage != "blackout":
             return
         for account_id in await store.list_account_ids():
+            heartbeat = await self._get_heartbeat(account_id)
+            if not is_heartbeat_active(
+                heartbeat,
+                now=now,
+                ttl_seconds=self._active_account_ttl_seconds,
+                require_timestamp=False,
+            ):
+                continue
             symbols = {
                 symbol.upper(): symbol
                 for symbol in [*await store.list_ai_symbols(account_id), *await store.list_symbols(account_id)]
@@ -281,11 +299,30 @@ class SchedulerService:
                         raise
 
     # ------------------------------------------------------------------ 内部链路
+    def _is_patrol_eligible_account(self, heartbeat: EaRecord, now_iso: str) -> bool:
+        return (
+            _explicit_boolean(heartbeat, "market_open") is True
+            and _explicit_boolean(heartbeat, "is_trade_allowed") is True
+            and is_heartbeat_active(
+                heartbeat,
+                now=now_iso,
+                ttl_seconds=self._active_account_ttl_seconds,
+                require_timestamp=True,
+            )
+        )
+
     async def _can_run_live_analysis(self, account_id: str) -> bool:
         heartbeat = await self._get_heartbeat(account_id)
-        return _explicit_boolean(heartbeat, "market_open") is True and _explicit_boolean(
+        if _explicit_boolean(heartbeat, "market_open") is not True or _explicit_boolean(
             heartbeat, "is_trade_allowed"
-        ) is True
+        ) is not True:
+            return False
+        return is_heartbeat_active(
+            heartbeat,
+            now=self._now_iso(),
+            ttl_seconds=self._active_account_ttl_seconds,
+            require_timestamp=False,
+        )
 
     async def _risk_gate_for_signal(
         self,
@@ -914,6 +951,7 @@ def create_scheduler_service(options: dict[str, Any]) -> SchedulerService:
         now_iso=options.get("now_iso"),
         patrol=options.get("patrol"),
         patrol_interval_seconds=int(options.get("patrol_interval_seconds") or 300),
+        active_account_ttl_seconds=int(options.get("active_account_ttl_seconds") or DEFAULT_ACTIVE_ACCOUNT_TTL_SECONDS),
     )
 
 
