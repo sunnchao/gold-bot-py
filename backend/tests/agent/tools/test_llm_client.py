@@ -230,7 +230,7 @@ async def test_adds_prompt_cache_key_only_for_kimi_moonshot_strategy() -> None:
     assert bodies[0]["parameters"]["prompt_cache_key"] == "gold-analysis"
 
 
-async def test_deepseek_requests_set_reasoning_effort_max_and_disable_thinking() -> None:
+async def test_deepseek_requests_set_reasoning_effort_medium_and_disable_thinking() -> None:
     bodies: list[dict[str, Any]] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -243,7 +243,7 @@ async def test_deepseek_requests_set_reasoning_effort_max_and_disable_thinking()
         [{"text": "user", "cacheable": False}],
     )
 
-    assert bodies[0]["parameters"] == {"reasoning_effort": "max", "thinking": {"type": "disabled"}}
+    assert bodies[0]["parameters"] == {"reasoning_effort": "medium", "thinking": {"type": "disabled"}}
 
 
 async def test_kimi_requests_enable_max_thinking_and_raise_max_tokens() -> None:
@@ -265,7 +265,7 @@ async def test_kimi_requests_enable_max_thinking_and_raise_max_tokens() -> None:
     assert body["maxTokens"] == 32768
     assert body["parameters"] == {
         "prompt_cache_key": "gold-analysis",
-        "reasoning_effort": "max",
+        "reasoning_effort": "medium",
         "thinking": {"type": "enabled"},
     }
 
@@ -538,7 +538,7 @@ async def test_fallback_model_request_does_not_inherit_primary_model_params() ->
 
     assert await client.invoke("test") == "ok"
     assert bodies[0]["model"] == "deepseek-v4-flash-0731"
-    assert bodies[0]["parameters"]["reasoning_effort"] == "max"
+    assert bodies[0]["parameters"]["reasoning_effort"] == "medium"
     assert bodies[1]["model"] == "gpt-4o-mini"
     assert bodies[1]["parameters"] == {}
     assert isinstance(CacheStats(), CacheStats)

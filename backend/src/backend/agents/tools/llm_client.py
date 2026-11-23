@@ -4,8 +4,8 @@
 - 分层请求(system 首条 / user 分层 / tools + tool_choice 映射)语义保留
 - 缓存策略探测保留(deepseek/gpt→auto_prefix;kimi/moonshot→prompt_cache_key;
   glm→auto_prefix_unstable;minimax/abab→none;其余→auto_prefix)
-- 模型专属参数保留(DeepSeek reasoning_effort=max + thinking=disabled;
-  Kimi/Moonshot reasoning_effort=max + thinking=enabled + maxTokens=32768)
+- 模型专属参数保留(DeepSeek reasoning_effort=medium + thinking=disabled;
+  Kimi/Moonshot reasoning_effort=medium + thinking=enabled + maxTokens=32768)
 - fallback 模型兜底:请求抛错时自动改用 fallback 模型重试一次;流式路径下空响应
   (无内容且无 tool_use)同样触发回退,非流式路径仅在异常时回退;fallback 与
   主模型相同(或为空)时不启用。
@@ -58,7 +58,8 @@ DEFAULT_MAX_TOKENS = 16384
 DEFAULT_TEMPERATURE = 0.1
 # Kimi 思考模型:思考 token 计入 completion,正文预算需相应放大。
 KIMI_THINKING_MAX_TOKENS = 32768
-MAX_REASONING_EFFORT = "max"
+# 思考强度:medium 在保留推理能力的同时显著压低思考 token 与耗时。
+REASONING_EFFORT = "medium"
 LAYER_SEPARATOR = "\n\n----------------------------------------\n\n"
 
 ResponseT = TypeVar("ResponseT")
@@ -203,12 +204,12 @@ class LLMClient:
             params["extra_body"] = {"prompt_cache_key": "gold-analysis"}
         if _is_deepseek_model(model):
             extra_body = params.get("extra_body") or {}
-            extra_body["reasoning_effort"] = MAX_REASONING_EFFORT
+            extra_body["reasoning_effort"] = REASONING_EFFORT
             extra_body["thinking"] = {"type": "disabled"}
             params["extra_body"] = extra_body
         if _is_kimi_thinking_model(model):
             extra_body = params.get("extra_body") or {}
-            extra_body["reasoning_effort"] = MAX_REASONING_EFFORT
+            extra_body["reasoning_effort"] = REASONING_EFFORT
             extra_body["thinking"] = {"type": "enabled"}
             params["extra_body"] = extra_body
             params["max_tokens"] = max(int(params["max_tokens"]), KIMI_THINKING_MAX_TOKENS)

@@ -133,10 +133,10 @@ async def test_maps_existing_contract_and_falls_back_only_on_empty_result() -> N
     assert requests[0]["stream"] is True
     assert requests[0]["parameters"] == {
         "prompt_cache_key": "gold-analysis",
-        "reasoning_effort": "max",
+        "reasoning_effort": "medium",
         "thinking": {"type": "enabled"},
     }
-    assert requests[1]["parameters"] == {"reasoning_effort": "max", "thinking": {"type": "disabled"}}
+    assert requests[1]["parameters"] == {"reasoning_effort": "medium", "thinking": {"type": "disabled"}}
     assert requests[0]["maxTokens"] == 32768
     assert requests[0]["maxRetries"] == 3
     assert requests[0]["timeoutMs"] == 1200
@@ -654,11 +654,11 @@ async def test_end_to_end_comprehensive_analyst_streaming_and_nonstreaming_with_
         assert stream_phase1["stream"] is True
         assert stream_phase1["model"] == "kimi-test"
         assert stream_phase1["prompt_cache_key"] == "gold-analysis"
-        assert stream_phase1["reasoning_effort"] == "max"
+        assert stream_phase1["reasoning_effort"] == "medium"
         assert stream_phase1["thinking"] == {"type": "enabled"}
         assert stream_phase1["max_completion_tokens"] == 32768
         assert stream_phase2["model"] == "deepseek-trade-test"
-        assert stream_phase2["reasoning_effort"] == "max"
+        assert stream_phase2["reasoning_effort"] == "medium"
         assert stream_phase2["thinking"] == {"type": "disabled"}
         assert stream_phase2["tool_choice"] == "auto"
         assert failed_stream["stream"] is True

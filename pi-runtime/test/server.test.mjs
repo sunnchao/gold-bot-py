@@ -19,7 +19,7 @@ const requestBody = {
   temperature: 0.1,
   timeoutMs: 3000,
   maxRetries: 0,
-  parameters: { prompt_cache_key: 'gold-analysis', reasoning_effort: 'max', thinking: { type: 'enabled' } },
+  parameters: { prompt_cache_key: 'gold-analysis', reasoning_effort: 'medium', thinking: { type: 'enabled' } },
 };
 
 function event(delta, finishReason = null) {
@@ -112,7 +112,7 @@ test('preserves the wire contract, streams thinking, and picks the lowest valid 
   assert.deepEqual(requests, [{
     model: primary, messages: requestBody.messages, tools: requestBody.tools, tool_choice: requestBody.toolChoice,
     prompt_cache_key: 'gold-analysis', stream: true, stream_options: { include_usage: true },
-    max_completion_tokens: 32768, temperature: 0.1, reasoning_effort: 'max', thinking: { type: 'enabled' },
+    max_completion_tokens: 32768, temperature: 0.1, reasoning_effort: 'medium', thinking: { type: 'enabled' },
   }]);
 });
 
@@ -193,7 +193,7 @@ test('retries a rate limit only as configured and never switches models', async 
   assert.equal(failed.status, 502);
   assert.doesNotMatch(await failed.text(), /gateway-private-error/);
   const success = await complete({ ...requestBody, model: secondary, toolChoice: 'required', maxRetries: 1,
-    parameters: { reasoning_effort: 'max', thinking: { type: 'disabled' } } });
+    parameters: { reasoning_effort: 'medium', thinking: { type: 'disabled' } } });
   assert.equal(success.status, 200);
   assert.deepEqual(models, [primary, secondary, secondary]);
 });

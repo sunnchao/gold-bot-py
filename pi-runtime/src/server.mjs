@@ -24,7 +24,7 @@ function inRange(value, min, max) {
 function validParameters(parameters) {
   return isRecord(parameters) && Object.entries(parameters).every(([key, value]) => {
     if (key === 'prompt_cache_key') return value === 'gold-analysis';
-    if (key === 'reasoning_effort') return value === 'max';
+    if (key === 'reasoning_effort') return ['minimal', 'low', 'medium', 'high', 'max'].includes(value);
     if (key === 'thinking') {
       return isRecord(value) && Object.keys(value).length === 1 && ['enabled', 'disabled'].includes(value.type);
     }
