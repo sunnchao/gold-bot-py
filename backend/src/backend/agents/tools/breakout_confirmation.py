@@ -101,7 +101,7 @@ def build_breakout_levels(
                 anchors.setdefault(("support", pivots["s1"]), False)
         for sweep in (smc_context or {}).get(f"{timeframe.lower()}_sweeps", []):
             if series and sweep["reversed"] and sweep["index"] >= len(series) - 2:
-                side = "resistance" if sweep["side"] == "BEAR" else "support"
+                side: LevelSide = "resistance" if sweep["side"] == "BEAR" else "support"
                 anchors[(side, sweep["level"])] = True
 
         for (level_side, price), swept in anchors.items():
