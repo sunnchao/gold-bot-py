@@ -263,3 +263,31 @@ def test_htf_hold_with_bearish_bias_preserves_short_direction_compact_veto_and_a
         now=t0 + timedelta(minutes=15),
     )
     assert next_patrol["updated_ledger"]["playbooks"][0]["state"] in ("armed", "watching")
+
+    # 关键位破位经 HTF 复盘后不应被重置为 unbroken(防止同一价位 5 分钟死循环触发)
+    broken_ledger = evaluate_ledger_patrol(
+        reconciled,
+        current_price=3590.0,
+        bars_by_tf={"M15": [{"close": 3590.0}], "H1": [{"close": 3590.0}]},
+        now=t0 + timedelta(minutes=20),
+    )["updated_ledger"]
+    after_rebuild = reconcile_ledger_after_review(
+        broken_ledger,
+        account_id="81124211",
+        symbol="GOLDM#",
+        role="htf_anchor",
+        review_result={**analyst_result, "bias": "bearish", "sop_context": sop_ctx},
+        confluence_levels=payload["confluence_levels"],
+        current_price=3590.0,
+        now=t0 + timedelta(minutes=21),
+    )
+    kl_3596 = next(lv for lv in after_rebuild["key_levels"] if lv["price"] == 3596.08)
+    assert kl_3596["break_state"] == "broken_down"
+    repeat_patrol = evaluate_ledger_patrol(
+        after_rebuild,
+        current_price=3590.0,
+        bars_by_tf={"M15": [{"close": 3590.0}], "H1": [{"close": 3590.0}]},
+        now=t0 + timedelta(minutes=26),
+    )
+    assert "key_level_breakdown" not in repeat_patrol["trigger_reasons"]
+    assert repeat_patrol["should_trigger_htf"] is False

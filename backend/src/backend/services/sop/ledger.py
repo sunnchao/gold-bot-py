@@ -573,21 +573,50 @@ def reconcile_ledger_after_review(
     tp_list = _extract_targets(review_result, "take_profits", suggested_tp)
 
     if role == "htf_anchor":
-        # 先更新多源共振关键位, 以便后续回退推导目标位与否决边界
+        # 先更新多源共振关键位, 并继承相同价位既有的破位状态以避免每 5 分钟冷巡检重复触发
         if isinstance(confluence_levels, list) and confluence_levels:
-            working["key_levels"] = [
-                {
-                    "id": f"kl-{idx + 1}",
-                    "price": float(item["price"]),
-                    "role": str(item.get("role") or "pivot"),
-                    "tier": str(item.get("tier") or "secondary"),
-                    "sources": list(item.get("sources") or []),
-                    "break_state": "unbroken",
-                    "broken_at": None,
-                }
-                for idx, item in enumerate(confluence_levels[:10])
-                if isinstance(item, dict) and _to_float(item.get("price")) is not None
-            ]
+            prev_levels = [k for k in working["key_levels"] if isinstance(k, dict)]
+            refreshed_levels: list[dict[str, Any]] = []
+            for idx, item in enumerate(confluence_levels[:10]):
+                if not isinstance(item, dict):
+                    continue
+                price_num = _to_float(item.get("price"))
+                if price_num is None:
+                    continue
+                lvl_role = str(item.get("role") or "pivot")
+                tol = max(price_num * 0.0005, 1e-6)
+                matched = next(
+                    (
+                        old
+                        for old in prev_levels
+                        if (old_p := _to_float(old.get("price"))) is not None and abs(old_p - price_num) <= tol
+                    ),
+                    None,
+                )
+                if matched is not None:
+                    break_state = str(matched.get("break_state") or "unbroken")
+                    broken_at = matched.get("broken_at")
+                else:
+                    break_state = "unbroken"
+                    broken_at = None
+                    if current_price is not None and current_price > 0:
+                        init_tol = max(price_num * 0.0003, 1e-6)
+                        if lvl_role == "support" and current_price < price_num - init_tol:
+                            break_state = "broken_down"
+                        elif lvl_role == "resistance" and current_price > price_num + init_tol:
+                            break_state = "broken_up"
+                refreshed_levels.append(
+                    {
+                        "id": f"kl-{idx + 1}",
+                        "price": price_num,
+                        "role": lvl_role,
+                        "tier": str(item.get("tier") or "secondary"),
+                        "sources": list(item.get("sources") or []),
+                        "break_state": break_state,
+                        "broken_at": broken_at,
+                    }
+                )
+            working["key_levels"] = refreshed_levels
 
         anchor = dict(working["htf_anchor"])
         macro_bias = str(
