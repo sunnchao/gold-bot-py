@@ -358,3 +358,113 @@ async def test_patrol_service_skips_inactive_or_missing_heartbeat_account() -> N
     res_manual = await patrol.run_patrol("90011087", "XAUUSD", trigger_type="manual_htf")
     assert res_manual["status"] == "ok"
     assert res_manual["htf_ran"] is True
+
+
+async def test_routine_htf_m15_wait_and_patrol_cycle_all_deliver_feishu_cards() -> None:
+    store = InMemoryEaStore()
+    feishu = FakeFeishu()
+    clock = [datetime(2026, 11, 23, 12, 0, tzinfo=UTC)]
+
+    async def wf_handler(_acc: str, _sym: str, state: dict[str, Any]) -> dict[str, Any]:
+        role = state.get("analysisRole")
+        if role == "htf_anchor":
+            return {
+                "ai_result": {
+                    "bias": "bearish",
+                    "confidence": 80,
+                    "suggested_sl": 3655.0,
+                    "suggested_tp": 3590.0,
+                    "trade_plan": {"entry_price": 3625.0, "stop_loss": 3655.0, "take_profits": [3590.0]},
+                    "arbitration": {"reasoning": "HTF 空头结构保持"},
+                    "sop_context": {
+                        "macro_bias": "bearish",
+                        "intraday_direction": "short",
+                        "short_term_targets": [3590.0],
+                        "long_term_targets": [3400.0, -50.0],
+                        "veto_boundary": {"short_invalid_above": 3655.0, "reason": "HTF 计划止损边界 3655"},
+                        "playbooks": [
+                            {
+                                "id": "pb-short-1",
+                                "role": "primary",
+                                "direction": "short",
+                                "state": "armed",
+                                "trigger_zone": {"low": 3600.0, "high": 3610.0},
+                                "entry_price": 3605.0,
+                                "stop_loss": 3655.0,
+                                "targets": [3590.0],
+                                "invalid_if": {"price_above": 3655.0},
+                            }
+                        ],
+                    },
+                }
+            }
+        return {
+            "ai_result": {
+                "bias": "bullish",
+                "confidence": 60,
+                "trade_action": "HOLD",
+                "sop_context": {"sop_blocks": ["sop.m15_counter_htf_blocked"]},
+            }
+        }
+
+    patrol = PatrolService(
+        store=store,
+        workflow_service=StubWorkflow(wf_handler),
+        alert_router=AlertRouter(feishu=feishu, now_fn=lambda: clock[0]),
+        htf_review_minutes=60,
+        patrol_interval_seconds=300,
+        notify_on_noop=True,
+        patrol_report_cooldown_seconds=0,
+        now_fn=lambda: clock[0],
+    )
+
+    snap = {
+        "price": 3625.0,
+        "bars_by_tf": {"M15": [{"close": 3625.0}], "H1": [{"close": 3625.0}]},
+        "market_open": True,
+        "data_stale": False,
+    }
+    # 1) 首次 HTF 锚定 -> 发卡片 (且负值长期目标被过滤)
+    r1 = await patrol.run_patrol("81124211", "GOLDM#", trigger_type="patrol", snapshot=snap)
+    assert r1["htf_ran"] is True
+    assert len(feishu.messages) == 1
+    assert feishu.messages[0]["card"]["header"]["template"] == "red"
+    ledger1 = await store.get_watch_ledger("81124211", "GOLDM#")
+    assert ledger1 is not None
+    assert ledger1["htf_anchor"]["long_term_targets"] == [3400.0]
+
+    # 2) 65 分钟后 HTF 定时例行复盘结论无实质变动 (changed=False) -> 依然发送 HTF 例行复盘卡片!
+    clock[0] += timedelta(minutes=65)
+    r2 = await patrol.run_patrol("81124211", "GOLDM#", trigger_type="patrol", snapshot=snap)
+    assert r2["htf_ran"] is True
+    assert len(feishu.messages) == 2
+    assert "例行复盘" in feishu.messages[1]["title"]
+
+    # 3) M15 切入复盘给出 HOLD / 逆势拦截 (m15_wait) -> 发送 M15 复盘卡片!
+    clock[0] += timedelta(minutes=5)
+    r3 = await patrol.run_patrol("81124211", "GOLDM#", trigger_type="manual_m15", snapshot=snap)
+    assert r3["m15_ran"] is True
+    assert r3["action_taken"] == "m15_wait"
+    assert len(feishu.messages) == 3
+    assert "逆势拦截" in feishu.messages[2]["title"]
+
+    # 4) 自动冷巡检结束调用 notify_patrol_cycle -> 发送巡检简报卡片!
+    clock[0] += timedelta(minutes=5)
+    r_noop = await patrol.run_patrol("81124211", "GOLDM#", trigger_type="patrol", snapshot=snap)
+    assert r_noop["action_taken"] == "no_op"
+    rep = await patrol.notify_patrol_cycle("81124211", [r_noop])
+    assert rep is not None and rep["sent"] is True
+    assert len(feishu.messages) == 4
+    assert "自动巡检简报" in feishu.messages[3]["title"]
+
+    # 5) 配置 notify_on_noop=False 且全为 no_op -> 不重复发送巡检简报
+    patrol_quiet = PatrolService(
+        store=store,
+        workflow_service=StubWorkflow(wf_handler),
+        alert_router=AlertRouter(feishu=feishu, now_fn=lambda: clock[0]),
+        notify_on_noop=False,
+        now_fn=lambda: clock[0],
+    )
+    rep_quiet = await patrol_quiet.notify_patrol_cycle("81124211", [r_noop])
+    assert rep_quiet is not None and rep_quiet["sent"] is False
+    assert len(feishu.messages) == 4

@@ -1787,10 +1787,21 @@ async def test_patrol_cycle_skips_inactive_accounts_and_only_patrols_active_acco
     class SpyPatrol:
         def __init__(self) -> None:
             self.calls: list[tuple[str, str, str]] = []
+            self.notify_calls: list[tuple[str, list[dict[str, Any]]]] = []
 
         async def run_patrol(self, acc: str, sym: str, *, trigger_type: str = "patrol") -> dict[str, Any]:
             self.calls.append((acc, sym, trigger_type))
-            return {"status": "ok"}
+            return {
+                "status": "ok",
+                "symbol": sym.strip().upper(),
+                "action_taken": "no_op",
+                "htf_ran": False,
+                "m15_ran": False,
+            }
+
+        async def notify_patrol_cycle(self, acc: str, results: list[dict[str, Any]]) -> dict[str, Any]:
+            self.notify_calls.append((acc, list(results)))
+            return {"sent": True}
 
     spy_patrol = SpyPatrol()
     analysis = FakeAnalysis()
@@ -1810,6 +1821,9 @@ async def test_patrol_cycle_skips_inactive_accounts_and_only_patrols_active_acco
         ("81124211", "GOLDm#", "patrol"),
         ("81124211", "SILVERm#", "patrol"),
     ]
+    assert len(spy_patrol.notify_calls) == 1
+    assert spy_patrol.notify_calls[0][0] == "81124211"
+    assert [r["symbol"] for r in spy_patrol.notify_calls[0][1]] == ["GOLDM#", "SILVERM#"]
 
     # Live bar/position review paths also skip stale-heartbeat inactive account 90011087
     await scheduler.enqueue_analysis("90011087", "XAUUSD", "H1")

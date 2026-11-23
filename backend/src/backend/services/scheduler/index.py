@@ -233,11 +233,30 @@ class SchedulerService:
                 if norm and norm not in seen_syms:
                     seen_syms.add(norm)
                     symbols.append(raw_sym)
+            cycle_results: list[dict[str, Any]] = []
             for symbol in symbols:
                 try:
-                    await self._patrol.run_patrol(account_id, symbol, trigger_type="patrol")
+                    res = await self._patrol.run_patrol(account_id, symbol, trigger_type="patrol")
+                    if isinstance(res, dict):
+                        cycle_results.append(res)
                 except Exception as exc:  # noqa: BLE001
                     print(f"[SOP] patrol cycle error account={account_id} symbol={symbol} err={exc}")
+                    cycle_results.append(
+                        {
+                            "status": "failure",
+                            "symbol": symbol.strip().upper(),
+                            "action_taken": "data_failure_alert",
+                            "alert_level": "urgent",
+                            "summary": str(exc),
+                        }
+                    )
+            if cycle_results:
+                notify_fn = getattr(self._patrol, "notify_patrol_cycle", None)
+                if callable(notify_fn):
+                    try:
+                        await notify_fn(account_id, cycle_results)
+                    except Exception as exc:  # noqa: BLE001
+                        print(f"[SOP] patrol cycle notify error account={account_id} err={exc}")
 
     async def _analysis_cycle(self) -> None:
         store = self._store

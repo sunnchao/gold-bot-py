@@ -11,7 +11,7 @@ from backend.api.app import create_api_app
 from backend.core.config import load_gold_bot_env
 from backend.core.database import create_store_from_env, ensure_store_schema
 from backend.notifications import FeishuNotifier
-from backend.services.sop import AlertRouter, PatrolService
+from backend.services.sop import AlertRouter, PatrolService, SopFeishuSender
 from backend.trading_core.riskgate.economic_calendar import load_economic_calendar
 
 
@@ -43,6 +43,11 @@ feishu_notifier = FeishuNotifier(
     secret=runtime_env.GB_FEISHU_SECRET,
     log=print,
 )
+sop_feishu_sender = SopFeishuSender(
+    webhook_url=runtime_env.GB_FEISHU_WEBHOOK_URL,
+    secret=runtime_env.GB_FEISHU_SECRET,
+    log=print,
+)
 sop_patrol: PatrolService | None = None
 if runtime_env.GB_SOP_PATROL_ENABLED:
     sop_execution_mode: Literal["advisory_only", "integrated"] = (
@@ -51,12 +56,15 @@ if runtime_env.GB_SOP_PATROL_ENABLED:
     sop_patrol = PatrolService(
         store=store,
         workflow_service=agent_workflow,
-        alert_router=AlertRouter(feishu=feishu_notifier),
+        alert_router=AlertRouter(feishu=sop_feishu_sender),
         execution_mode=sop_execution_mode,
         htf_review_minutes=runtime_env.GB_SOP_HTF_REVIEW_MINUTES,
         move_trigger_pct=runtime_env.GB_SOP_MOVE_TRIGGER_PCT,
         m15_always_run_entry=runtime_env.GB_SOP_M15_ALWAYS_RUN_ENTRY,
         active_account_ttl_seconds=runtime_env.GB_SOP_ACTIVE_ACCOUNT_TTL_SECONDS,
+        patrol_interval_seconds=runtime_env.GB_SOP_PATROL_INTERVAL_SECONDS,
+        notify_on_noop=runtime_env.GB_SOP_PATROL_NOTIFY_ON_NOOP,
+        patrol_report_cooldown_seconds=runtime_env.GB_SOP_PATROL_REPORT_COOLDOWN_SECONDS,
     )
 
 

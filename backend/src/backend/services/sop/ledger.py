@@ -653,13 +653,15 @@ def reconcile_ledger_after_review(
             short_targets = sorted(set(tgt_pool), reverse=(intraday_dir == "short"))[:2]
 
         long_targets = [
-            float(x) for x in (sop_ctx.get("long_term_targets") or []) if _to_float(x) is not None
+            float(x)
+            for x in (sop_ctx.get("long_term_targets") or [])
+            if (lt_val := _to_float(x)) is not None and lt_val > 0
         ]
         if not long_targets and isinstance(daily_structure, dict):
             long_targets = [
                 float(t["price"])
                 for t in (daily_structure.get("measured_targets") or [])[:3]
-                if isinstance(t, dict) and _to_float(t.get("price")) is not None
+                if isinstance(t, dict) and (lt_val := _to_float(t.get("price"))) is not None and lt_val > 0
             ]
 
         raw_veto = sop_ctx.get("veto_boundary")

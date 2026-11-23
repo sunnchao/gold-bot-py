@@ -12,6 +12,11 @@ from typing import Any, Literal
 from backend.persistence.helpers import DEFAULT_ACTIVE_ACCOUNT_TTL_SECONDS, is_heartbeat_active
 from backend.persistence.store import EaStore
 from backend.services.sop.alerts import AlertRouter
+from backend.services.sop.cards import (
+    build_htf_review_card,
+    build_m15_review_card,
+    build_patrol_cycle_card,
+)
 from backend.services.sop.ledger import (
     empty_watch_ledger,
     evaluate_ledger_patrol,
@@ -104,6 +109,9 @@ class PatrolService:
         move_trigger_pct: float = 0.5,
         m15_always_run_entry: bool = False,
         active_account_ttl_seconds: int = DEFAULT_ACTIVE_ACCOUNT_TTL_SECONDS,
+        patrol_interval_seconds: int = 300,
+        notify_on_noop: bool = True,
+        patrol_report_cooldown_seconds: int = 0,
         queue_pending_fn: Callable[..., Awaitable[Any]] | None = None,
         snapshot_fn: Callable[[str, str], Awaitable[dict[str, Any]]] | None = None,
         now_fn: Callable[[], datetime] = _default_now,
@@ -118,11 +126,15 @@ class PatrolService:
         self.move_trigger_pct = max(0.05, float(move_trigger_pct))
         self.m15_always_run_entry = bool(m15_always_run_entry)
         self.active_account_ttl_seconds = max(60, int(active_account_ttl_seconds))
+        self.patrol_interval_seconds = max(15, int(patrol_interval_seconds))
+        self.notify_on_noop = bool(notify_on_noop)
+        self.patrol_report_cooldown_seconds = max(0, int(patrol_report_cooldown_seconds))
         self._queue_pending_fn = queue_pending_fn
         self._snapshot_fn = snapshot_fn
         self._now_fn = now_fn
         self._locks: dict[tuple[str, str], asyncio.Lock] = {}
         self._consecutive_failures: dict[tuple[str, str], int] = {}
+        self._last_cycle_report_at: dict[str, datetime] = {}
 
     def _lock_for(self, account_id: str, symbol: str) -> asyncio.Lock:
         key = (account_id, _norm_symbol(symbol))
@@ -223,9 +235,12 @@ class PatrolService:
         )
         return {
             "status": "failure",
+            "symbol": key[1],
+            "current_price": None,
             "consecutive_failures": count,
             "alert_level": log_level,
             "action_taken": action,
+            "summary": reason,
             "reason": reason,
         }
 
@@ -433,24 +448,38 @@ class PatrolService:
             working_ledger = await self._store.save_watch_ledger(account_id, symbol, working_ledger)
             changed, change_reasons = is_material_change(prev_snapshot, working_ledger)
             action_taken = "htf_reviewed"
+            highest_alert = "notify"
+            anchor = working_ledger["htf_anchor"]
             if changed:
-                highest_alert = "notify"
-                anchor = working_ledger["htf_anchor"]
                 summary = (
                     f"{symbol} HTF 锚定更新: 方向={anchor.get('intraday_direction')} "
                     f"短期目标={anchor.get('short_term_targets')} 变动={','.join(change_reasons)}"
                 )
-                await self._alerts.route(
-                    account_id=account_id,
-                    symbol=symbol,
-                    level="notify",
-                    category="htf_anchor_update",
-                    title=f"GOLD-BOT HTF 方向更新 · {symbol}",
-                    content=summary,
-                    dedup_key=f"htf:{anchor.get('intraday_direction')}:{anchor.get('short_term_targets')}",
-                )
             else:
                 summary = f"{symbol} HTF 例行复盘完成(核心结论无实质变更)"
+            htf_title, htf_content, htf_card = build_htf_review_card(
+                account_id=account_id,
+                symbol=symbol,
+                current_price=float(current_price),
+                ledger=working_ledger,
+                ai_result=ai_res,
+                trigger_reasons=patrol_eval["trigger_reasons"],
+                changed=changed,
+                change_reasons=change_reasons,
+                execution_mode=self.execution_mode,
+                now=now_dt,
+            )
+            await self._alerts.route(
+                account_id=account_id,
+                symbol=symbol,
+                level="notify",
+                category="htf_anchor_update" if changed else "htf_routine_review",
+                title=htf_title,
+                content=htf_content,
+                card=htf_card,
+                dedup_key=f"htf:{working_ledger.get('version')}:{working_ledger.get('htf_reviewed_at')}",
+                bypass_cooldown=True,
+            )
 
         # Tier 2: M15 入场时机切入 (严格以 persisted WatchLedger HTF 锚定为前提)
         run_m15 = (
@@ -509,12 +538,27 @@ class PatrolService:
                 )
             )
 
+            side_label = (
+                trade_action
+                if trade_action in {"BUY", "SELL"}
+                else (rec_action if rec_action in {"BUY", "SELL"} else plan_side)
+            )
+            m15_title, m15_content, m15_card = build_m15_review_card(
+                account_id=account_id,
+                symbol=symbol,
+                current_price=float(current_price),
+                ledger=working_ledger,
+                ai_result=ai_res,
+                trigger_reasons=patrol_eval["trigger_reasons"],
+                is_actionable=is_actionable,
+                side_label=side_label,
+                execution_mode=self.execution_mode,
+                now=now_dt,
+            )
+
             if is_actionable:
                 highest_alert = "actionable"
                 action_taken = "m15_entry_signal"
-                side_label = trade_action if trade_action in {"BUY", "SELL"} else (
-                    rec_action if rec_action in {"BUY", "SELL"} else plan_side
-                )
                 entry_val = plan.get("entry_price")
                 raw_ez = plan.get("entry_zone")
                 if entry_val is None and isinstance(raw_ez, dict):
@@ -529,18 +573,31 @@ class PatrolService:
                     symbol=symbol,
                     level="actionable",
                     category="m15_entry_signal",
-                    title=f"GOLD-BOT M15 入场信号 · {symbol}",
-                    content=summary,
-                    dedup_key=f"m15:{side_label}:{entry_val}",
+                    title=m15_title,
+                    content=m15_content,
+                    card=m15_card,
+                    dedup_key=f"m15:{side_label}:{entry_val}:{working_ledger.get('m15_reviewed_at')}",
+                    bypass_cooldown=True,
                 )
                 if self.execution_mode == "integrated" and self._queue_pending_fn is not None:
                     await self._queue_pending_fn(account_id, symbol, ai_res)
             else:
-                changed, _ = is_material_change(prev_snapshot, working_ledger)
+                _changed_m15, _ = is_material_change(prev_snapshot, working_ledger)
                 action_taken = "m15_wait"
-                if changed and highest_alert == "silent":
+                if highest_alert == "silent":
                     highest_alert = "notify"
                 summary = f"{symbol} M15 切入巡检: 保持观察 (未触发下单条件)"
+                await self._alerts.route(
+                    account_id=account_id,
+                    symbol=symbol,
+                    level="notify",
+                    category="m15_entry_review",
+                    title=m15_title,
+                    content=m15_content,
+                    card=m15_card,
+                    dedup_key=f"m15_wait:{working_ledger.get('version')}:{working_ledger.get('m15_reviewed_at')}",
+                    bypass_cooldown=True,
+                )
 
         # 若未触发任何 LLM 调用但也发生了状态迁徙
         if not htf_ran and not m15_ran and patrol_eval["state_transitions"]:
@@ -579,6 +636,9 @@ class PatrolService:
         )
         return {
             "status": "ok",
+            "symbol": symbol,
+            "current_price": float(current_price),
+            "summary": summary,
             "htf_ran": htf_ran,
             "m15_ran": m15_ran,
             "alert_level": highest_alert,
@@ -588,6 +648,56 @@ class PatrolService:
             "ledger": working_ledger,
             "log": log_entry,
         }
+
+    async def notify_patrol_cycle(
+        self,
+        account_id: str,
+        results: Sequence[dict[str, Any]],
+    ) -> dict[str, Any] | None:
+        valid = [r for r in results if isinstance(r, dict) and r.get("status") in {"ok", "failure"}]
+        if not valid:
+            return None
+        all_noop = all(r.get("status") == "ok" and r.get("action_taken") == "no_op" for r in valid)
+        if all_noop and not self.notify_on_noop:
+            return {"sent": False, "reason": "noop_disabled"}
+
+        now_dt = self._now_fn()
+        if now_dt.tzinfo is None:
+            now_dt = now_dt.replace(tzinfo=UTC)
+
+        if self.patrol_report_cooldown_seconds > 0 and all_noop:
+            prev_dt = self._last_cycle_report_at.get(account_id)
+            if prev_dt is not None:
+                elapsed = (now_dt - prev_dt).total_seconds()
+                if elapsed < self.patrol_report_cooldown_seconds:
+                    return {
+                        "sent": False,
+                        "suppressed": True,
+                        "reason": "report_cooldown",
+                        "elapsed_seconds": elapsed,
+                    }
+
+        title, content, card = build_patrol_cycle_card(
+            account_id=account_id,
+            results=valid,
+            interval_seconds=self.patrol_interval_seconds,
+            execution_mode=self.execution_mode,
+            now=now_dt,
+        )
+        res = await self._alerts.route(
+            account_id=account_id,
+            symbol="ALL",
+            level="digest",
+            category="patrol_cycle_report",
+            title=title,
+            content=content,
+            card=card,
+            dedup_key=f"patrol:{account_id}:{now_dt.isoformat()}",
+            bypass_cooldown=True,
+        )
+        if res.get("sent"):
+            self._last_cycle_report_at[account_id] = now_dt
+        return res
 
     async def _enqueue_cancel_pending(self, account_id: str, symbol: str, reasons: list[str]) -> bool:
         from uuid import uuid4
