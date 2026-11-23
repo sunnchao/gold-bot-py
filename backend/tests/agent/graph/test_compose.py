@@ -228,3 +228,32 @@ def test_propagates_risk_assessment_add_on_into_trade_plan() -> None:
     assert plan.add_on is True
     parsed = TradePlanSchema.model_validate(asdict(plan))
     assert parsed.add_on is True
+
+
+def test_event_blackout_vetoes_entries_without_triggering_an_exit_alert() -> None:
+    from backend.agents.types.goldbot import MarketFilter, MarketFilters
+
+    state = _base_state()
+    state["payload"].market_filters = MarketFilters(
+        blocked=True, blocking=[MarketFilter(code="event.blackout_window", severity="blocking")],
+    )
+    signal = compose_final_signal(state)
+
+    assert signal.arbitration["action"] == "hold"
+    assert signal.trade_plan.mode == "veto"
+    assert signal.risk_alert is False
+
+
+def test_final_market_plan_cannot_bypass_an_intrabar_breakout() -> None:
+    state = _base_state()
+    state["payload"] = {
+        **asdict(state["payload"]),
+        "breakout_levels": [
+            {"price": 3335, "side": "resistance", "timeframe": "H1", "state": "intrabar_broken"},
+        ],
+    }
+    signal = compose_final_signal(state)
+
+    assert signal.arbitration["action"] == "hold"
+    assert signal.confidence == 20
+    assert signal.trade_plan is None

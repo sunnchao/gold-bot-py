@@ -13,6 +13,7 @@ from collections.abc import Callable
 from datetime import UTC, datetime
 from typing import Any
 
+from backend.agents.tools.breakout_confirmation import breakout_entry_rejection, build_breakout_levels
 from backend.persistence.records import EaRecord
 from backend.persistence.store import EaStore
 from backend.services.ai_approve.rules import (
@@ -99,15 +100,23 @@ async def evaluate_ai_approve_pending_gate(gate_input: AIApprovePendingGateInput
     if not protection["accepted"]:
         return _reject(str(protection["reason"]))
 
-    trend = _build_ai_approve_trend_context(
-        {
-            "D1": await store.get_bars(account_id, tradable_symbol, "D1"),
-            "H4": await store.get_bars(account_id, tradable_symbol, "H4"),
-            "H1": h1_bars,
-            "M30": await store.get_bars(account_id, tradable_symbol, "M30"),
-            "M15": await store.get_bars(account_id, tradable_symbol, "M15"),
-        }
-    )
+    bars = {
+        "D1": await store.get_bars(account_id, tradable_symbol, "D1"),
+        "H4": await store.get_bars(account_id, tradable_symbol, "H4"),
+        "H1": h1_bars,
+        "M30": await store.get_bars(account_id, tradable_symbol, "M30"),
+        "M15": await store.get_bars(account_id, tradable_symbol, "M15"),
+    }
+    if order_intent["orderType"] == "market":
+        reference_price = _number_field(tick, "bid") or current_price
+        reason = breakout_entry_rejection(
+            build_breakout_levels(bars, reference_price), _string_field(trade_plan, "side"),
+            reference_price, entry, market=True,
+        )
+        if reason:
+            return _reject(reason)
+
+    trend = _build_ai_approve_trend_context(bars)
     signal_direction = "BEAR" if _string_field(trade_plan, "side").strip().lower() == "sell" else "BULL"
     if bool(trend["hasIndicatorContext"]):
         if (

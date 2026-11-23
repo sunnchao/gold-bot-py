@@ -1,0 +1,32 @@
+[
+  {
+    "type": "CORE_PCE",
+    "time_utc": "2026-11-25T13:30:00Z",
+    "symbols": ["XAUUSD", "XAGUSD", "EURUSD", "GBPUSD", "USDJPY", "USDCAD", "AUDUSD", "NZDUSD", "USDCNH", "GBPJPY", "EURJPY", "US100CASH", "USOILCASH", "UKOILCASH"]
+  },
+  {
+    "type": "NFP",
+    "time_utc": "2026-12-04T13:30:00Z",
+    "symbols": ["XAUUSD", "XAGUSD", "EURUSD", "GBPUSD", "USDJPY", "USDCAD", "AUDUSD", "NZDUSD", "USDCNH", "GBPJPY", "EURJPY", "US100CASH", "USOILCASH", "UKOILCASH"]
+  },
+  {
+    "type": "FOMC",
+    "time_utc": "2026-12-09T19:00:00Z",
+    "symbols": ["XAUUSD", "XAGUSD", "EURUSD", "GBPUSD", "USDJPY", "USDCAD", "AUDUSD", "NZDUSD", "USDCNH", "GBPJPY", "EURJPY", "US100CASH", "USOILCASH", "UKOILCASH"]
+  },
+  {
+    "type": "CPI",
+    "time_utc": "2026-12-10T13:30:00Z",
+    "symbols": ["XAUUSD", "XAGUSD", "EURUSD", "GBPUSD", "USDJPY", "USDCAD", "AUDUSD", "NZDUSD", "USDCNH", "GBPJPY", "EURJPY", "US100CASH", "USOILCASH", "UKOILCASH"]
+  },
+  {
+    "type": "CORE_PCE",
+    "time_utc": "2026-12-23T13:30:00Z",
+    "symbols": ["XAUUSD", "XAGUSD", "EURUSD", "GBPUSD", "USDJPY", "USDCAD", "AUDUSD", "NZDUSD", "USDCNH", "GBPJPY", "EURJPY", "US100CASH", "USOILCASH", "UKOILCASH"]
+  },
+  {
+    "type": "FOMC_MINUTES",
+    "time_utc": "2026-12-30T19:00:00Z",
+    "symbols": ["XAUUSD", "XAGUSD", "EURUSD", "GBPUSD", "USDJPY", "USDCAD", "AUDUSD", "NZDUSD", "USDCNH", "GBPJPY", "EURJPY", "US100CASH", "USOILCASH", "UKOILCASH"]
+  }
+]

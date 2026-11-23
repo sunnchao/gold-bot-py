@@ -20,10 +20,14 @@ from collections.abc import Callable
 from datetime import UTC, datetime
 from typing import Any, Protocol
 
+from sqlalchemy.exc import IntegrityError
+
 from backend.persistence.records import EaRecord, StoredCommand
 from backend.persistence.store import EaStore
 from backend.trading_core.indicators import atr
 from backend.trading_core.riskgate import evaluate_market_filters, evaluate_risk_gate
+from backend.trading_core.riskgate.economic_calendar import EVENT_BLACKOUT
+from backend.trading_core.riskgate.riskgate import apply_event_order_limits, market_event_window
 
 __all__ = [
     "SchedulerService",
@@ -146,7 +150,7 @@ class SchedulerService:
             await self._analysis.persist_position_states(account_id, symbol, position_states)
 
     # ------------------------------------------------------------------ 调度生命周期
-    async def start(self) -> None:
+    async def start(self, *, position_review: bool = True) -> None:
         """启动 APScheduler 周期任务 + taskiq 内存 broker(调度入口)。
 
         任务本体就是 enqueue_analysis / enqueue_position_review(与 TS 的 job 语义一致);
@@ -173,7 +177,12 @@ class SchedulerService:
             await self.enqueue_position_review(str(payload["account_id"]), str(payload["symbol"]))
 
         scheduler = AsyncIOScheduler(timezone=UTC)
-        scheduler.add_job(self._position_review_cycle, "interval", minutes=1, id="scheduler:position_review")
+        if position_review:
+            scheduler.add_job(self._position_review_cycle, "interval", minutes=1, id="scheduler:position_review")
+        scheduler.add_job(
+            self._event_cancellation_cycle, "interval", seconds=10,
+            id="scheduler:event_cancellation", next_run_time=datetime.now(UTC),
+        )
         self._apscheduler = scheduler
         scheduler.start()
         self._started = True
@@ -201,6 +210,40 @@ class SchedulerService:
             for symbol in await store.list_symbols(account_id):
                 await self.enqueue_position_review(account_id, symbol)
 
+    async def _event_cancellation_cycle(self) -> None:
+        store = self._store
+        now = self._now_iso()
+        window = market_event_window(None, now)
+        if store is None or window is None or window.stage != "blackout":
+            return
+        for account_id in await store.list_account_ids():
+            symbols = {
+                symbol.upper(): symbol
+                for symbol in [*await store.list_ai_symbols(account_id), *await store.list_symbols(account_id)]
+            }
+            for symbol in symbols.values():
+                window = market_event_window(symbol, now)
+                if window is None or window.stage != "blackout":
+                    continue
+                event_time = int(window.event.time.timestamp())
+                key = hashlib.sha256(f"{account_id}|{symbol.upper()}|{event_time}".encode()).hexdigest()[:24]
+                command_id = f"event_cancel_{key}"
+                if await store.get_command(command_id) is not None:
+                    continue
+                try:
+                    await self._command_lifecycle.accept_candidate(account_id, {
+                        "command_id": command_id,
+                        "action": "CANCEL_PENDING",
+                        "source": "position_manager",
+                        "symbol": symbol,
+                        "ticket": 0,
+                        "reason": EVENT_BLACKOUT,
+                        "expiration": int(window.event.blackout_end.timestamp()),
+                    })
+                except IntegrityError:
+                    if await store.get_command(command_id) is None:
+                        raise
+
     # ------------------------------------------------------------------ 内部链路
     async def _can_run_live_analysis(self, account_id: str) -> bool:
         heartbeat = await self._get_heartbeat(account_id)
@@ -208,14 +251,16 @@ class SchedulerService:
             heartbeat, "is_trade_allowed"
         ) is True
 
-    async def _allowed_lots_for_signal(
+    async def _risk_gate_for_signal(
         self,
         account_id: str,
         symbol: str,
         signal: EaRecord,
         heartbeat: EaRecord,
         latest_tick: EaRecord,
-    ) -> float | None:
+        now_iso: str,
+        order_type: str,
+    ) -> dict[str, Any]:
         """riskgate allowedLots(Phase 5.2):2% 权益风险 + 保证金约束下的手数上限。"""
         registration = await self._get_registration(account_id)
         positions = await self._get_positions(account_id, symbol)
@@ -223,11 +268,11 @@ class SchedulerService:
             _string_field(latest_tick, "received_at")
             or _string_field(latest_tick, "updated_at")
             or _string_field(latest_tick, "time")
-            or self._now_iso()
+            or now_iso
         )
-        result = evaluate_risk_gate(
+        return evaluate_risk_gate(
             {
-                "now": self._now_iso(),
+                "now": now_iso,
                 "account": {
                     "accountId": account_id,
                     "leverage": _number_field(registration, "leverage"),
@@ -255,6 +300,7 @@ class SchedulerService:
                             "type": _string_field(position, "type"),
                             "lots": _number_field(position, "lots"),
                             "strategy": _string_field(position, "strategy"),
+                            "order_class": "pending" if _is_pending_position_record(position) else "market",
                         }
                         for position in positions
                     ],
@@ -268,20 +314,12 @@ class SchedulerService:
                     "maxLots": _number_field(signal, "lots"),
                 },
                 "allowAdd": True,
+                "isAddOn": _number_field(signal, "scale_in_parent_ticket") > 0,
+                "isPending": order_type != "market",
                 "allowHedge": True,
                 "sourceStrategy": _string_field(signal, "strategy"),
             }
         )
-        allowed_lots = result.get("allowedLots")
-        if (
-            isinstance(allowed_lots, (int, float))
-            and not isinstance(allowed_lots, bool)
-            and math.isfinite(float(allowed_lots))
-            and allowed_lots > 0
-        ):
-            return float(allowed_lots)
-        return None
-
     async def _publish_replay_signal(self, account_id: str, symbol: str) -> None:
         result = await self._analysis.analyze_account_symbol(account_id, symbol)
         replay = result["replay"]
@@ -323,7 +361,10 @@ class SchedulerService:
             return
         bars = await self._bars_by_timeframe(account_id, symbol)
         latest_tick = await self._get_latest_tick(account_id, symbol)
-        market_filters = await self._evaluate_signal_market_filters(account_id, symbol, latest_tick, bars, heartbeat)
+        now_iso = self._now_iso()
+        market_filters = await self._evaluate_signal_market_filters(
+            account_id, symbol, latest_tick, bars, heartbeat, now_iso,
+        )
         if market_filters.get("blocked") is True:
             return
         trigger_key = _live_decision_key(strategy, bars)
@@ -340,11 +381,17 @@ class SchedulerService:
         should_split_tp = tp2_value > 0 and abs(tp2_value - tp1_value) > 0
         signal_lots = _number_field(signal_record, "lots")
         command_lots = signal_lots
-        if signal_lots > 0:
-            allowed_lots = await self._allowed_lots_for_signal(
-                account_id, symbol, signal_record, heartbeat, latest_tick
+        reduced_window = market_filters.get("event_window", {}).get("stage") == "reduced"
+        risk_gate: dict[str, Any] = {}
+        if signal_lots > 0 or reduced_window:
+            risk_gate = await self._risk_gate_for_signal(
+                account_id, symbol, signal_record, heartbeat, latest_tick, now_iso, order_type,
             )
-            if allowed_lots is not None and signal_lots > allowed_lots:
+            if reduced_window and risk_gate.get("status") == "rejected":
+                print(f"[SCHED] event_signal_rejected {account_id} {symbol} {risk_gate['reasonCodes']}")
+                return
+            allowed_lots = risk_gate.get("allowedLots", 0)
+            if 0 < allowed_lots < signal_lots:
                 command_lots = allowed_lots
                 payload = _json(
                     {
@@ -387,10 +434,15 @@ class SchedulerService:
         if _boolean_field(signal_record, "fib_enhanced"):
             candidate["fib_enhanced"] = True
         if order_type != "market":
-            candidate["expiration"] = _unix_seconds(self._now_iso()) + 24 * 60 * 60
+            candidate["expiration"] = _unix_seconds(now_iso) + 24 * 60 * 60
+        if reduced_window:
+            apply_event_order_limits(candidate, risk_gate["allowedLots"], risk_gate["eventCutoff"])
         await self._command_lifecycle.accept_candidate(account_id, candidate)
 
     async def _queue_ai_stop_loss_adjust(self, account_id: str, symbol: str) -> None:
+        window = market_event_window(symbol, self._now_iso())
+        if window is not None and window.stage == "blackout":
+            return
         # 对 EA 上报持仓的全部品种生效(不再有 GB_AI_TRAIL_SYMBOLS 白名单):
         # 分析按 EA 端 /positions、/tick、/bars 载荷里的 symbol 字段执行。
         positions = await self._get_positions(account_id, symbol)
@@ -476,10 +528,13 @@ class SchedulerService:
         if commands is None or len(commands) == 0:
             return
         now_iso = self._now_iso()
+        window = market_event_window(symbol, now_iso)
         positions = await self._get_positions(account_id, symbol)
         bars = await self._bars_by_timeframe(account_id, symbol)
         current_price = _live_current_price(await self._get_latest_tick(account_id, symbol), bars)
         for command in commands:
+            if window is not None and window.stage == "blackout" and command.get("action") == "MODIFY":
+                continue
             candidate = self._position_manager_command_candidate(
                 account_id, symbol, command, positions, now_iso, current_price
             )
@@ -694,16 +749,17 @@ class SchedulerService:
         latest_tick: EaRecord,
         bars: dict[str, list[EaRecord]],
         heartbeat: EaRecord,
+        now_iso: str,
     ) -> dict[str, Any]:
         last_tick_at = (
             _string_field(latest_tick, "received_at")
             or _string_field(latest_tick, "updated_at")
             or _string_field(latest_tick, "time")
-            or self._now_iso()
+            or now_iso
         )
         result = evaluate_market_filters(
             {
-                "now": self._now_iso(),
+                "now": now_iso,
                 "symbol": symbol,
                 "runtime": {
                     "marketOpen": _explicit_boolean(heartbeat, "market_open") is not False,

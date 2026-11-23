@@ -227,6 +227,39 @@ def is_runtime_command_expired(command: StoredCommand, now_iso: str) -> bool:
     return False
 
 
+def command_delivery_rejection(
+    command: StoredCommand, now_iso: str, event_controls: bool,
+) -> tuple[str, str] | None:
+    from backend.trading_core.riskgate.economic_calendar import EVENT_LOT_SCALE
+    from backend.trading_core.riskgate.riskgate import market_event_window
+
+    if is_runtime_command_expired(command, now_iso):
+        return "expired", "command expired before delivery"
+
+    action = command.get("action")
+    if action not in ("SIGNAL", "PENDING", "OPEN", "ADD", "MODIFY"):
+        return None
+    window = market_event_window(symbol_default(command), now_iso)
+    if window is not None and window.stage == "blackout":
+        return "rejected", window.code
+    if action != "MODIFY" and window is not None and window.stage == "reduced":
+        cutoff = int(window.event.blackout_start.timestamp())
+        expiration = numeric_field(command, "expiration")
+        if (
+            action not in ("SIGNAL", "PENDING") or command.get("lot_scale") != EVENT_LOT_SCALE
+            or command.get("event_cutoff") != cutoff or command.get("tp_split") is not False
+            or not 0 < expiration <= cutoff
+        ):
+            return "rejected", window.code
+    if command.get("event_cutoff") and not event_controls:
+        return "rejected", "event.ea_upgrade_required"
+    return None
+
+
+def requires_batch_cancel(command: StoredCommand) -> bool:
+    return command.get("action") == "CANCEL_PENDING" and command.get("ticket") == 0
+
+
 def is_active_ai_approve_pending(command: StoredCommand, account: str, symbol: str, side: str, now_iso: str) -> bool:
     if (
         command.get("account_id") != account

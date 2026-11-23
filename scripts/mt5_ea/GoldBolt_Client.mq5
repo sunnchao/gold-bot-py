@@ -1370,8 +1370,8 @@ void SendTick()
 //+------------------------------------------------------------------+
 void SendAllBars()
 {
-   string tf_names[] = {"M1","M5","M15","M30","H1","H4","D1"};
-   ENUM_TIMEFRAMES tf_periods[] = {PERIOD_M1,PERIOD_M5,PERIOD_M15,PERIOD_M30,PERIOD_H1,PERIOD_H4,PERIOD_D1};
+   string tf_names[] = {"M1","M5","M30","H1","H4","D1","M15"};
+   ENUM_TIMEFRAMES tf_periods[] = {PERIOD_M1,PERIOD_M5,PERIOD_M30,PERIOD_H1,PERIOD_H4,PERIOD_D1,PERIOD_M15};
 
    for(int s = 0; s < g_symbolCount; s++)
    {
@@ -1433,7 +1433,8 @@ string OrderTypeToString(int ot)
 bool IsPendingOrderType(int ot)
 {
    return (ot == (int)ORDER_TYPE_BUY_LIMIT || ot == (int)ORDER_TYPE_BUY_STOP ||
-           ot == (int)ORDER_TYPE_SELL_LIMIT || ot == (int)ORDER_TYPE_SELL_STOP);
+           ot == (int)ORDER_TYPE_SELL_LIMIT || ot == (int)ORDER_TYPE_SELL_STOP ||
+           ot == (int)ORDER_TYPE_BUY_STOP_LIMIT || ot == (int)ORDER_TYPE_SELL_STOP_LIMIT);
 }
 
 //+------------------------------------------------------------------+
@@ -1684,7 +1685,7 @@ void PollAndExecute()
    for(int s = 0; s < g_symbolCount; s++)
    {
       string baseSymbol = g_symbols[s];
-      string json = StringFormat("{\"account_id\":\"%s\",\"symbol\":\"%s\",\"magic\":%d}", AccountID, baseSymbol, PullbackMagic);
+      string json = StringFormat("{\"account_id\":\"%s\",\"symbol\":\"%s\",\"magic\":%d,\"event_controls\":true}", AccountID, baseSymbol, PullbackMagic);
       string response = HttpPost("/poll", json);
 
       if(StringLen(response) == 0) continue;
@@ -2290,7 +2291,7 @@ void ExecuteSignal(string cmd, string cmd_id)
 
    double sl_distance = MathAbs(price - sl);
    double lots = CalcLotsForStrategy(strategy, baseSymbol, sl_distance);
-   lots = NormalizeVolume(brokerSymbol, lots);
+   if(!ApplyCommandLotScale(cmd, cmd_id, brokerSymbol, type_str, false, lots, tpSplit)) return;
    string comment = "GB_" + strategy + "_S" + IntegerToString(score);
 
    // Multi-TP 拆单: 检查是否需要拆成两个订单
@@ -2542,12 +2543,12 @@ void ExecutePending(string cmd, string cmd_id)
       }
    }
 
-   // 计算手数：挂单始终使用 EA 策略配置，不使用服务端 cmd.lots 覆盖。
+   // 先使用 EA 策略配置计算基础手数，再执行指令中的风险限制。
    double currentPrice = (type_str == "BUY") ? SymbolInfoDouble(brokerSymbol, SYMBOL_ASK)
                                              : SymbolInfoDouble(brokerSymbol, SYMBOL_BID);
    double sl_distance = MathAbs(currentPrice - sl);
    double lots = CalcLotsForStrategy(strategy, baseSymbol, sl_distance);
-   lots = NormalizeVolume(brokerSymbol, lots);
+   if(!ApplyCommandLotScale(cmd, cmd_id, brokerSymbol, type_str, true, lots, tpSplit)) return;
 
    // 挂单同样需要通过本地风控检查
    if(!CheckRisk(type_str, baseSymbol))
@@ -2562,10 +2563,25 @@ void ExecutePending(string cmd, string cmd_id)
    // 过期时间：默认24小时；broker 不支持指定过期时间则回退 GTC
    if(expiration <= 0)
       expiration = TimeCurrent() + 24 * 60 * 60;
+   else
+   {
+      long remaining = expiration - TimeGMT();
+      if(remaining <= 0)
+      {
+         ReportResult(cmd_id, "REJECTED", 0, "command.expired");
+         return;
+      }
+      expiration = TimeCurrent() + remaining;
+   }
    ENUM_ORDER_TYPE_TIME timeType = ORDER_TIME_SPECIFIED;
    long expModes = SymbolInfoInteger(brokerSymbol, SYMBOL_EXPIRATION_MODE);
    if((expModes & SYMBOL_EXPIRATION_SPECIFIED) == 0)
    {
+      if(GetJsonDouble(cmd, "event_cutoff") > 0)
+      {
+         ReportResult(cmd_id, "REJECTED", 0, "event.expiration_unsupported");
+         return;
+      }
       timeType = ORDER_TIME_GTC;
       expiration = 0;
    }
@@ -2656,6 +2672,34 @@ void ExecuteCancelPending(string cmd, string cmd_id)
    ulong ticket = (ulong)GetJsonDouble(cmd, "ticket");
    string reason = GetJsonStringSafe(cmd, "reason");
 
+   if(ticket == 0 && StringFind(cmd, "\"ticket\"") >= 0)
+   {
+      string symbol = GetJsonStringSafe(cmd, "symbol");
+      if(StringLen(symbol) == 0)
+      {
+         ReportResult(cmd_id, "ERROR", 0, "symbol_missing");
+         return;
+      }
+      string brokerSymbol = GetBrokerSymbol(symbol);
+      long magic = (long)GetJsonDouble(cmd, "magic");
+      int failures = 0;
+      for(int index = OrdersTotal() - 1; index >= 0; index--)
+      {
+         ulong pendingTicket = OrderGetTicket(index);
+         if(pendingTicket == 0 || StringCompare(OrderGetString(ORDER_SYMBOL), brokerSymbol, false) != 0) continue;
+         long orderMagic = OrderGetInteger(ORDER_MAGIC);
+         if(orderMagic <= 0 || !IsOurMagic(orderMagic) || (magic > 0 && magic != orderMagic)) continue;
+         if(!IsPendingOrderType((int)OrderGetInteger(ORDER_TYPE))) continue;
+         if(!TradeOperationSucceeded(trade.OrderDelete(pendingTicket)))
+         {
+            failures++;
+            Print("Batch cancel failed: #", FormatULongValue(pendingTicket), " Error#", GetTradeErrorCode());
+         }
+      }
+      ReportResult(cmd_id, failures == 0 ? "OK" : "ERROR", 0, failures == 0 ? "" : "batch_cancel_failed");
+      return;
+   }
+
    if(ticket == 0)
    {
       Print("❌ 取消挂单：无效ticket");
@@ -2736,7 +2780,9 @@ void ExecuteModify(string cmd, string cmd_id)
          }
 
          PrepareTrade(sym, OrderGetInteger(ORDER_MAGIC));
-         bool result = trade.OrderModify(ticket, OrderGetDouble(ORDER_PRICE_OPEN), sl, tp, ORDER_TIME_GTC, 0);
+         bool result = trade.OrderModify(ticket, OrderGetDouble(ORDER_PRICE_OPEN), sl, tp,
+            (ENUM_ORDER_TYPE_TIME)OrderGetInteger(ORDER_TYPE_TIME),
+            (datetime)OrderGetInteger(ORDER_TIME_EXPIRATION), OrderGetDouble(ORDER_PRICE_STOPLIMIT));
          if(TradeOperationSucceeded(result))
          {
             Print("✅ 改单成功（挂单）");
@@ -3022,6 +3068,62 @@ double CalcLotsForStrategy(string strategy, string symbol, double sl_distance)
       return NormalizeVolume(brokerSymbol, strategyLots);
 
    return CalcLots(sl_distance, tradeSymbol, brokerSymbol);
+}
+
+bool ApplyCommandLotScale(string cmd, string cmd_id, string symbol, string side, bool pending,
+                          double &lots, bool &tpSplit)
+{
+   double scale = GetJsonDouble(cmd, "lot_scale");
+   datetime eventCutoff = (datetime)GetJsonDouble(cmd, "event_cutoff");
+   if(eventCutoff > 0 && TimeGMT() >= (datetime)GetJsonDouble(cmd, "expiration"))
+   {
+      ReportResult(cmd_id, "REJECTED", 0, "command.expired");
+      return false;
+   }
+   if(scale == 0.0 && eventCutoff == 0)
+   {
+      lots = NormalizeVolume(symbol, lots);
+      return true;
+   }
+   if(scale <= 0.0 || scale > 1.0)
+   {
+      ReportResult(cmd_id, "REJECTED", 0, "lots.invalid_scale");
+      return false;
+   }
+   lots *= scale;
+   if(eventCutoff > 0) lots = MathMin(lots, GetJsonDouble(cmd, "lots"));
+   lots = NormalizeCloseVolume(symbol, lots);
+   if(lots <= 0.0)
+   {
+      ReportResult(cmd_id, "REJECTED", 0, "lots.below_min_after_scale");
+      return false;
+   }
+   if(eventCutoff > 0)
+   {
+      for(int index = PositionsTotal() - 1; index >= 0; index--)
+      {
+         if(!SelectPositionByIndex(index) || PositionGetString(POSITION_SYMBOL) != symbol) continue;
+         if(PositionGetInteger(POSITION_TYPE) == (side == "BUY" ? POSITION_TYPE_BUY : POSITION_TYPE_SELL))
+         {
+            ReportResult(cmd_id, "REJECTED", 0, "event.add_on_not_allowed");
+            return false;
+         }
+      }
+      if(pending)
+      {
+         for(int index = OrdersTotal() - 1; index >= 0; index--)
+         {
+            if(OrderGetTicket(index) == 0 || OrderGetString(ORDER_SYMBOL) != symbol) continue;
+            if(IsOurMagic(OrderGetInteger(ORDER_MAGIC)) && IsPendingOrderType((int)OrderGetInteger(ORDER_TYPE)))
+            {
+               ReportResult(cmd_id, "REJECTED", 0, "event.dual_pending_not_allowed");
+               return false;
+            }
+         }
+      }
+   }
+   if(scale < 1.0) tpSplit = false;
+   return true;
 }
 
 // ============================================================

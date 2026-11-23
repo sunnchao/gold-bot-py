@@ -273,6 +273,29 @@ def test_ai_approve_commands_expire_after_four_hours() -> None:
     assert is_runtime_command_expired(numeric, "2099-01-01T00:00:00Z") is True
 
 
+async def test_rechecks_queued_commands_at_event_delivery(store: EaStore, tmp_path, monkeypatch) -> None:
+    calendar = tmp_path / "calendar.json"
+    calendar.write_text('[{"type":"CPI","time_utc":"2030-01-07T13:30:00Z","symbols":["XAUUSD"]}]')
+    monkeypatch.setenv("GB_ECONOMIC_CALENDAR_PATH", str(calendar))
+    await store.enqueue_command("acc-1", command(command_id="unscaled"))
+    await store.enqueue_command("acc-1", command(
+        command_id="scaled", lot_scale=0.5, lots=0.05, tp_split=False,
+        expiration=1894021200, event_cutoff=1894021200,
+    ))
+    assert await store.poll_commands("acc-1", now_iso="2030-01-07T11:30:00Z", event_controls=False) == []
+    assert (await store.get_command("unscaled"))["error_text"] == "event.reduced_window"
+    assert (await store.get_command("scaled"))["error_text"] == "event.ea_upgrade_required"
+
+    await store.enqueue_command("acc-1", command(command_id="crossed-window", action="PENDING"))
+    await store.enqueue_command("acc-1", command(command_id="old-modification", action="MODIFY"))
+    await store.enqueue_command("acc-1", command(command_id="risk-reduction", action="CLOSE"))
+
+    polled = await store.poll_commands("acc-1", now_iso="2030-01-07T13:15:00Z")
+    assert [item["command_id"] for item in polled] == ["risk-reduction"]
+    assert (await store.get_command("crossed-window"))["error_text"] == "event.blackout_window"
+    assert (await store.get_command("old-modification"))["error_text"] == "event.blackout_window"
+
+
 async def test_applies_order_results_only_to_delivered_commands(store: EaStore) -> None:
     await store.enqueue_command("acc-1", command("acc-1"))
     assert await store.reconcile_command_result("acc-1", "cmd_acc-1_0", "OK") is False  # 未 delivered

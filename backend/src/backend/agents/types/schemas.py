@@ -28,6 +28,8 @@ from pydantic import (
     model_validator,
 )
 
+from backend.agents.tools.breakout_confirmation import BreakoutLevel, TriggerBasis
+
 __all__ = [
     "AccountInfoSchema",
     "ArbitrationResultSchema",
@@ -271,6 +273,7 @@ class ArbitrationResultSchema(_StrictModel):
     reasoning: MinOneString
     action: Literal["open", "close", "modify", "hold"]
     united_front_analysis: str
+    trigger_basis: TriggerBasis | None = None
     dow_theory: DowTheorySchema | None = None
     wave_theory: WaveTheorySchema | None = None
     chanlun_theory: ChanlunTheorySchema | None = None
@@ -493,6 +496,7 @@ class MarketFiltersSchema(_StrictModel):
     blocking: list[MarketFilterSchema] | None = []
     warnings: list[MarketFilterSchema] | None = []
     reason_codes: list[MinOneString] | None = []
+    event_window: dict[str, str] | None = None
 
 
 # StrategyMappingSchema - Go API returns simple map[string]string
@@ -620,6 +624,7 @@ class GoldbotPayloadSchema(_StrictModel):
     bars: dict[str, list[GoldbotBarSchema]] | None = None
     trend_context: TrendContextSchema | None = None
     harmonic_context: HarmonicContextSchema | None = None
+    breakout_levels: list[BreakoutLevel] | None = None
 
 
 # ---------------------------------------------------------------- safeParseLLM + helpers

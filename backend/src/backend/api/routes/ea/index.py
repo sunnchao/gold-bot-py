@@ -645,7 +645,9 @@ async def handle_ea_route(
             }
         )
     if switch_path == "/poll":
-        commands = await deps["store"].poll_commands(account_id)
+        commands = await deps["store"].poll_commands(
+            account_id, now_iso=deps["now_iso"](), event_controls=parsed_body.get("event_controls") is True,
+        )
         return ok({"status": "OK", "commands": commands, "count": len(commands)})
     if switch_path == "/order_result":
         on_order_result = deps.get("on_order_result")

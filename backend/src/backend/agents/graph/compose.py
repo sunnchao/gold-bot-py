@@ -17,6 +17,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any, Literal, cast
 
 from backend.agents.graph.state import AnalysisGraphState
+from backend.agents.tools.breakout_confirmation import UNCONFIRMED_BREAKOUT, breakout_entry_rejection
 from backend.agents.types.agent import (
     AISignalResult,
     DualTradePlan,
@@ -25,11 +26,12 @@ from backend.agents.types.agent import (
 )
 from backend.agents.types.analysis import ArbitrationResult
 from backend.agents.types.trade_action import MarketOrderAction, PendingOrderAction, TradeAction
+from backend.trading_core.riskgate.economic_calendar import EVENT_BLACKOUT
 
 TRADE_PLAN_SCHEMA_VERSION: Literal["trade_plan.v1"] = "trade_plan.v1"
 TRADE_PLAN_EXPIRY_MS = 15 * 60 * 1000
 
-CRITICAL_BLOCKING = ["market.closed", "market.trade_not_allowed", "tick.missing", "tick.stale"]
+CRITICAL_BLOCKING = ["market.closed", "market.trade_not_allowed", "tick.missing", "tick.stale", EVENT_BLACKOUT]
 
 TradePlanMode = Literal["observe", "veto", "approve", "modify", "reduce", "close"]
 TradePlanSide = Literal["buy", "sell", "dual", "none"]
@@ -497,6 +499,13 @@ def compose_final_signal(state: AnalysisGraphState) -> AISignalResult | None:
     if arbitration is None:
         return None
 
+    if EVENT_BLACKOUT in filters["blocking"] and _get(arbitration, "action") in ("open", "modify"):
+        arbitration = _with_arbitration(arbitration, {
+            "action": "hold", "final_direction": "hold",
+            "reasoning": f"{_get(arbitration, 'reasoning', '')} | {EVENT_BLACKOUT}",
+            "trade_recommendation": None,
+        })
+
     final_direction = _get(arbitration, "final_direction")
     if final_direction == "buy":
         bias: str = "bullish"
@@ -520,6 +529,8 @@ def compose_final_signal(state: AnalysisGraphState) -> AISignalResult | None:
         and _get(wave_analysis, "wave_confirmation") == "confirmed"
     ):
         confidence = min(100, confidence + 10)
+    if UNCONFIRMED_BREAKOUT in _get(arbitration, "reasoning", "") and _get(arbitration, "action") == "hold":
+        confidence = min(confidence, 20)
 
     dow_theory = _get(arbitration, "dow_theory")
     multi_tf_align = bool(_get(dow_theory, "multi_tf_confirm", False))
@@ -597,15 +608,36 @@ def compose_final_signal(state: AnalysisGraphState) -> AISignalResult | None:
         else None
     )
 
+    levels = _get(state.get("payload"), "breakout_levels") or []
+    bid, ask = _entry_bid_ask(state)
+    plans = (dual_trade_plan.buy, dual_trade_plan.sell) if dual_trade_plan is not None else (trade_plan,)
+    if any(
+        breakout_entry_rejection(
+            levels, plan.side, bid or ask, (plan.entry_zone.min + plan.entry_zone.max) / 2,
+            phase=_get(technical, "phase", ""), basis=_get(arbitration, "trigger_basis") or "",
+            market=plan.execution_type == "market",
+        )
+        for plan in plans
+        if plan is not None and plan.mode == "approve"
+    ):
+        confidence = min(confidence, 20)
+        arbitration = _with_arbitration(arbitration, {
+            "action": "hold", "final_direction": "hold", "confidence": confidence,
+            "reasoning": f"{_get(arbitration, 'reasoning', '')} | {UNCONFIRMED_BREAKOUT}",
+            "trade_recommendation": None,
+        })
+        trade_plan = dual_trade_plan = None
+
     risk_level = _get(risk_assessment, "riskLevel")
     trade_action_type = _get(trade_action, "type")
+    risk_blocking = [code for code in filters["blocking"] if code != EVENT_BLACKOUT]
     if trade_action_type == "place_pending_order":
         risk_alert = (
-            any(code in CRITICAL_BLOCKING for code in filters["blocking"])
+            any(code in CRITICAL_BLOCKING for code in risk_blocking)
             or risk_level in ("high", "extreme")
         )
     else:
-        risk_alert = market_blocked or risk_level in ("high", "extreme")
+        risk_alert = bool(risk_blocking) or risk_level in ("high", "extreme")
 
     alert_reason_parts: list[str] = []
     if market_blocked:
@@ -650,6 +682,7 @@ def compose_final_signal(state: AnalysisGraphState) -> AISignalResult | None:
             "phase": _get(arbitration, "phase", ""),
             "contradiction": _get(arbitration, "primary_contradiction", ""),
             "united_front": _get(arbitration, "united_front_analysis", ""),
+            **({"trigger_basis": basis} if (basis := _get(arbitration, "trigger_basis")) else {}),
         },
         wave_analysis=(
             {

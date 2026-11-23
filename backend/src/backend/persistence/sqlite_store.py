@@ -17,19 +17,20 @@ from backend.persistence.helpers import (
     candidate_signal_decision_event,
     clone_record,
     command_decision_event,
+    command_delivery_rejection,
     command_result_decision_event,
     current_timestamp,
     filter_shadow_comparisons,
     from_json,
     is_active_ai_approve_pending,
     is_pending_signal_expired,
-    is_runtime_command_expired,
     normalize_api_token,
     normalize_decision_event,
     normalize_pending_signal,
     normalize_position_state,
     numeric_field,
     position_state_from_row,
+    requires_batch_cancel,
     string_array_field,
     string_field,
     summarize_shadow_comparisons,
@@ -540,7 +541,9 @@ class SqliteEaStore:
             await conn.commit()
             return True
 
-    async def poll_commands(self, account_id_: str) -> list[EaRecord]:
+    async def poll_commands(
+        self, account_id_: str, *, now_iso: str | None = None, event_controls: bool = True,
+    ) -> list[EaRecord]:
         async with self._connect() as conn:
             rows = await self._rows(
                 conn,
@@ -553,35 +556,40 @@ class SqliteEaStore:
                 account=account_id_,
             )
             delivered: list[EaRecord] = []
-            delivered_at = current_timestamp()
+            delivered_at = now_iso or current_timestamp()
             for row in rows:
                 command, visible = build_runtime_command(row["command_id"], row)
-                if is_runtime_command_expired(command, delivered_at):
+                rejection = command_delivery_rejection(command, delivered_at, event_controls)
+                if rejection is not None:
+                    result, error_text = rejection
                     await conn.execute(
                         text(
                             """
                             UPDATE runtime_commands
-                            SET status = 'failed', result = 'expired', ticket = 0,
-                                error_text = 'command expired before delivery', failed_at = :delivered_at,
+                            SET status = 'failed', result = :result, ticket = 0,
+                                error_text = :error_text, failed_at = :delivered_at,
                                 updated_at = CURRENT_TIMESTAMP
                             WHERE command_id = :command_id AND account_id = :account AND status = 'queued'
                             """
                         ),
-                        {"delivered_at": delivered_at, "command_id": row["command_id"], "account": account_id_},
+                        {
+                            "delivered_at": delivered_at, "command_id": row["command_id"], "account": account_id_,
+                            "result": result, "error_text": error_text,
+                        },
                     )
-                    expired: StoredCommand = {
+                    failed: StoredCommand = {
                         **command,
                         "status": "failed",
-                        "result": "expired",
+                        "result": result,
                         "ticket": 0,
-                        "error_text": "command expired before delivery",
+                        "error_text": error_text,
                         "failed_at": delivered_at,
                     }
-                    event = command_result_decision_event(
-                        expired, "expired", 0, "command expired before delivery", delivered_at, visible
-                    )
+                    event = command_result_decision_event(failed, result, 0, error_text, delivered_at, visible)
                     if event is not None:
                         await self._insert_decision_event(conn, event)
+                    continue
+                if not event_controls and requires_batch_cancel(command):
                     continue
                 await conn.execute(
                     text(

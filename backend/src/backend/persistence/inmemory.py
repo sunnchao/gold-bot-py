@@ -13,19 +13,20 @@ from backend.persistence.helpers import (
     clone_array,
     clone_record,
     command_decision_event,
+    command_delivery_rejection,
     command_result_decision_event,
     current_timestamp,
     filter_decision_events,
     filter_shadow_comparisons,
     is_active_ai_approve_pending,
     is_pending_signal_expired,
-    is_runtime_command_expired,
     normalize_api_token,
     normalize_decision_event,
     normalize_pending_signal,
     normalize_position_state,
     numeric_field,
     position_state_from_row,
+    requires_batch_cancel,
     string_array_field,
     string_field,
     summarize_shadow_comparisons,
@@ -263,31 +264,37 @@ class InMemoryEaStore(EaStore):
             if e["kind"] == "order_result" and e["account_id"] == account_id_
         ]
 
-    async def poll_commands(self, account_id_: str) -> list[EaRecord]:
+    async def poll_commands(
+        self, account_id_: str, *, now_iso: str | None = None, event_controls: bool = True,
+    ) -> list[EaRecord]:
         pending = sorted(
             (c for c in self._commands.values() if c.get("account_id") == account_id_ and c.get("status") == "queued"),
             key=lambda c: (c.get("created_at", ""), c.get("command_id", "")),
         )
-        delivered_at = current_timestamp()
+        delivered_at = now_iso or current_timestamp()
         delivered: list[StoredCommand] = []
         for command in pending:
             command_id = command.get("command_id", "")
-            if is_runtime_command_expired(command, delivered_at):
+            rejection = command_delivery_rejection(command, delivered_at, event_controls)
+            if rejection is not None:
+                result, error_text = rejection
                 command["status"] = "failed"
-                command["result"] = "expired"
+                command["result"] = result
                 command["ticket"] = 0
-                command["error_text"] = "command expired before delivery"
+                command["error_text"] = error_text
                 command["failed_at"] = delivered_at
                 event = command_result_decision_event(
                     command,
-                    "expired",
+                    result,
                     0,
-                    "command expired before delivery",
+                    error_text,
                     delivered_at,
                     self._poll_source_visible.get(command_id, False),
                 )
                 if event is not None:
                     self._decision_events.append(self._finalize_decision(event))
+                continue
+            if not event_controls and requires_batch_cancel(command):
                 continue
             command["status"] = "delivered"
             command["delivered_at"] = delivered_at

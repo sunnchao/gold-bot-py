@@ -60,6 +60,7 @@ from backend.agents.agents.trade_action_converter import (
     tool_use_to_trade_action,
     tool_use_to_trade_action_legacy,
 )
+from backend.agents.tools.breakout_confirmation import TRIGGER_BASES, BreakoutLevel, build_breakout_levels
 
 __all__ = [
     "ComprehensiveAnalystService",
@@ -112,6 +113,14 @@ def get_payload_bars(payload: JSONDict, timeframe: str) -> list[JSONDict]:
     matching_key = next((key for key in bars.keys() if str(key).upper() == timeframe), None)
     matched = bars.get(matching_key) if matching_key else None
     return matched if isinstance(matched, list) else []
+
+
+def payload_breakout_levels(payload: JSONDict, current_price: float) -> list[BreakoutLevel]:
+    levels = payload.get("breakout_levels")
+    if levels is not None:
+        return levels
+    bars = {tf: get_payload_bars(payload, tf) for tf in ("D1", "H4", "H1", "M30", "M15")}
+    return build_breakout_levels(bars, current_price, payload.get("smc_context"))
 
 
 def extract_preferred_bar_closes(
@@ -636,6 +645,10 @@ ALL 5 sections are REQUIRED on every response. Do not omit any section.
 7. Support/Resistance levels use pipe-delimited format: price | type | strength | timeframe | touches
 8. All prices must fit the instrument's range described in SYMBOL CHARACTERISTICS.
 9. For bilingual text fields: Chinese first, English in parentheses.
+10. Quote the computed key-level states as given. Only closed_confirmed supports a breakout entry;
+    intrabar_broken and touched are not breakout confirmation. Never chase an intrabar break.
+11. Read the economic event window before recommending a trade. In blackout, do not propose new orders.
+    In the reduced window, no add-on or dual-direction trades; the execution engine scales size.
 
 ## DUAL-DIRECTION TRADING (双向下单)
 
@@ -735,6 +748,7 @@ Do NOT mix these up. Keep them separate.
 - Harmonic Confidence: <0-100>
 - Harmonic Rationale: <string>
 - Trade Direction: buy | sell | hold | dual
+- Trade Trigger Basis: pullback_limit | closed_breakout | intrabar_breakout | range_fade
 - Trade Entry Price: <number>
 - Trade Stop Loss: <absolute stop loss price level>
 - Trade Take Profit 1: <absolute take profit price level>
@@ -1108,6 +1122,10 @@ def build_realtime_data_prompt(
 ### Current Price & Market Context
 - **{symbol}: {current_price:.{profile['price_precision']}f}**
 - Market status: {stable_stringify(stable_market_status)}
+- Market filters and economic calendar: {stable_stringify(payload.get('market_filters') or {})}
+
+### Tested Key Levels (computed from bars and liquidity sweeps)
+{stable_stringify(payload_breakout_levels(payload, current_price))}
 
 ### Market Data
 {stable_stringify(market)}
@@ -1567,6 +1585,9 @@ def parse_markdown_response(
         "harmonic_theory": harmonic_theory,
         "trade_recommendation": trade_recommendation,
     }
+    trigger_basis = get_enum_field(arb_fields, "trade_trigger_basis", TRIGGER_BASES, "")
+    if trigger_basis:
+        arbitration["trigger_basis"] = trigger_basis
 
     return {
         "technical": technical,
@@ -2220,7 +2241,11 @@ class ComprehensiveAnalystService:
                     arbitration["action"] = "hold"
                     arbitration["confidence"] = min(arbitration.get("confidence", 0), 20)
 
-            arb_val = validate_arbitration_business(arbitration, current_price, profile)
+            arb_val = validate_arbitration_business(
+                arbitration, current_price, profile,
+                breakout_levels=payload_breakout_levels(payload, current_price),
+                technical_phase=(result.get("technical") or {}).get("phase", ""),
+            )
             if not arb_val.valid and arb_val.fixed_arbitration is not None:
                 logger.warn({"symbol": symbol}, "Arbitration result invalid — applying downgrade")
                 result["arbitration"] = arb_val.fixed_arbitration

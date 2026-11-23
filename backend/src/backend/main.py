@@ -11,6 +11,7 @@ from backend.api.app import create_api_app
 from backend.core.config import load_gold_bot_env
 from backend.core.database import create_store_from_env, ensure_store_schema
 from backend.notifications import FeishuNotifier
+from backend.trading_core.riskgate.economic_calendar import load_economic_calendar
 
 
 class HealthResponse(BaseModel):
@@ -55,11 +56,14 @@ if agent_token:
     )
 app = create_api_app(app_options)
 app.router.add_event_handler("shutdown", pi_http_client.aclose)
+app.router.add_event_handler("shutdown", app.state.scheduler.stop)
 
 
 @app.on_event("startup")
 async def initialize_persistence() -> None:
+    load_economic_calendar()
     await ensure_store_schema(store)
+    await app.state.scheduler.start(position_review=False)
 
 app.add_middleware(
     CORSMiddleware,

@@ -10,6 +10,7 @@ import re
 from datetime import UTC, datetime, timedelta, timezone
 from typing import Any
 
+from backend.agents.tools.breakout_confirmation import build_breakout_levels
 from backend.api.http.json import parse_strict_json_object
 from backend.api.http.response import JsonResponse, error
 from backend.api.middleware.auth import (
@@ -825,7 +826,7 @@ async def analysis_payload(store: EaStore, account_id: str, symbol: str, timesta
         for tf, bars in enriched.items()
     }
     market_status = analysis_market_status(heartbeat, latest_tick, timestamp)
-    d1_bars = await store.get_bars(account_id, symbol, "D1")
+    d1_bars = flatten_bar_records(await store.get_bars(account_id, symbol, "D1"))
     trend_bars = {**enriched, "D1": enrich_analysis_bars(d1_bars)}
     harmonic_context = build_harmonic_context_payload(enriched)
     smc_context = build_smc_context_payload(enriched)
@@ -850,6 +851,9 @@ async def analysis_payload(store: EaStore, account_id: str, symbol: str, timesta
         "bars": payload_bars,
         "harmonic_context": harmonic_context,
         "smc_context": smc_context,
+        "breakout_levels": build_breakout_levels(
+            trend_bars, number_field(latest_tick, "bid") or number_field(latest_tick, "ask"), smc_context
+        ),
         "candlestick_patterns": candlestick_patterns,
         "indicators": indicator_packs(enriched),
         "market": {
@@ -1137,7 +1141,9 @@ def _decode_time_field_error(record: dict, field: str) -> str | None:
 # ------------------------------------------------ risk gate(app.ts)
 
 
-async def ai_trade_plan_risk_gate(store: EaStore, account_id: str, symbol: str, trade_plan: dict, now: str) -> dict:
+async def ai_trade_plan_risk_gate(
+    store: EaStore, account_id: str, symbol: str, trade_plan: dict, now: str, *, dual_direction: bool = False,
+) -> dict:
     from backend.trading_core.riskgate.riskgate import evaluate_risk_gate
 
     registration = (await store.get_registration(account_id)) or {}
@@ -1173,6 +1179,7 @@ async def ai_trade_plan_risk_gate(store: EaStore, account_id: str, symbol: str, 
                         "type": _string_field(position, "type"),
                         "lots": number_field(position, "lots"),
                         "strategy": _string_field(position, "strategy"),
+                        "order_class": resolve_order_class_field(position),
                     }
                     for position in positions
                 ],
@@ -1190,6 +1197,9 @@ async def ai_trade_plan_risk_gate(store: EaStore, account_id: str, symbol: str, 
                 "expiresAt": _string_field(trade_plan, "expires_at"),
             },
             "allowAdd": boolean_field(trade_plan, "add_on"),
+            "isAddOn": boolean_field(trade_plan, "add_on") or bool(trade_plan.get("add_on_type")),
+            "isPending": trade_plan.get("execution_type") == "limit",
+            "dualDirection": dual_direction,
             "sourceStrategy": "ai_signal",
         }
     )
@@ -1205,6 +1215,10 @@ async def ai_trade_plan_risk_gate(store: EaStore, account_id: str, symbol: str, 
         "max_risk_lots": result.get("maxRiskLots", 0),
         "max_margin_lots": result.get("maxMarginLots", 0),
         "canProduceLiveCommands": result.get("canProduceLiveCommands", False),
+        **(
+            {"lot_scale": result["lotScale"], "event_cutoff": result["eventCutoff"]}
+            if "lotScale" in result else {}
+        ),
     }
 
 
@@ -1657,7 +1671,8 @@ def dual_trade_plans(dual_trade_plan: dict) -> list[dict]:
 
 
 async def queue_ai_approve_pending_commands(
-    deps: dict, account_id: str, symbol: str, trade_plans: list[dict], risk_gate: dict, event_timestamp: str
+    deps: dict, account_id: str, symbol: str, trade_plans: list[dict], risk_gate: dict, event_timestamp: str,
+    *, dual_direction: bool = False,
 ) -> StoredCommand | None:
     from backend.services.ai_approve.command import build_ai_approve_command_candidate
     from backend.services.ai_approve.gate import evaluate_ai_approve_pending_gate
@@ -1667,8 +1682,18 @@ async def queue_ai_approve_pending_commands(
     positions = await store.get_positions(account_id, symbol)
     position_states = await store.load_position_states(account_id, symbol)
     for trade_plan in trade_plans:
-        queue_skip_reason = ai_approve_queue_skip_reason(trade_plan, risk_gate)
+        plan_gate = (
+            await ai_trade_plan_risk_gate(store, account_id, symbol, trade_plan, event_timestamp, dual_direction=True)
+            if dual_direction else risk_gate
+        )
+        queue_skip_reason = ai_approve_queue_skip_reason(trade_plan, plan_gate)
         if queue_skip_reason is not None:
+            if queue_skip_reason == "queue_skip.risk_rejected":
+                queue_skip_reason = next(
+                    (code for code in plan_gate.get("reason_codes", [])
+                     if code.startswith("event.") or code == "lots.below_min_after_scale"),
+                    queue_skip_reason,
+                )
             await record_ai_approve_pending_gate_event(
                 store, account_id, symbol, trade_plan, queue_skip_reason, event_timestamp
             )
@@ -1698,7 +1723,7 @@ async def queue_ai_approve_pending_commands(
                 "accountId": account_id,
                 "symbol": command_symbol,
                 "tradePlan": trade_plan,
-                "riskGate": risk_gate,
+                "riskGate": plan_gate,
                 "nowIso": event_timestamp,
                 "orderType": pending_gate.get("orderType", ""),
                 "positions": positions,
@@ -1723,6 +1748,7 @@ async def handle_ai_result_route(_method: str, account_id: str, symbol: str, raw
     trade_plan_payload = parse_trade_plan_payload(parsed_body, account_id, symbol)
     trade_plan = trade_plan_payload.get("tradePlan")
     dual_trade_plan = parse_dual_trade_plan_payload(parsed_body, account_id, symbol)
+    dual_direction = dual_trade_plan is not None and dual_trade_plan.get("valid") is True
     if trade_plan is None:
         publish_ai_result_events(deps["events"], account_id, symbol, parsed_body, None, None, event_timestamp)
         risk_command_requested = should_queue_ai_risk_command(parsed_body)
@@ -1730,7 +1756,7 @@ async def handle_ai_result_route(_method: str, account_id: str, symbol: str, raw
             await queue_ai_risk_commands(store, account_id, symbol, parsed_body, event_timestamp)
         if not risk_command_requested and dual_trade_plan is not None and dual_trade_plan.get("valid") is True:
             await queue_ai_approve_pending_commands(
-                deps, account_id, symbol, dual_trade_plans(dual_trade_plan), {}, event_timestamp
+                deps, account_id, symbol, dual_trade_plans(dual_trade_plan), {}, event_timestamp, dual_direction=True
             )
         validation = trade_plan_payload.get("validation")
         no_trade_plan_body: dict[str, Any] = {"status": "OK", "received": True}
@@ -1738,7 +1764,9 @@ async def handle_ai_result_route(_method: str, account_id: str, symbol: str, raw
             no_trade_plan_body["trade_plan_validation"] = validation
         return {"statusCode": 200, "body": no_trade_plan_body}
 
-    risk_gate = await ai_trade_plan_risk_gate(store, account_id, symbol, trade_plan, event_timestamp)
+    risk_gate = await ai_trade_plan_risk_gate(
+        store, account_id, symbol, trade_plan, event_timestamp, dual_direction=dual_direction,
+    )
     decision_id = _string_field(trade_plan, "decision_id")
     mode = _string_field(trade_plan, "mode")
     trade_plan_side = _string_field(trade_plan, "side")
@@ -1760,6 +1788,7 @@ async def handle_ai_result_route(_method: str, account_id: str, symbol: str, raw
             else [trade_plan],
             risk_gate,
             event_timestamp,
+            dual_direction=dual_direction,
         )
     else:
         command = None

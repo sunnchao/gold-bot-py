@@ -31,6 +31,8 @@ import re
 from collections.abc import Awaitable, Callable
 from typing import Any, Protocol, TypeGuard
 
+from backend.agents.tools.breakout_confirmation import TRIGGER_BASES, BreakoutLevel, breakout_entry_rejection
+
 __all__ = [
     "CacheStats",
     "DEFAULT_MAX_LOTS",
@@ -1504,6 +1506,8 @@ def validate_arbitration_result(data: Any) -> dict[str, Any] | None:
         "action": action,
         "united_front_analysis": united_front_analysis,
     }
+    if data.get("trigger_basis") in TRIGGER_BASES:
+        result["trigger_basis"] = data["trigger_basis"]
     optional_fields: dict[str, Any] = {
         "dow_theory": validate_dow_theory,
         "wave_theory": validate_wave_theory,
@@ -1694,6 +1698,9 @@ def validate_arbitration_business(
     arb: dict[str, Any],
     current_price: float,
     profile: dict[str, Any],
+    *,
+    breakout_levels: list[BreakoutLevel] | None = None,
+    technical_phase: str = "",
 ) -> TradeValidation:
     """镜像 validateArbitrationResult:嵌入 trade_recommendation 的业务校验。"""
     trade = arb.get("trade_recommendation")
@@ -1702,6 +1709,25 @@ def validate_arbitration_business(
 
     if trade.get("direction") == "hold" and trade.get("entry_price", 0) <= 0:
         return TradeValidation(valid=True, warnings=[], fixed_arbitration=arb)
+
+    if breakout_levels is not None and arb.get("action") == "open":
+        reason = breakout_entry_rejection(
+            breakout_levels, trade.get("direction", ""), current_price, trade.get("entry_price", 0),
+            phase=technical_phase, basis=arb.get("trigger_basis") or "",
+        )
+        if reason:
+            fixed_trade = {**trade, "direction": "hold", "rationale": reason}
+            return TradeValidation(
+                valid=False,
+                warnings=[reason],
+                fixed_trade=fixed_trade,
+                fixed_arbitration={
+                    **arb, "final_direction": "hold", "action": "hold",
+                    "confidence": min(arb.get("confidence", 0), 20),
+                    "reasoning": f"{arb.get('reasoning', '')} | {reason}",
+                    "trade_recommendation": fixed_trade,
+                },
+            )
 
     trade_result = validate_trade_recommendation_business(trade, current_price, profile)
 

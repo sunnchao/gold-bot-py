@@ -1126,3 +1126,23 @@ async def test_preserves_explicit_neutral_theory_sections_and_a_hold_recommendat
     assert theory["harmonic_theory"]["confidence"] == 0
     assert theory["trade_recommendation"]["direction"] == "hold"
     assert "观望" in theory["trade_recommendation"]["rationale"]
+
+
+async def test_realtime_prompt_quotes_computed_breakout_and_blocks_second_phase():
+    response = BUY_SETUP_MARKDOWN.replace("- Trade Entry Price: 4145", "- Trade Entry Price: 4174")
+    response += "\n- Trade Trigger Basis: closed_breakout\n"
+    client = FakeLlmClient(stream_results=[sr(response)])
+    trade_client = FakeLlmClient()
+    payload = payload_with_last_bar_close(4174)
+    payload["breakout_levels"] = [
+        {"price": 4173, "side": "resistance", "timeframe": "H1", "state": "intrabar_broken"}
+    ]
+
+    result = await make_service(client, trade_client).run(payload, "XAUUSD")
+
+    assert "intrabar_broken" in client.stream_calls[0][1][-1].text
+    assert result["arbitration"]["trigger_basis"] == "closed_breakout"
+    assert result["arbitration"]["action"] == "hold"
+    assert result["arbitration"]["confidence"] == 20
+    assert result["tradeAction"]["type"] == "do_nothing"
+    assert not trade_client.stream_calls

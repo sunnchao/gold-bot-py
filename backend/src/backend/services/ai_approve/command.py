@@ -19,6 +19,7 @@ from backend.services.ai_approve.rules import (
     resolve_ai_approve_executable_take_profits,
     round2,
 )
+from backend.trading_core.riskgate.riskgate import apply_event_order_limits
 
 __all__ = [
     "AIApproveCommandInput",
@@ -82,6 +83,13 @@ def build_ai_approve_command_candidate(command_input: AIApproveCommandInput) -> 
         "risk_gate": command_input["riskGate"],
         "tp_split": bool(take_profits["tpSplit"]),
     }
+
+    risk_gate = command_input["riskGate"]
+    if risk_gate.get("event_cutoff"):
+        plan_expires_at = _string_field(trade_plan, "expires_at")
+        if plan_expires_at:
+            candidate["expiration"] = min(expiration, _unix_seconds(plan_expires_at))
+        apply_event_order_limits(candidate, risk_gate["allowed_lots"], risk_gate["event_cutoff"])
 
     add_on_type = _string_field(trade_plan, "add_on_type")
     if (add_on_type in ("favorable", "adverse")) and command_input.get("positions") is not None:

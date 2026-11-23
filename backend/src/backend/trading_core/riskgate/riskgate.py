@@ -12,6 +12,12 @@ import re
 from datetime import UTC, datetime
 from typing import Any
 
+from backend.trading_core.riskgate.economic_calendar import (
+    EVENT_LOT_SCALE,
+    EventWindow,
+    event_window_for,
+)
+
 __all__ = [
     "evaluate_market_filters",
     "evaluate_risk_gate",
@@ -183,6 +189,46 @@ def base_symbol(symbol: str) -> str:
     if normalized in ("UKOIL", "BRENT", "UKOILCASH"):
         return "UKOILCASH"
     return normalized
+
+
+def _event_symbol(symbol: str) -> str:
+    normalized = base_symbol(symbol.split(".", 1)[0].strip().upper().removesuffix("M"))
+    return "XAGUSD" if normalized in ("SILVER", "SILVERM") else normalized
+
+
+def market_event_window(symbol: str | None, now: str | datetime | None) -> EventWindow | None:
+    normalized = None if symbol is None else _event_symbol(symbol)
+    return event_window_for(normalized, now if isinstance(now, datetime) else _as_utc_dt(now))
+
+
+def apply_event_order_limits(candidate: dict[str, Any], allowed_lots: float, cutoff: int) -> None:
+    expiration = candidate.get("expiration") or cutoff
+    candidate.update(
+        lots=allowed_lots, lot_scale=EVENT_LOT_SCALE, tp_split=False,
+        expiration=min(expiration, cutoff), event_cutoff=cutoff,
+    )
+
+
+def reduced_window_rejection(input_: dict[str, Any], symbol: str) -> str | None:
+    if input_.get("dualDirection") is True:
+        return "event.dual_pending_not_allowed"
+    if input_.get("isAddOn") is True or input_.get("sourceStrategy") == "scale_in":
+        return "event.add_on_not_allowed"
+
+    side = str(input_["plan"].get("side") or "").lower()
+    for position in _get(_get(input_, "state", {}), "positions", []):
+        if _get(position, "ticket", 0) <= 0 or _get(position, "lots", 0) <= 0:
+            continue
+        if _event_symbol(str(position.get("symbol") or symbol)) != symbol:
+            continue
+        order_type = str(position.get("type") or "").upper()
+        order_class = str(position.get("order_class") or "").lower()
+        if order_class == "pending" or order_type.endswith(("_LIMIT", "_STOP")):
+            if input_.get("isPending") is True:
+                return "event.dual_pending_not_allowed"
+        elif position_side(order_type) == side:
+            return "event.add_on_not_allowed"
+    return None
 
 
 def metadata_for(symbol: str) -> dict[str, Any]:
@@ -514,6 +560,19 @@ def evaluate_risk_gate(input_: dict[str, Any]) -> dict[str, Any]:
         result["reasonCodes"].append("action.non_executable")
         return result
 
+    raw_symbol = str(plan.get("symbol") or "")
+    window = market_event_window(raw_symbol, now) if mode in ("approve", "modify") else None
+    if window is not None and window.stage == "blackout":
+        result.update(status="rejected", reasonCodes=[window.code])
+        return result
+
+    if window is not None and window.stage == "reduced" and mode == "approve":
+        if reason := reduced_window_rejection(input_, _event_symbol(raw_symbol)):
+            result.update(status="rejected", reasonCodes=[reason])
+            return result
+        result.update(lotScale=EVENT_LOT_SCALE, eventCutoff=int(window.event.blackout_start.timestamp()))
+        result["reasonCodes"].append(window.code)
+
     meta = metadata_for(symbol)
     tradeability_rejects = collect_tradeability_rejects(input_, now, meta)
     if tradeability_rejects:
@@ -534,6 +593,17 @@ def evaluate_risk_gate(input_: dict[str, Any]) -> dict[str, Any]:
     if validation["rejects"]:
         result["status"] = "rejected"
         result["reasonCodes"].extend(validation["rejects"])
+        return result
+    if "lotScale" in result:
+        min_lots = 0.10 if "#" in raw_symbol or raw_symbol.strip().upper().endswith("M") else meta["minLot"]
+        base_lots = min(validation["allowedLots"], validation["maxRiskLots"], validation["maxMarginLots"])
+        scaled_lots = round_down_lot(base_lots * EVENT_LOT_SCALE, meta["lotStep"])
+        result["allowedLots"] = scaled_lots
+        if scaled_lots < min_lots:
+            result["status"] = "rejected"
+            result["reasonCodes"].append("lots.below_min_after_scale")
+        else:
+            result["status"] = "clamped"
         return result
     if validation["clamped"]:
         result["status"] = "clamped"
@@ -596,5 +666,10 @@ def evaluate_market_filters(input_: dict[str, Any]) -> dict[str, Any]:
     bars = _get(_get(state, "bars", {}), "M30", None)
     if has_atr_expansion(bars if isinstance(bars, list) else []):
         add("volatility.atr_expansion", "warning")
+
+    window = market_event_window(str(symbol_raw or ""), now)
+    if window is not None:
+        add(window.code, "blocking" if window.stage == "blackout" else "warning")
+        result["event_window"] = window.context()
 
     return result
