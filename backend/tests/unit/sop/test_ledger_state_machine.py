@@ -180,8 +180,98 @@ def test_reconcile_m15_strictly_preserves_htf_anchor_and_never_leaves_orphan_pla
 
     prompt_txt = format_ledger_prompt_block(htf_ledger, role="m15_entry")
     assert "HARD PREMISE FOR M15 ENTRY" in prompt_txt
+    assert "htf" not in prompt_txt.lower()
     assert "4080.0" in prompt_txt
     assert empty_watch_ledger("acc-1", "xauusd")["symbol"] == "XAUUSD"
+
+
+def test_intraday_uses_h1_h4_only_without_atr_budget_or_htf_abbr() -> None:
+    from backend.agents.agents.comprehensive_analyst import _build_sop_context, _format_sop_realtime_section
+
+    payload = {
+        "market": {"bid": 3620.0, "ask": 3620.5},
+        "trend_context": {
+            "d1_direction": "BULL",
+            "h4_direction": "BEAR",
+            "h1_direction": "BEAR",
+            "m30_direction": "BEAR",
+            "consensus_direction": "BEAR",
+            "consensus_strength": 0.7,
+        },
+        "daily_structure": {"status": "ok", "macro_bias": "bullish_breakout", "prior_major_high": 3800.0},
+        "day_range": {
+            "status": "ok",
+            "realized_range": 95.0,
+            "expected_atr": 70.0,
+            "atr_consumed_pct": 135.7,
+            "expansion_stage": "extended",
+            "range_exhausted": True,
+        },
+        "confluence_levels": [
+            {"price": 3800.0, "role": "resistance", "tier": "core", "sources": ["D1_PDH_PDL"]},
+            {"price": 3645.0, "role": "resistance", "tier": "core", "sources": ["H4_SWING", "H1_SWING"]},
+            {"price": 3598.0, "role": "support", "tier": "core", "sources": ["H1_SMC"]},
+        ],
+    }
+
+    intraday_prompt = _format_sop_realtime_section(payload, {"analysisRole": "htf_anchor"})
+    assert "ATR Budget" not in intraday_prompt
+    assert "exhausted=" not in intraday_prompt
+    assert "D1 Structure" not in intraday_prompt
+    assert "1H/4H" in intraday_prompt
+    assert "3645.0" in intraday_prompt
+    assert "3800.0" not in intraday_prompt
+    assert "htf" not in intraday_prompt.lower()
+
+    # D1 方向是 BULL，但 1H/4H 是 BEAR，中性仲裁下日内方向应取 1H/4H (short)，不被 D1 覆盖
+    sop_ctx = _build_sop_context(
+        result={"technical": {"bias": "neutral"}, "risk": {}, "arbitration": {"final_direction": "hold"}},
+        payload=payload,
+        options={"analysisRole": "htf_anchor"},
+    )
+    assert sop_ctx["intraday_direction"] == "short"
+    assert sop_ctx["macro_bias"] == "bearish"
+    assert sop_ctx["daily_structure"] is None
+    assert "day_range" not in sop_ctx
+    assert sop_ctx["veto_boundary"] is not None
+    assert "htf" not in sop_ctx["veto_boundary"]["reason"].lower()
+
+    reconciled = reconcile_ledger_after_review(
+        None,
+        account_id="81124211",
+        symbol="GOLDM#",
+        role="htf_anchor",
+        review_result={"bias": "neutral", "confidence": 70, "sop_context": sop_ctx},
+        daily_structure=payload["daily_structure"],
+        confluence_levels=payload["confluence_levels"],
+        current_price=3620.0,
+    )
+    assert "htf" not in reconciled["htf_anchor"]["veto_boundary"]["reason"].lower()
+    assert "htf" not in reconciled["playbooks"][0]["name"].lower()
+    assert "htf" not in reconciled["playbooks"][0]["trigger_condition"].lower()
+
+    # 收盘后日/周复盘角色才会注入 D1 Structure 与对应复盘统计（同样没有 ATR Budget）
+    daily_prompt = _format_sop_realtime_section(
+        payload,
+        {
+            "analysisRole": "daily_close_review",
+            "patrolContext": {"daily_recap": {"status": "ok", "trade_date": "2026-11-23", "close": 3635.6}},
+        },
+    )
+    assert "D1 Structure" in daily_prompt
+    assert "Daily Close Recap" in daily_prompt
+    assert "ATR Budget" not in daily_prompt
+
+    weekly_prompt = _format_sop_realtime_section(
+        payload,
+        {
+            "analysisRole": "weekly_close_review",
+            "patrolContext": {"weekly_recap": {"status": "ok", "iso_week": "2026-W47", "week_close": 3660.0}},
+        },
+    )
+    assert "D1 Structure" in weekly_prompt
+    assert "Weekly Close Recap" in weekly_prompt
+    assert "ATR Budget" not in weekly_prompt
 
 
 def test_htf_hold_with_bearish_bias_preserves_short_direction_compact_veto_and_armed_playbook() -> None:

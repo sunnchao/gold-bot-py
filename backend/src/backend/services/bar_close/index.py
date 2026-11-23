@@ -67,7 +67,7 @@ class BarCloseEventService:
 
     def _trigger_for(self, timeframe: str) -> AnalysisTrigger | None:
         if self._patrol_trigger is not None:
-            if timeframe in (TRIGGER_TIMEFRAME, "H1", "H4"):
+            if timeframe in (TRIGGER_TIMEFRAME, "H1", "H4", "D1"):
                 return self._patrol_trigger
             return None
         if timeframe == TRIGGER_TIMEFRAME:

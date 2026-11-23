@@ -72,6 +72,7 @@ class AnalysisGraphState(TypedDict, total=False):
     duration: NotRequired[int | None]
     durations: NotRequired[dict[str, int] | None]
     skipFeishu: NotRequired[bool | None]
+    skipPublish: NotRequired[bool | None]
     forceAnalyze: NotRequired[bool | None]
     analysisRole: NotRequired[str | None]
     previousLedger: NotRequired[dict[str, Any] | None]

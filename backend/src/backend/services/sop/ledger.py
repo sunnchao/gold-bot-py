@@ -619,11 +619,7 @@ def reconcile_ledger_after_review(
             working["key_levels"] = refreshed_levels
 
         anchor = dict(working["htf_anchor"])
-        macro_bias = str(
-            sop_ctx.get("macro_bias")
-            or (daily_structure or {}).get("macro_bias")
-            or bias
-        ).lower()
+        macro_bias = str(sop_ctx.get("macro_bias") or bias).lower()
         intraday_dir = (
             _direction_from_bias(sop_ctx.get("intraday_direction"))
             or _direction_from_bias(bias)
@@ -657,12 +653,6 @@ def reconcile_ledger_after_review(
             for x in (sop_ctx.get("long_term_targets") or [])
             if (lt_val := _to_float(x)) is not None and lt_val > 0
         ]
-        if not long_targets and isinstance(daily_structure, dict):
-            long_targets = [
-                float(t["price"])
-                for t in (daily_structure.get("measured_targets") or [])[:3]
-                if isinstance(t, dict) and (lt_val := _to_float(t.get("price"))) is not None and lt_val > 0
-            ]
 
         raw_veto = sop_ctx.get("veto_boundary")
         has_valid_veto = False
@@ -675,13 +665,13 @@ def reconcile_ledger_after_review(
         veto: dict[str, Any]
         if has_valid_veto and isinstance(raw_veto, dict):
             veto = dict(raw_veto)
-            veto["reason"] = _compact_text(veto.get("reason") or "HTF 结构边界", max_len=160)
+            veto["reason"] = _compact_text(veto.get("reason") or "高周期(1H/4H)结构边界", max_len=160)
         elif intraday_dir in ("long", "short"):
             chosen_veto: float | None = None
-            veto_label = "HTF 结构失效止损边界"
+            veto_label = "高周期(1H/4H)结构失效止损边界"
             if stop_loss is not None and _is_protective_level(stop_loss, intraday_dir, current_price):
                 chosen_veto = stop_loss
-                veto_label = "HTF 止损边界"
+                veto_label = "高周期(1H/4H)止损边界"
             else:
                 all_kl: list[float] = []
                 core_kl: list[float] = []
@@ -695,12 +685,14 @@ def reconcile_ledger_after_review(
                 pool = core_kl or all_kl
                 if pool:
                     chosen_veto = max(pool) if intraday_dir == "long" else min(pool)
-                    veto_label = "HTF 共振支撑否决位" if intraday_dir == "long" else "HTF 共振阻力否决位"
+                    veto_label = (
+                        "高周期(1H/4H)共振支撑否决位" if intraday_dir == "long" else "高周期(1H/4H)共振阻力否决位"
+                    )
             veto = {
                 "long_invalid_below": chosen_veto if intraday_dir == "long" else None,
                 "short_invalid_above": chosen_veto if intraday_dir == "short" else None,
                 "reason": _compact_text(
-                    f"{veto_label} {chosen_veto}" if chosen_veto is not None else "HTF 结构失效止损边界",
+                    f"{veto_label} {chosen_veto}" if chosen_veto is not None else "高周期(1H/4H)结构失效止损边界",
                     max_len=160,
                 ),
             }
@@ -708,7 +700,10 @@ def reconcile_ledger_after_review(
             veto = {
                 "long_invalid_below": None,
                 "short_invalid_above": None,
-                "reason": _compact_text(sop_ctx.get("veto_reason") or "HTF 结构失效止损边界", max_len=160),
+                "reason": _compact_text(
+                    sop_ctx.get("veto_reason") or "高周期(1H/4H)结构失效止损边界",
+                    max_len=160,
+                ),
             }
 
         anchor.update(
@@ -718,7 +713,7 @@ def reconcile_ledger_after_review(
                 "short_term_targets": short_targets,
                 "long_term_targets": long_targets,
                 "veto_boundary": veto,
-                "vacuum_zone": (daily_structure or {}).get("vacuum_zone") or anchor.get("vacuum_zone"),
+                "vacuum_zone": anchor.get("vacuum_zone"),
                 "rationale": _compact_text(
                     sop_ctx.get("htf_rationale") or review_result.get("alert_reason") or "",
                     max_len=240,
@@ -811,11 +806,11 @@ def reconcile_ledger_after_review(
         had_prior = bool(working["playbooks"])
         fallback_pb: dict[str, Any] = {
             "id": f"pb-rearmed-{len(working['playbooks']) + 1}" if had_prior else "pb-primary-1",
-            "name": "HTF 锚定自动观察剧本",
+            "name": "高周期(1H/4H)锚定自动观察剧本",
             "role": "primary",
             "direction": fallback_dir,
             "state": "rearmed" if had_prior else "armed",
-            "trigger_condition": f"围绕 HTF {fallback_dir} 方向等待 M15 结构确认入场",
+            "trigger_condition": f"围绕高周期(1H/4H) {fallback_dir} 方向等待 M15 结构确认入场",
             "trigger_zone": {"level": anchor_px, "op": ">=" if fallback_dir == "long" else "<="}
             if anchor_px is not None
             else None,
@@ -875,10 +870,17 @@ def is_material_change(prev_ledger: dict[str, Any] | None, next_ledger: dict[str
 
 def format_ledger_prompt_block(ledger: dict[str, Any] | None, *, role: str) -> str:
     """将持久化 WatchLedger 格式化为注入 LLM 提示词的增量记忆与前提约束块。"""
+    role_display_map = {
+        "htf_anchor": "higher_timeframe_1h_4h_direction",
+        "m15_entry": "m15_entry_timing",
+        "daily_close_review": "daily_close_review",
+        "weekly_close_review": "weekly_close_review",
+    }
+    display_role = role_display_map.get(role, role)
     if not isinstance(ledger, dict):
         return (
             "## WATCH LEDGER MEMORY\n"
-            f"- Analysis Role: {role}\n"
+            f"- Analysis Role: {display_role}\n"
             "- Status: Initial baseline (no prior WatchLedger persisted yet)."
         )
 
@@ -886,16 +888,13 @@ def format_ledger_prompt_block(ledger: dict[str, Any] | None, *, role: str) -> s
     anchor: dict[str, Any] = raw_anchor if isinstance(raw_anchor, dict) else {}
     lines: list[str] = [
         "## WATCH LEDGER MEMORY (INCREMENTAL PREMISE)",
-        f"- Analysis Role: `{role}` | Ledger Version: {ledger.get('version', 0)} | "
-        f"HTF Reviewed: {ledger.get('htf_reviewed_at') or 'N/A'}",
-        f"- HTF Macro Bias: {anchor.get('macro_bias', 'neutral')} | "
+        f"- Analysis Role: `{display_role}` | Ledger Version: {ledger.get('version', 0)} | "
+        f"Higher-Timeframe (1H/4H) Reviewed: {ledger.get('htf_reviewed_at') or 'N/A'}",
+        f"- Higher-Timeframe (1H/4H) Trend Bias: {anchor.get('macro_bias', 'neutral')} | "
         f"Intraday Direction Premise: **{anchor.get('intraday_direction', 'wait')}**",
-        f"- Short-Term Targets: {anchor.get('short_term_targets') or []} | "
-        f"Long-Term Targets: {anchor.get('long_term_targets') or []}",
+        f"- Short-Term Targets: {anchor.get('short_term_targets') or []}",
         f"- Veto Boundary: {anchor.get('veto_boundary')}",
     ]
-    if anchor.get("vacuum_zone"):
-        lines.append(f"- D1 Vacuum Zone: {anchor['vacuum_zone']}")
 
     key_levels = [k for k in (ledger.get("key_levels") or []) if isinstance(k, dict)]
     if key_levels:
@@ -922,15 +921,16 @@ def format_ledger_prompt_block(ledger: dict[str, Any] | None, *, role: str) -> s
 
     if role == "m15_entry":
         lines.append(
-            "- HARD PREMISE FOR M15 ENTRY: Treat HTF Intraday Direction Premise, Short/Long Targets, and "
-            "Veto Boundary above as binding constraints. Focus on M15 entry timing/retest/breakout trigger "
-            "and precise SL/TP; do NOT reverse HTF direction without double-evidence breach of the Veto Boundary."
+            "- HARD PREMISE FOR M15 ENTRY: Treat Higher-Timeframe (1H/4H) Intraday Direction Premise, "
+            "Short-Term Targets, and Veto Boundary above as binding constraints. Focus on M15 entry timing/"
+            "retest/breakout trigger and precise SL/TP; do NOT reverse 1H/4H direction without "
+            "double-evidence breach of the Veto Boundary, and never refuse entries due to daily ATR budget."
         )
     elif role == "htf_anchor":
         lines.append(
-            "- HTF ANCHOR INSTRUCTION: Review whether existing anchor thesis & playbooks remain valid or "
-            "have become exhausted/invalidated; update macro/intraday direction, targets, veto boundary, "
-            "and maintain primary + backup playbooks with explicit invalidation prices."
+            "- HIGHER-TIMEFRAME (1H/4H) DIRECTION INSTRUCTION: Use 1H and 4H data as the primary basis for "
+            "intraday overall trend direction, targets, veto boundary, and playbooks. Do NOT refuse entries "
+            "due to daily ATR budget exhaustion, and never output the abbreviation HTF."
         )
 
     return "\n".join(lines)

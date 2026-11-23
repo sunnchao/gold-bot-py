@@ -229,6 +229,69 @@ def test_compose_blocks_counter_htf_m15_and_exhausted_logic_unless_double_eviden
     assert counter_buy.sop_context is not None
     assert "sop.m15_counter_htf_blocked" in counter_buy.sop_context["sop_blocks"]
 
+    # 5. 已移除日 ATR 预算耗尽限制: 即使 payload["day_range"]["range_exhausted"]=True 也不再拦截顺势开仓
+    atr_unblocked = compose_final_signal(
+        {
+            "accountId": "acc-1",
+            "symbol": "XAGUSD",
+            "analysisRole": "m15_entry",
+            "previousLedger": {
+                **ledger,
+                "playbooks": [{"id": "pb-1", "state": "exhausted", "direction": "long"}],
+            },
+            "payload": {"day_range": {"status": "ok", "atr_consumed_pct": 140.0, "range_exhausted": True}},
+            "patrolContext": {"trigger_reasons": ["m15_close"]},
+            "technicalAnalysis": TechnicalAnalysis(
+                bias="bullish",
+                confidence=80,
+                phase="trending",
+                indicators_summary="M15 continuation",
+                support_levels=[],
+                resistance_levels=[],
+                recommendation="none",
+                rationale="M15 continuation",
+            ),
+            "arbitration": ArbitrationResult(
+                final_direction="buy",
+                action="open",
+                confidence=82,
+                reasoning="顺高周期多头方向入场",
+                phase="markup",
+                primary_contradiction="none",
+                united_front_analysis="none",
+                trade_recommendation=TradeRecommendation(
+                    direction="buy",
+                    entry_price=64.0,
+                    stop_loss=63.2,
+                    take_profit_1=65.2,
+                    take_profit_2=None,
+                    risk_reward_ratio=1.5,
+                    position_size_lots=0.1,
+                    rationale="M15顺势回踩买入",
+                ),
+            ),
+        }
+    )
+    assert atr_unblocked is not None
+    assert atr_unblocked.arbitration is not None
+    assert atr_unblocked.arbitration["action"] == "open"
+    assert atr_unblocked.trade_plan is not None
+
+    # 6. 收盘后日/周复盘角色绝不产出可下单 trade_plan
+    daily_review_sig = compose_final_signal(
+        {
+            "accountId": "acc-1",
+            "symbol": "XAGUSD",
+            "analysisRole": "daily_close_review",
+            "previousLedger": ledger,
+            "technicalAnalysis": tech,
+            "arbitration": arb,
+        }
+    )
+    assert daily_review_sig is not None
+    assert daily_review_sig.trade_plan is None
+    assert "sop.m15_counter_htf_blocked" not in (daily_review_sig.sop_context or {}).get("sop_blocks", [])
+
 
 async def test_sqlite_closed_loop_replay_and_admin_endpoints(tmp_path) -> None:
     db_path = tmp_path / "sop_replay.db"

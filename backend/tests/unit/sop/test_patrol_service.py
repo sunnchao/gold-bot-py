@@ -566,3 +566,122 @@ async def test_default_snapshot_unblocks_live_tick_and_runs_m15_when_always_run_
     assert res["m15_ran"] is True
     assert calls == ["m15_entry"]
     assert len(feishu.messages) == 1
+
+
+async def test_daily_and_weekly_close_reviews_trigger_dedupe_and_skip_inactive() -> None:
+    store = InMemoryEaStore()
+    feishu = FakeFeishu()
+    clock = [datetime(2026, 11, 20, 22, 10, tzinfo=UTC)]  # 周五收盘后 10 分钟
+
+    await store.save_heartbeat(
+        {
+            "account_id": "81124211",
+            "connected": True,
+            "market_open": False,  # 周五收盘后市场关闭, 但仍在最近 48 小时活跃心跳内
+            "is_trade_allowed": False,
+            "last_heartbeat_at": (clock[0] - timedelta(minutes=20)).isoformat().replace("+00:00", "Z"),
+        }
+    )
+    await store.save_heartbeat(
+        {
+            "account_id": "90011087",
+            "connected": True,
+            "market_open": False,
+            "last_heartbeat_at": "2026-11-10T00:00:00Z",  # 过期非活跃账户
+        }
+    )
+
+    d1_bars = [
+        {"time": "2026-11-12", "open": 3590, "high": 3610, "low": 3580, "close": 3600},
+        {"time": "2026-11-13", "open": 3600, "high": 3620, "low": 3585, "close": 3610},
+        {"time": "2026-11-16", "open": 3610, "high": 3630, "low": 3600, "close": 3620},
+        {"time": "2026-11-17", "open": 3620, "high": 3640, "low": 3610, "close": 3635},
+        {"time": "2026-11-18", "open": 3635, "high": 3645, "low": 3605, "close": 3615},
+        {"time": "2026-11-19", "open": 3615, "high": 3642, "low": 3608, "close": 3638},
+        {"time": "2026-11-20", "open": 3638, "high": 3670, "low": 3632, "close": 3665},
+    ]
+    await store.save_bars({"account_id": "81124211", "symbol": "GOLDM#", "timeframe": "D1", "bars": d1_bars})
+    await store.save_bars(
+        {
+            "account_id": "81124211",
+            "symbol": "GOLDM#",
+            "timeframe": "H4",
+            "bars": [{"time": "2026-11-20T20:00:00Z", "open": 3655, "high": 3670, "low": 3650, "close": 3665}],
+        }
+    )
+    await store.save_bars(
+        {
+            "account_id": "81124211",
+            "symbol": "GOLDM#",
+            "timeframe": "H1",
+            "bars": [{"time": "2026-11-20T21:00:00Z", "open": 3660, "high": 3670, "low": 3658, "close": 3665}],
+        }
+    )
+    await store.save_bars({"account_id": "90011087", "symbol": "GOLDM#", "timeframe": "D1", "bars": d1_bars})
+
+    wf_calls: list[dict[str, Any]] = []
+
+    async def wf_handler(_acc: str, _sym: str, state: dict[str, Any]) -> dict[str, Any]:
+        wf_calls.append(
+            {
+                "role": state.get("analysisRole"),
+                "skipPublish": state.get("skipPublish"),
+                "forceAnalyze": state.get("forceAnalyze"),
+                "patrolContext": state.get("patrolContext"),
+            }
+        )
+        return {
+            "ai_result": {
+                "bias": "bullish",
+                "confidence": 75,
+                "arbitration": {"reasoning": "D1 收盘走强，复盘关注下周延续。"},
+            }
+        }
+
+    patrol = PatrolService(
+        store=store,
+        workflow_service=StubWorkflow(wf_handler),
+        alert_router=AlertRouter(feishu=feishu, now_fn=lambda: clock[0]),
+        now_fn=lambda: clock[0],
+    )
+
+    # 1) 非活跃账户应直接跳过
+    inactive_res = await patrol.run_daily_close_review("90011087", "GOLDM#", bar_time="2026-11-20")
+    assert inactive_res["status"] == "skipped"
+    assert inactive_res["reason"] == "inactive_account"
+
+    # 2) 周四 D1 收盘 -> 仅触发每日收盘复盘，不触发每周收盘复盘
+    thu_res = await patrol.handle_d1_bar_close("81124211", "GOLDM#", bar_time="2026-11-19")
+    assert thu_res["daily_review"]["status"] == "ok"
+    assert thu_res["weekly_review"] is None
+    assert [c["role"] for c in wf_calls] == ["daily_close_review"]
+    assert wf_calls[0]["skipPublish"] is True
+    assert wf_calls[0]["forceAnalyze"] is True
+    assert len(feishu.messages) == 1
+    assert "每日收盘日内走势复盘" in feishu.messages[0]["title"]
+    # 收盘复盘绝不创建或覆盖日内盯盘账本，也不下单
+    assert await store.get_watch_ledger("81124211", "GOLDM#") is None
+    assert await store.list_commands("81124211") == []
+
+    # 3) 周五收盘后定时窗口 check_post_close_reviews -> 触发周五每日 + 每周复盘各 1 次
+    post_res = await patrol.check_post_close_reviews("81124211", "GOLDM#", now=clock[0])
+    assert post_res["daily_review"]["status"] == "ok"
+    assert post_res["weekly_review"]["status"] == "ok"
+    assert [c["role"] for c in wf_calls[-2:]] == ["daily_close_review", "weekly_close_review"]
+    assert len(feishu.messages) == 3
+    assert "每日收盘日内走势复盘" in feishu.messages[1]["title"]
+    assert "每周收盘周内走势复盘" in feishu.messages[2]["title"]
+
+    # 4) 周一新 D1 K线推入周五 bar_time 时不再重复推送
+    await store.save_bars(
+        {
+            "account_id": "81124211",
+            "symbol": "GOLDM#",
+            "timeframe": "D1",
+            "bars": [*d1_bars, {"time": "2026-11-23", "open": 3665, "high": 3680, "low": 3655, "close": 3672}],
+        }
+    )
+    dup_res = await patrol.handle_d1_bar_close("81124211", "GOLDM#", bar_time="2026-11-20")
+    assert dup_res["daily_review"]["reason"] == "already_reviewed"
+    assert dup_res["weekly_review"]["reason"] == "already_reviewed"
+    assert len(feishu.messages) == 3

@@ -484,22 +484,25 @@ def build_feishu_card(account_id: str, symbol: str, result: JSONDict) -> JSONDic
 
     if isinstance(result.get("sop_context"), dict):
         sop = result["sop_context"]
+        role_map = {
+            "htf_anchor": "高周期(1H/4H)日内方向锚定",
+            "m15_entry": "M15 入场切入",
+            "daily_close_review": "每日收盘日内走势复盘",
+            "weekly_close_review": "每周收盘周内走势复盘",
+        }
+        raw_role = str(sop.get("analysis_role") or "standard")
+        role_label = role_map.get(raw_role, raw_role)
         sop_lines = [
-            "**🧭 SOP 增量记忆 & 盯盘框架:**",
-            f"角色层级: `{sop.get('analysis_role', 'standard')}` | 宏观偏置: {sop.get('macro_bias')} "
+            "**🧭 多周期协同与盯盘框架:**",
+            f"角色层级: `{role_label}` | 高周期偏向: {sop.get('macro_bias')} "
             f"| 日内前提: {sop.get('intraday_direction')}",
             f"短期目标: {sop.get('short_term_targets') or []} | 长期目标: {sop.get('long_term_targets') or []}",
         ]
         if sop.get("veto_boundary"):
-            sop_lines.append(f"否决边界: {sop['veto_boundary']}")
-        if isinstance(sop.get("day_range"), dict) and sop["day_range"].get("status") == "ok":
-            dr = sop["day_range"]
-            sop_lines.append(
-                f"当日振幅: {dr.get('realized_range')} "
-                f"({dr.get('atr_consumed_pct')}% ATR / {dr.get('expansion_stage')})"
-            )
+            veto_txt = re.sub(r"\bhtf\b", "高周期(1H/4H)", str(sop["veto_boundary"]), flags=re.IGNORECASE)
+            sop_lines.append(f"否决边界: {veto_txt}")
         if sop.get("sop_blocks"):
-            sop_lines.append(f"SOP 拦截标记: {', '.join(sop['sop_blocks'])}")
+            sop_lines.append(f"规则拦截标记: {', '.join(sop['sop_blocks'])}")
         analysis_sections.append({"tag": "div", "text": {"tag": "lark_md", "content": "\n".join(sop_lines)}})
 
     analysis_sections.append({"tag": "hr"})

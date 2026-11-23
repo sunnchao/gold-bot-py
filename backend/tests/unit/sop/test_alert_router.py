@@ -8,9 +8,11 @@ from typing import Any
 
 from backend.services.sop.alerts import AlertRouter, SopFeishuSender
 from backend.services.sop.cards import (
+    build_daily_close_review_card,
     build_htf_review_card,
     build_m15_review_card,
     build_patrol_cycle_card,
+    build_weekly_close_review_card,
 )
 
 
@@ -244,13 +246,27 @@ async def test_sop_feishu_sender_validates_code_retries_and_passes_card() -> Non
     assert out_fail["reason"] == "delivery_failed"
     assert any("code=19021" in line for line in logs)
 
-    # 3) M15 拦截卡片格式正确
-    m_title, _, m_card = build_m15_review_card(
+    # 3) M15 拦截卡片格式正确且全部卡片不含 HTF 缩写
+    assert "htf" not in json.dumps(card, ensure_ascii=False).lower()
+    assert "htf" not in md.lower()
+    assert "htf" not in json.dumps(p_card, ensure_ascii=False).lower()
+
+    m_title, m_md, m_card = build_m15_review_card(
         account_id="81124211",
         symbol="GOLDM#",
         current_price=3620.0,
-        ledger={"version": 6, "htf_anchor": {"intraday_direction": "short"}},
-        ai_result={"sop_context": {"sop_blocks": ["sop.m15_counter_htf_blocked"]}, "confidence": 65},
+        ledger={
+            "version": 6,
+            "htf_anchor": {
+                "intraday_direction": "short",
+                "veto_boundary": {"short_invalid_above": 3655.0, "reason": "HTF 计划止损边界 3655"},
+            },
+        },
+        ai_result={
+            "arbitration": {"reasoning": "HTF 结构维持空头"},
+            "sop_context": {"sop_blocks": ["sop.m15_counter_htf_blocked"]},
+            "confidence": 65,
+        },
         trigger_reasons=["m15_close"],
         is_actionable=False,
         side_label="",
@@ -259,3 +275,75 @@ async def test_sop_feishu_sender_validates_code_retries_and_passes_card() -> Non
     )
     assert "逆势拦截" in m_title
     assert m_card["header"]["template"] == "orange"
+    assert "htf" not in json.dumps(m_card, ensure_ascii=False).lower()
+    assert "htf" not in m_md.lower()
+
+    # 4) 每日收盘 & 每周收盘复盘卡片格式正确且不含 HTF 缩写
+    d_title, d_md, d_card = build_daily_close_review_card(
+        account_id="81124211",
+        symbol="GOLDM#",
+        daily_recap={
+            "status": "ok",
+            "trade_date": "2026-11-23",
+            "open": 3557.91,
+            "high": 3689.61,
+            "low": 3553.75,
+            "close": 3635.63,
+            "net_change": 77.72,
+            "change_pct": 2.18,
+            "amplitude": 135.86,
+            "candle_type": "阳线收涨",
+            "prev_high": 3636.52,
+            "prev_low": 3502.76,
+            "vs_prev_day": "突破前日高点",
+        },
+        daily_structure={
+            "status": "ok",
+            "macro_bias": "bullish",
+            "prior_major_high": 3890.0,
+            "prior_major_low": 3502.76,
+        },
+        ai_result={"arbitration": {"reasoning": "日线收复失地并突破前日高点，明日关注回踩支撑。"}},
+        execution_mode="advisory_only",
+        now=clock[0],
+    )
+    assert "每日收盘日内走势复盘" in d_title
+    assert d_card["header"]["template"] == "green"
+    assert "htf" not in json.dumps(d_card, ensure_ascii=False).lower()
+    assert "htf" not in d_md.lower()
+
+    w_title, w_md, w_card = build_weekly_close_review_card(
+        account_id="81124211",
+        symbol="GOLDM#",
+        weekly_recap={
+            "status": "ok",
+            "iso_week": "2026-W47",
+            "week_start_date": "2026-11-16",
+            "week_end_date": "2026-11-20",
+            "trading_days_count": 5,
+            "week_open": 3600.0,
+            "week_high": 3665.0,
+            "week_low": 3550.0,
+            "week_close": 3580.0,
+            "net_change": -20.0,
+            "change_pct": -0.56,
+            "week_range": 115.0,
+            "weekly_candle_type": "周线收阴",
+            "up_days": 2,
+            "down_days": 3,
+            "vs_prev_week": "上周区间内震荡",
+            "daily_breakdown": [{"date": "2026-11-16", "open": 3600.0, "close": 3620.0, "change_pct": 0.56}],
+        },
+        daily_structure={
+            "status": "ok",
+            "macro_bias": "bearish",
+            "measured_targets": [{"ratio": 1.0, "price": 3480.0}],
+        },
+        ai_result={"arbitration": {"reasoning": "本周先扬后抑周线收阴，下周关注前低支撑表现。"}},
+        execution_mode="advisory_only",
+        now=clock[0],
+    )
+    assert "每周收盘周内走势复盘" in w_title
+    assert w_card["header"]["template"] == "red"
+    assert "htf" not in json.dumps(w_card, ensure_ascii=False).lower()
+    assert "htf" not in w_md.lower()

@@ -219,7 +219,9 @@ class SchedulerService:
         now_iso = self._now_iso()
         for account_id in await self._store.list_account_ids():
             hb = await self._get_heartbeat(account_id)
-            if not self._is_patrol_eligible_account(hb, now_iso):
+            patrol_eligible = self._is_patrol_eligible_account(hb, now_iso)
+            post_close_eligible = self._is_post_close_eligible_account(hb, now_iso)
+            if not patrol_eligible and not post_close_eligible:
                 continue
             reg = await self._get_registration(account_id)
             seen_syms: set[str] = set()
@@ -233,6 +235,18 @@ class SchedulerService:
                 if norm and norm not in seen_syms:
                     seen_syms.add(norm)
                     symbols.append(raw_sym)
+            if not patrol_eligible:
+                post_fn = getattr(self._patrol, "check_post_close_reviews", None)
+                if callable(post_fn):
+                    for symbol in symbols:
+                        try:
+                            await post_fn(account_id, symbol)
+                        except Exception as exc:  # noqa: BLE001
+                            print(
+                                f"[SOP] post-close review error account={account_id} "
+                                f"symbol={symbol} err={exc}"
+                            )
+                continue
             cycle_results: list[dict[str, Any]] = []
             for symbol in symbols:
                 try:
@@ -250,6 +264,15 @@ class SchedulerService:
                             "summary": str(exc),
                         }
                     )
+                post_fn = getattr(self._patrol, "check_post_close_reviews", None)
+                if callable(post_fn):
+                    try:
+                        await post_fn(account_id, symbol)
+                    except Exception as exc:  # noqa: BLE001
+                        print(
+                            f"[SOP] post-close review error account={account_id} "
+                            f"symbol={symbol} err={exc}"
+                        )
             if cycle_results:
                 notify_fn = getattr(self._patrol, "notify_patrol_cycle", None)
                 if callable(notify_fn):
@@ -328,6 +351,14 @@ class SchedulerService:
                 ttl_seconds=self._active_account_ttl_seconds,
                 require_timestamp=True,
             )
+        )
+
+    def _is_post_close_eligible_account(self, heartbeat: EaRecord, now_iso: str) -> bool:
+        return is_heartbeat_active(
+            heartbeat,
+            now=now_iso,
+            ttl_seconds=max(self._active_account_ttl_seconds, 48 * 3600),
+            require_timestamp=True,
         )
 
     async def _can_run_live_analysis(self, account_id: str) -> bool:

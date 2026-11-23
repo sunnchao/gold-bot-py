@@ -840,36 +840,26 @@ async def analysis_payload(store: EaStore, account_id: str, symbol: str, timesta
     ref_price = number_field(latest_tick, "bid") or number_field(latest_tick, "ask")
     trend_ctx = trend_context(trend_bars)
     h1_bars = enriched.get("H1") or []
-    h1_atr_raw = h1_bars[-1].get("atr") if h1_bars and isinstance(h1_bars[-1], dict) else None
-    h1_atr = float(h1_atr_raw) if isinstance(h1_atr_raw, (int, float)) else None
     d1_atr_raw = enriched_d1[-1].get("atr") if enriched_d1 and isinstance(enriched_d1[-1], dict) else None
     d1_atr = float(d1_atr_raw) if isinstance(d1_atr_raw, (int, float)) else None
 
     from backend.agents.tools.market_structure_sop import (
         analyze_daily_vacuum,
         build_confluence_levels,
-        compute_day_range,
     )
 
     daily_structure = analyze_daily_vacuum(enriched_d1, ref_price, atr_d1=d1_atr)
+    # 日内关键位与方向锚定重点使用 4H 与 1H 数据; D1 专用于每日/每周收盘复盘, 不纳入日内振幅限制。
     confluence_levels = build_confluence_levels(
         symbol,
-        d1_bars=enriched_d1,
+        d1_bars=None,
         h4_bars=enriched.get("H4"),
         h1_bars=h1_bars,
         m15_bars=enriched.get("M15"),
         smc_data=smc_context,
-        trend_context=trend_ctx,
-        daily_structure=daily_structure,
+        trend_context=None,
+        daily_structure=None,
         current_price=ref_price,
-    )
-    day_range = compute_day_range(
-        symbol,
-        enriched_d1,
-        h1_bars,
-        ref_price,
-        atr_d1=d1_atr,
-        atr_h1=h1_atr,
     )
     watch_ledger = await store.get_watch_ledger(account_id, symbol)
     return {
@@ -924,7 +914,7 @@ async def analysis_payload(store: EaStore, account_id: str, symbol: str, timesta
         "trend_context": trend_ctx,
         "daily_structure": daily_structure,
         "confluence_levels": confluence_levels,
-        "day_range": day_range,
+        "day_range": None,
         "watch_ledger": watch_ledger,
     }
 

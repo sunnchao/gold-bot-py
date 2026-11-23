@@ -64,6 +64,11 @@ def route_after_fetch(state: AnalysisGraphState) -> Literal["error", "skip", "an
 
 def route_after_arbitration(state: AnalysisGraphState) -> Literal["publish", "skip_publish"]:
     """Route after the composeSignal node (mirror of routeAfterArbitration)."""
+    if state.get("skipPublish") is True:
+        return "skip_publish"
+    if state.get("analysisRole") in ("daily_close_review", "weekly_close_review"):
+        return "skip_publish"
+
     final_signal = state.get("finalSignal")
     if final_signal is not None and _field(final_signal, "arbitration") is not None:
         return "publish"

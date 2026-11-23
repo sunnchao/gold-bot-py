@@ -419,8 +419,11 @@ class WorkflowNodes:
                     all_current_prices[sym] = price
 
             sop_options: dict[str, Any] = {}
-            if state.get("analysisRole") is not None:
-                sop_options["analysisRole"] = state.get("analysisRole")
+            analysis_role = state.get("analysisRole")
+            if analysis_role is not None:
+                sop_options["analysisRole"] = analysis_role
+                if analysis_role in ("daily_close_review", "weekly_close_review"):
+                    sop_options["skipTradeAction"] = True
             if state.get("previousLedger") is not None:
                 sop_options["previousLedger"] = state.get("previousLedger")
             if state.get("patrolContext") is not None:

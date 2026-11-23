@@ -72,7 +72,11 @@ async def trigger_patrol_on_bar_close(account_id: str, symbol: str, timeframe: s
     if sop_patrol is None:
         await trigger_llm_analysis(account_id, symbol, timeframe, bar_time)
         return
-    ttype = "m15_close" if timeframe.strip().upper() == "M15" else f"{timeframe.strip().lower()}_close"
+    norm_tf = timeframe.strip().upper()
+    if norm_tf == "D1":
+        await sop_patrol.handle_d1_bar_close(account_id, symbol, bar_time=bar_time)
+        return
+    ttype = "m15_close" if norm_tf == "M15" else f"{norm_tf.lower()}_close"
     await sop_patrol.run_patrol(account_id, symbol, trigger_type=ttype)
 
 

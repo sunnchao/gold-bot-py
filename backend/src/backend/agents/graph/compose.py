@@ -630,15 +630,17 @@ def compose_final_signal(state: AnalysisGraphState) -> AISignalResult | None:
 
     sop_blocks: list[str] = []
     analysis_role = state.get("analysisRole")
+    is_post_close_review = analysis_role in ("daily_close_review", "weekly_close_review")
     raw_prev_ledger = state.get("previousLedger")
     prev_ledger: dict[str, Any] | None = raw_prev_ledger if isinstance(raw_prev_ledger, dict) else None
     raw_patrol_ctx = state.get("patrolContext")
     patrol_ctx: dict[str, Any] = raw_patrol_ctx if isinstance(raw_patrol_ctx, dict) else {}
-    payload_day_range = _get(state.get("payload"), "day_range")
     raw_triggers = patrol_ctx.get("trigger_reasons")
     trigger_reasons = [str(r) for r in raw_triggers] if isinstance(raw_triggers, list) else []
 
-    if prev_ledger is not None:
+    if is_post_close_review:
+        trade_plan = dual_trade_plan = None
+    elif prev_ledger is not None:
         raw_anchor = prev_ledger.get("htf_anchor")
         htf_anchor: dict[str, Any] = raw_anchor if isinstance(raw_anchor, dict) else {}
         htf_dir = str(htf_anchor.get("intraday_direction") or "wait").lower()
@@ -676,13 +678,12 @@ def compose_final_signal(state: AnalysisGraphState) -> AISignalResult | None:
                 sop_blocks.append("sop.m15_counter_htf_blocked")
             sop_blocks.append("sop.reverse_missing_double_evidence")
 
-        playbooks = [p for p in (prev_ledger.get("playbooks") or []) if isinstance(p, dict)]
-        all_exhausted = bool(playbooks) and all(str(p.get("state") or "").lower() == "exhausted" for p in playbooks)
-        range_exhausted = isinstance(payload_day_range, dict) and payload_day_range.get("range_exhausted") is True
+        # 仅当剧本目标已全部兑现 ("logic_exhausted") 时拦截 M15 追单;
+        # 已移除日 ATR 预算耗尽 (range_exhausted) 限制。
         if (
             analysis_role == "m15_entry"
             and arb_action == "open"
-            and ("logic_exhausted" in trigger_reasons or (all_exhausted and range_exhausted))
+            and "logic_exhausted" in trigger_reasons
         ):
             sop_blocks.append("sop.logic_exhausted")
 

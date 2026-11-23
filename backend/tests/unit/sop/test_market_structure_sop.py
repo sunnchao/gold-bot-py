@@ -6,6 +6,9 @@ from backend.agents.tools.market_structure_sop import (
     analyze_daily_vacuum,
     build_confluence_levels,
     compute_day_range,
+    is_weekly_close_bar,
+    summarize_daily_close_recap,
+    summarize_weekly_close_recap,
 )
 
 
@@ -106,3 +109,45 @@ def test_build_confluence_levels_promotes_multi_source_levels_for_gold_and_silve
     assert core_65[0]["confluence_count"] >= 2
     assert "D1_PDH_PDL" in core_65[0]["sources"]
     assert "PSYCH_ROUND" in core_65[0]["sources"]
+
+
+def test_daily_and_weekly_close_recap_helpers() -> None:
+    # 2026-11-16 (Mon) ~ 2026-11-20 (Fri), plus 2026-11-23 (Mon, unix seconds) as forming bar
+    d1_bars = [
+        {"time": "2026-11-13", "open": 3590.0, "high": 3620.0, "low": 3580.0, "close": 3600.0},
+        {"time": "2026-11-16", "open": 3600.0, "high": 3630.0, "low": 3595.0, "close": 3625.0},
+        {"time": "2026-11-17", "open": 3625.0, "high": 3640.0, "low": 3610.0, "close": 3635.0},
+        {"time": "2026-11-18", "open": 3635.0, "high": 3645.0, "low": 3605.0, "close": 3615.0},
+        {"time": "2026-11-19", "open": 3615.0, "high": 3638.0, "low": 3608.0, "close": 3630.0},
+        {"time": "2026-11-20", "open": 3630.0, "high": 3665.0, "low": 3628.0, "close": 3660.0},
+        # Next Monday (Unix seconds 2026-11-23T00:00:00Z = 1795392000) forming bar
+        {"time": "1795392000", "open": 3660.0, "high": 3670.0, "low": 3650.0, "close": 3662.0},
+    ]
+
+    assert is_weekly_close_bar(d1_bars, target_bar_time="2026-11-19") is False
+    assert is_weekly_close_bar(d1_bars, target_bar_time="2026-11-20") is True
+
+    daily_fri = summarize_daily_close_recap(d1_bars, target_bar_time="2026-11-20")
+    assert daily_fri["status"] == "ok"
+    assert daily_fri["trade_date"] == "2026-11-20"
+    assert daily_fri["candle_type"] == "阳线收涨"
+    assert daily_fri["vs_prev_day"] == "突破前日高点"
+    assert daily_fri["net_change"] == 30.0
+
+    weekly = summarize_weekly_close_recap(d1_bars, reference_bar_time="2026-11-20")
+    assert weekly["status"] == "ok"
+    assert weekly["iso_week"] == "2026-W47"
+    assert weekly["week_start_date"] == "2026-11-16"
+    assert weekly["week_end_date"] == "2026-11-20"
+    assert weekly["trading_days_count"] == 5
+    assert weekly["week_open"] == 3600.0
+    assert weekly["week_close"] == 3660.0
+    assert weekly["week_high"] == 3665.0
+    assert weekly["week_low"] == 3595.0
+    assert weekly["weekly_candle_type"] == "周线收阳"
+    assert weekly["vs_prev_week"] == "突破上周高点"
+    assert len(weekly["daily_breakdown"]) == 5
+
+    # 节假日周五休市时, 周四同样被识别为本周最后一根收盘 D1
+    holiday_bars = d1_bars[:-2] + [d1_bars[-1]]
+    assert is_weekly_close_bar(holiday_bars, target_bar_time="2026-11-19") is True

@@ -1105,51 +1105,114 @@ def strip_hoisted_market_fields(market: JSONDict) -> JSONDict:
     return {k: v for k, v in market.items() if k not in HOISTED_MARKET_FIELDS}
 
 
+def _intraday_h1_h4_direction(trend_ctx: JSONDict) -> str | None:
+    """从 H4 与 H1 趋势推导日内高周期方向，不引入 D1 日线方向。"""
+    h4 = _normalize_sop_direction(trend_ctx.get("h4_direction"))
+    h1 = _normalize_sop_direction(trend_ctx.get("h1_direction"))
+    if h4 and h1:
+        return h4 if h4 == h1 else None
+    return h4 or h1
+
+
 def _format_sop_realtime_section(
     payload: JSONDict,
     options: JSONDict | None = None,
 ) -> str:
-    """当 payload 或 options 含 SOP 结构/增量记忆字段时, 构造紧凑的 SOP 前提注入块。"""
+    """按分析角色分离日内(1H/4H+M15)与收盘后复盘(D1)上下文，不注入日 ATR 预算限制。"""
     opts = options or {}
-    daily = payload.get("daily_structure") if isinstance(payload.get("daily_structure"), dict) else None
     conf = payload.get("confluence_levels") if isinstance(payload.get("confluence_levels"), list) else None
-    day_range = payload.get("day_range") if isinstance(payload.get("day_range"), dict) else None
     ledger = opts.get("previousLedger") if isinstance(opts.get("previousLedger"), dict) else payload.get("watch_ledger")
     role = str(opts.get("analysisRole") or "")
     patrol_ctx = opts.get("patrolContext") if isinstance(opts.get("patrolContext"), dict) else None
+    trend_ctx = payload.get("trend_context") if isinstance(payload.get("trend_context"), dict) else None
 
-    if not any([daily, conf, day_range, ledger, role, patrol_ctx]):
+    is_post_close = role in ("daily_close_review", "weekly_close_review")
+    ctx_daily = patrol_ctx.get("daily_structure") if patrol_ctx else None
+    payload_daily = payload.get("daily_structure")
+    daily = (
+        ctx_daily
+        if isinstance(ctx_daily, dict)
+        else (payload_daily if isinstance(payload_daily, dict) else None)
+    )
+
+    if not any([conf, ledger, role, patrol_ctx, trend_ctx, daily if is_post_close else None]):
         return ""
 
-    blocks: list[str] = ["\n### SOP Structure & Multi-Timeframe Premise"]
-    if daily and daily.get("status") == "ok":
+    blocks: list[str] = ["\n### Multi-Timeframe Structure & Review Context"]
+    if is_post_close:
+        if daily and daily.get("status") == "ok":
+            blocks.append(
+                f"- **D1 Structure:** macro_bias={daily.get('macro_bias')} | in_vacuum={daily.get('in_vacuum')} | "
+                f"vacuum_zone={stable_stringify(daily.get('vacuum_zone'))} | "
+                f"prior_high={daily.get('prior_major_high')} | prior_low={daily.get('prior_major_low')} | "
+                f"measured_targets={stable_stringify(daily.get('measured_targets'))}"
+            )
+        if role == "daily_close_review":
+            raw_daily_recap = patrol_ctx.get("daily_recap") if patrol_ctx else None
+            daily_recap = raw_daily_recap if isinstance(raw_daily_recap, dict) else None
+            if daily_recap is None:
+                from backend.agents.tools.market_structure_sop import summarize_daily_close_recap
+
+                bar_t = str(patrol_ctx.get("bar_time") or "") if patrol_ctx else None
+                computed = summarize_daily_close_recap(
+                    get_payload_bars(payload, "D1"),
+                    h4_bars=get_payload_bars(payload, "H4"),
+                    h1_bars=get_payload_bars(payload, "H1"),
+                    target_bar_time=bar_t or None,
+                )
+                if computed.get("status") == "ok":
+                    daily_recap = computed
+            if daily_recap and daily_recap.get("status") == "ok":
+                blocks.append(f"- **Daily Close Recap (Completed D1 Bar):** {stable_stringify(daily_recap)}")
+        elif role == "weekly_close_review":
+            raw_weekly_recap = patrol_ctx.get("weekly_recap") if patrol_ctx else None
+            weekly_recap = raw_weekly_recap if isinstance(raw_weekly_recap, dict) else None
+            if weekly_recap is None:
+                from backend.agents.tools.market_structure_sop import summarize_weekly_close_recap
+
+                bar_t = str(patrol_ctx.get("bar_time") or "") if patrol_ctx else None
+                computed = summarize_weekly_close_recap(
+                    get_payload_bars(payload, "D1"),
+                    reference_bar_time=bar_t or None,
+                )
+                if computed.get("status") == "ok":
+                    weekly_recap = computed
+            if weekly_recap and weekly_recap.get("status") == "ok":
+                blocks.append(f"- **Weekly Close Recap (Completed Week from D1):** {stable_stringify(weekly_recap)}")
+    elif trend_ctx:
         blocks.append(
-            f"- **D1 Structure:** macro_bias={daily.get('macro_bias')} | in_vacuum={daily.get('in_vacuum')} | "
-            f"vacuum_zone={stable_stringify(daily.get('vacuum_zone'))} | "
-            f"prior_high={daily.get('prior_major_high')} | prior_low={daily.get('prior_major_low')} | "
-            f"measured_targets={stable_stringify(daily.get('measured_targets'))}"
+            f"- **Higher-Timeframe (1H/4H) Trend Context:** "
+            f"H4={trend_ctx.get('h4_direction')} | H1={trend_ctx.get('h1_direction')}"
         )
-    if day_range and day_range.get("status") == "ok":
-        blocks.append(
-            f"- **Day Range & ATR Budget:** realized={day_range.get('realized_range')} / "
-            f"expected_atr={day_range.get('expected_atr')} ({day_range.get('atr_consumed_pct')}%), "
-            f"stage={day_range.get('expansion_stage')}, exhausted={day_range.get('range_exhausted')}, "
-            f"bounds=[{day_range.get('intraday_lower_bound')}, {day_range.get('intraday_upper_bound')}]"
-        )
+
     if conf:
+        if not is_post_close:
+            intraday_conf = [
+                lv
+                for lv in conf
+                if isinstance(lv, dict) and any(not str(s).startswith("D1_") for s in (lv.get("sources") or []))
+            ]
+            selected_conf = intraday_conf or [lv for lv in conf if isinstance(lv, dict)]
+        else:
+            selected_conf = [lv for lv in conf if isinstance(lv, dict)]
         top_levels = [
             f"{lv.get('price')}({lv.get('role')}/{lv.get('tier')}/srcs={','.join(lv.get('sources') or [])})"
-            for lv in conf[:6]
-            if isinstance(lv, dict)
+            for lv in selected_conf[:6]
         ]
         if top_levels:
             blocks.append(f"- **Confluence Key Levels:** {' | '.join(top_levels)}")
-    if isinstance(ledger, dict) or role:
+    if (isinstance(ledger, dict) or role) and not is_post_close:
         from backend.services.sop.ledger import format_ledger_prompt_block
 
         blocks.append(format_ledger_prompt_block(ledger if isinstance(ledger, dict) else None, role=role or "standard"))
     if patrol_ctx:
-        blocks.append(f"- **Patrol Trigger Context:** {stable_stringify(patrol_ctx)}")
+        compact_ctx = (
+            {k: v for k, v in patrol_ctx.items() if k not in ("daily_recap", "weekly_recap", "daily_structure")}
+            if is_post_close
+            else patrol_ctx
+        )
+        if compact_ctx:
+            blocks.append(f"- **Review Trigger Context:** {stable_stringify(compact_ctx)}")
     return "\n".join(blocks) + "\n"
 
 
@@ -1206,13 +1269,14 @@ def _pick_protective_veto_level(
     tech: JSONDict,
     daily: JSONDict | None,
 ) -> tuple[float | None, str]:
+    del daily
     sl = to_finite_number(trade.get("stop_loss"))
     if sl is not None and _is_protective_stop(float(sl), direction, current_price):
-        return float(sl), "HTF 计划止损边界"
+        return float(sl), "高周期(1H/4H)计划止损边界"
 
     risk_sl = to_finite_number(risk.get("suggestedSL") if "suggestedSL" in risk else risk.get("suggested_sl"))
     if risk_sl is not None and _is_protective_stop(float(risk_sl), direction, current_price):
-        return float(risk_sl), "HTF 风控止损边界"
+        return float(risk_sl), "高周期(1H/4H)风控止损边界"
 
     if isinstance(confluence, list) and confluence:
         all_candidates: list[float] = []
@@ -1230,20 +1294,14 @@ def _pick_protective_veto_level(
         pool = core_candidates or all_candidates
         if pool:
             chosen = max(pool) if direction == "long" else min(pool)
-            label = "HTF 共振支撑否决位" if direction == "long" else "HTF 共振阻力否决位"
+            label = "高周期(1H/4H)共振支撑否决位" if direction == "long" else "高周期(1H/4H)共振阻力否决位"
             return chosen, label
 
     tech_items = tech.get("support_levels") if direction == "long" else tech.get("resistance_levels")
     tech_pool = [p for p in _extract_level_prices(tech_items) if _is_protective_stop(p, direction, current_price)]
     if tech_pool:
         chosen = max(tech_pool) if direction == "long" else min(tech_pool)
-        return chosen, "HTF 技术结构否决位"
-
-    if isinstance(daily, dict):
-        major_key = "prior_major_low" if direction == "long" else "prior_major_high"
-        major = to_finite_number(daily.get(major_key))
-        if major is not None and _is_protective_stop(float(major), direction, current_price):
-            return float(major), "D1 结构否决位"
+        return chosen, "高周期(1H/4H)技术结构否决位"
 
     return None, ""
 
@@ -1292,7 +1350,7 @@ def _build_sop_context(
     payload: JSONDict,
     options: JSONDict,
 ) -> JSONDict:
-    """从分析结果与上下文中归纳 SOP 结构化前提/靶位/否决边界。"""
+    """从分析结果与上下文中归纳多周期协同前提/靶位/否决边界。"""
     raw_arb = result.get("arbitration")
     arb: JSONDict = raw_arb if isinstance(raw_arb, dict) else {}
     raw_trade = arb.get("trade_recommendation")
@@ -1307,28 +1365,36 @@ def _build_sop_context(
     trend_ctx: JSONDict = raw_tc if isinstance(raw_tc, dict) else {}
     raw_daily = payload.get("daily_structure")
     daily: JSONDict | None = raw_daily if isinstance(raw_daily, dict) else None
-    raw_dr = payload.get("day_range")
-    day_range: JSONDict | None = raw_dr if isinstance(raw_dr, dict) else None
     raw_conf = payload.get("confluence_levels")
     confluence: list[Any] | None = raw_conf if isinstance(raw_conf, list) else None
     raw_pl = options.get("previousLedger")
     prev_ledger: JSONDict | None = raw_pl if isinstance(raw_pl, dict) else None
     role = str(options.get("analysisRole") or "standard")
+    is_post_close = role in ("daily_close_review", "weekly_close_review")
 
     px_val = current_price_from_payload(payload)
     current_px: float | None = float(px_val) if px_val > 0 else None
 
-    inferred_dir = (
-        _normalize_sop_direction(arb.get("final_direction"))
-        or _normalize_sop_direction(trade.get("direction"))
-        or _normalize_sop_direction(tech.get("bias"))
-        or _normalize_sop_direction(dow.get("primary_trend"))
-        or _normalize_sop_direction(trend_ctx.get("consensus_direction"))
-        or _normalize_sop_direction((daily or {}).get("macro_bias"))
-        or "wait"
-    )
+    if is_post_close:
+        inferred_dir = (
+            _normalize_sop_direction(arb.get("final_direction"))
+            or _normalize_sop_direction(tech.get("bias"))
+            or _normalize_sop_direction((daily or {}).get("macro_bias"))
+            or "wait"
+        )
+    else:
+        # 日内整体方向重点以 1H / 4H 数据及技术仲裁为准，不用 D1 日线方向覆盖日内判断
+        inferred_dir = (
+            _normalize_sop_direction(arb.get("final_direction"))
+            or _normalize_sop_direction(trade.get("direction"))
+            or _normalize_sop_direction(tech.get("bias"))
+            or _normalize_sop_direction(dow.get("primary_trend"))
+            or _intraday_h1_h4_direction(trend_ctx)
+            or _normalize_sop_direction(trend_ctx.get("consensus_direction"))
+            or "wait"
+        )
 
-    # 若处于 M15 切入层且既有 HTF 锚定已确立方向, 优先保留既有 HTF 锚定方向作审计对照
+    # 若处于 M15 切入层且既有高周期(1H/4H)锚定已确立方向, 优先保留既定前提作审计对照
     htf_anchor = prev_ledger.get("htf_anchor") if isinstance(prev_ledger, dict) else None
     existing_htf_dir = htf_anchor.get("intraday_direction") if isinstance(htf_anchor, dict) else None
     htf_dir = (
@@ -1342,7 +1408,7 @@ def _build_sop_context(
         val = trade.get(k)
         if isinstance(val, (int, float)) and val > 0:
             short_targets.append(float(val))
-    if not short_targets and htf_dir in ("long", "short"):
+    if not short_targets and not is_post_close and htf_dir in ("long", "short"):
         short_targets = _pick_directional_short_targets(
             direction=htf_dir,
             current_price=current_px,
@@ -1351,7 +1417,7 @@ def _build_sop_context(
         )
 
     long_targets: list[float] = []
-    if daily and isinstance(daily.get("measured_targets"), list):
+    if is_post_close and daily and isinstance(daily.get("measured_targets"), list):
         for t in daily["measured_targets"][:3]:
             if isinstance(t, dict) and isinstance(t.get("price"), (int, float)):
                 long_targets.append(float(t["price"]))
@@ -1359,7 +1425,7 @@ def _build_sop_context(
     veto_boundary: JSONDict | None = None
     if role == "m15_entry" and isinstance(htf_anchor, dict) and isinstance(htf_anchor.get("veto_boundary"), dict):
         veto_boundary = dict(htf_anchor["veto_boundary"])
-    elif htf_dir in ("long", "short"):
+    elif not is_post_close and htf_dir in ("long", "short"):
         veto_price, veto_label = _pick_protective_veto_level(
             direction=htf_dir,
             current_price=current_px,
@@ -1367,7 +1433,7 @@ def _build_sop_context(
             risk=risk,
             confluence=confluence,
             tech=tech,
-            daily=daily,
+            daily=None,
         )
         if veto_price is not None:
             veto_boundary = {
@@ -1379,17 +1445,21 @@ def _build_sop_context(
     inferred_macro = (
         "bullish" if htf_dir == "long" else ("bearish" if htf_dir == "short" else "neutral")
     )
+    resolved_macro = (
+        ((daily or {}).get("macro_bias") or inferred_macro)
+        if is_post_close
+        else inferred_macro
+    )
     htf_rationale = _compact_sop_text(arb.get("reasoning") or tech.get("rationale") or "", max_len=240)
     return {
         "analysis_role": role,
-        "macro_bias": (daily or {}).get("macro_bias") or inferred_macro,
+        "macro_bias": resolved_macro,
         "intraday_direction": htf_dir,
         "short_term_targets": short_targets,
         "long_term_targets": long_targets,
         "veto_boundary": veto_boundary,
         "htf_rationale": htf_rationale,
-        "day_range": day_range,
-        "daily_structure": daily,
+        "daily_structure": daily if is_post_close else None,
     }
 
 
@@ -2373,18 +2443,47 @@ class ComprehensiveAnalystService:
         symbol_system_text = build_symbol_system_prompt(profile)
         if sop_role == "htf_anchor":
             symbol_system_text += (
-                "\n\n## SOP ROLE: HTF_ANCHOR (TIER 1)\n"
-                "- Primary mission: establish D1/H4/H1 macro bias, intraday direction, short/long targets, "
-                "structural veto boundary, and primary/backup playbooks with clear invalidation rules.\n"
-                "- Keep M15 triggers subordinate to the HTF structure."
+                "\n\n## ROLE: HIGHER-TIMEFRAME (1H / 4H) INTRADAY DIRECTION ANCHOR\n"
+                "- Primary mission: analyze **1-hour (1H) and 4-hour (4H)** market structure to establish "
+                "intraday overall trend direction, key structural levels, short-term targets, structural "
+                "veto boundary, and primary/backup playbooks with clear invalidation prices.\n"
+                "- Keep M15 entry signals subordinate to the 1H/4H intraday direction.\n"
+                "- Do NOT use Daily (D1) bars as the intraday direction driver (D1 is reserved for "
+                "post-close daily/weekly reviews).\n"
+                "- Do NOT block or refuse new positions due to daily ATR budget or daily range exhaustion.\n"
+                "- Terminology rule: NEVER output the abbreviation 'HTF' or 'htf' anywhere in Chinese or "
+                "English text; always write full terms such as '高周期(1H/4H)' or '1小时/4小时高周期'."
             )
         elif sop_role == "m15_entry":
             symbol_system_text += (
-                "\n\n## SOP ROLE: M15_ENTRY (TIER 2)\n"
-                "- Primary mission: execute precise M15 entry timing, SL/TP refinement strictly UNDER the "
-                "persisted WatchLedger HTF Anchor premise.\n"
-                "- Do NOT overturn HTF intraday direction unless veto boundary breach is confirmed "
-                "with double evidence."
+                "\n\n## ROLE: M15 ENTRY TIMING ANALYSIS (15分钟入场切入)\n"
+                "- Primary mission: evaluate precise M15 entry timing, SL/TP refinement, and setup quality "
+                "strictly UNDER the persisted Higher-Timeframe (1H/4H) intraday direction premise.\n"
+                "- Do NOT overturn the 1H/4H intraday direction unless veto boundary breach is confirmed "
+                "with double evidence.\n"
+                "- Do NOT block or refuse new positions due to daily ATR budget or daily range exhaustion.\n"
+                "- Terminology rule: NEVER output the abbreviation 'HTF' or 'htf' anywhere in Chinese or "
+                "English text; always write full terms such as '高周期(1H/4H)' or '1小时/4小时高周期'."
+            )
+        elif sop_role == "daily_close_review":
+            symbol_system_text += (
+                "\n\n## ROLE: DAILY CLOSE INTRADAY TREND REVIEW (每日收盘后日内走势复盘)\n"
+                "- Primary mission: conduct a retrospective post-close review of the completed trading day "
+                "using the closed Daily (D1) bar together with 4-hour (4H) and 1-hour (1H) price action.\n"
+                "- Summarize intraday evolution (open/high/low/close rhythm, key level tests, closing "
+                "structure) and next-day key focus areas.\n"
+                "- Retrospective review only: set Action = hold, Final Direction = hold, Trade Direction = hold.\n"
+                "- NEVER mention daily ATR budget exhaustion and NEVER output the abbreviation 'HTF' or 'htf'."
+            )
+        elif sop_role == "weekly_close_review":
+            symbol_system_text += (
+                "\n\n## ROLE: WEEKLY CLOSE TREND REVIEW (每周收盘后周内走势复盘)\n"
+                "- Primary mission: conduct a retrospective post-weekly-close review of the completed trading "
+                "week using Daily (D1) weekly aggregation and macro structure.\n"
+                "- Summarize weekly open/high/low/close evolution, comparison against prior week range, "
+                "dominant weekly rhythm, and key zones for next week.\n"
+                "- Retrospective review only: set Action = hold, Final Direction = hold, Trade Direction = hold.\n"
+                "- NEVER mention daily ATR budget exhaustion and NEVER output the abbreviation 'HTF' or 'htf'."
             )
 
         system_blocks = [
@@ -2601,7 +2700,12 @@ class ComprehensiveAnalystService:
                 logger.warn({"symbol": symbol}, "Arbitration result invalid — applying downgrade")
                 result["arbitration"] = arb_val.fixed_arbitration
 
-        if (result.get("arbitration") is not None) and options.get("skipTradeAction") is not True:
+        is_post_close_role = sop_role in ("daily_close_review", "weekly_close_review")
+        if (
+            (result.get("arbitration") is not None)
+            and options.get("skipTradeAction") is not True
+            and not is_post_close_role
+        ):
             trade_action = await self.decide_trade_action(result["arbitration"], payload, profile)
             if trade_action:
                 result["tradeAction"] = trade_action
@@ -2610,11 +2714,7 @@ class ComprehensiveAnalystService:
                     "tradeAction decided",
                 )
 
-        if (
-            options.get("analysisRole") is not None
-            or payload.get("daily_structure") is not None
-            or payload.get("day_range") is not None
-        ):
+        if options.get("analysisRole") is not None or payload.get("daily_structure") is not None:
             result["sop_context"] = _build_sop_context(
                 result=result,
                 payload=payload,

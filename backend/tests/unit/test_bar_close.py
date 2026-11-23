@@ -73,3 +73,18 @@ def test_trigger_timeframe_is_m15() -> None:
     from backend.services.bar_close.index import TRIGGER_TIMEFRAME
 
     assert TRIGGER_TIMEFRAME == "M15"
+
+
+async def test_patrol_trigger_dispatches_d1_bar_close_once() -> None:
+    calls: list[tuple[str, str, str, str]] = []
+
+    async def patrol_trigger(account: str, symbol: str, timeframe: str, bar_time: str) -> None:
+        calls.append((account, symbol, timeframe, bar_time))
+
+    service = BarCloseEventService(create_in_memory_store(), patrol_trigger=patrol_trigger)
+
+    assert await service.dispatch("81124211", "GOLDM#", "D1", "2026-11-23") is True
+    assert await service.dispatch("81124211", "GOLDM#", "D1", "2026-11-23") is False
+    await asyncio.sleep(0)
+
+    assert calls == [("81124211", "GOLDM#", "D1", "2026-11-23")]

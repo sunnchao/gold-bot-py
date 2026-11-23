@@ -1,4 +1,4 @@
-"""SOP 双层盯盘巡检服务: 冷巡检过滤 + HTF 宏观锚定 + M15 增量入场切入。"""
+"""SOP 双层盯盘巡检与日/周收盘复盘服务: 冷巡检过滤 + 高周期(1H/4H)方向锚定 + M15 入场切入 + D1 日/周复盘。"""
 
 from __future__ import annotations
 
@@ -9,13 +9,21 @@ from datetime import UTC, datetime
 from math import isfinite
 from typing import Any, Literal
 
+from backend.agents.tools.market_structure_sop import (
+    analyze_daily_vacuum,
+    is_weekly_close_bar,
+    summarize_daily_close_recap,
+    summarize_weekly_close_recap,
+)
 from backend.persistence.helpers import DEFAULT_ACTIVE_ACCOUNT_TTL_SECONDS, is_heartbeat_active
 from backend.persistence.store import EaStore
 from backend.services.sop.alerts import AlertRouter
 from backend.services.sop.cards import (
+    build_daily_close_review_card,
     build_htf_review_card,
     build_m15_review_card,
     build_patrol_cycle_card,
+    build_weekly_close_review_card,
 )
 from backend.services.sop.ledger import (
     empty_watch_ledger,
@@ -494,11 +502,11 @@ class PatrolService:
             anchor = working_ledger["htf_anchor"]
             if changed:
                 summary = (
-                    f"{symbol} HTF 锚定更新: 方向={anchor.get('intraday_direction')} "
+                    f"{symbol} 高周期(1H/4H)方向更新: 方向={anchor.get('intraday_direction')} "
                     f"短期目标={anchor.get('short_term_targets')} 变动={','.join(change_reasons)}"
                 )
             else:
-                summary = f"{symbol} HTF 例行复盘完成(核心结论无实质变更)"
+                summary = f"{symbol} 高周期(1H/4H)例行复盘完成(核心结论无实质变更)"
             htf_title, htf_content, htf_card = build_htf_review_card(
                 account_id=account_id,
                 symbol=symbol,
@@ -740,6 +748,325 @@ class PatrolService:
         if res.get("sent"):
             self._last_cycle_report_at[account_id] = now_dt
         return res
+
+    async def _is_post_close_account_active(self, account_id: str, now_dt: datetime) -> bool:
+        heartbeat = await self._store.get_heartbeat(account_id)
+        return is_heartbeat_active(
+            heartbeat,
+            now=now_dt,
+            ttl_seconds=max(self.active_account_ttl_seconds, 48 * 3600),
+            require_timestamp=True,
+        )
+
+    async def _load_review_bars(
+        self,
+        account_id: str,
+        symbol: str,
+        snapshot: dict[str, Any] | None,
+    ) -> dict[str, Sequence[dict[str, Any]]]:
+        if isinstance(snapshot, dict) and isinstance(snapshot.get("bars_by_tf"), dict):
+            return dict(snapshot["bars_by_tf"])
+        out: dict[str, Sequence[dict[str, Any]]] = {}
+        for tf in ("D1", "H4", "H1"):
+            out[tf] = await self._store.get_bars(account_id, symbol, tf, limit=200)
+        return out
+
+    async def run_daily_close_review(
+        self,
+        account_id: str,
+        symbol: str,
+        *,
+        bar_time: str | None = None,
+        manual: bool = False,
+        snapshot: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """D1 收盘后的日内走势复盘分析（不修改日内锚定账本，不触发开仓）。"""
+        norm_sym = _norm_symbol(symbol)
+        lock = self._lock_for(account_id, norm_sym)
+        async with lock:
+            now_dt = self._now_fn()
+            if now_dt.tzinfo is None:
+                now_dt = now_dt.replace(tzinfo=UTC)
+
+            if not manual and snapshot is None:
+                if not await self._is_post_close_account_active(account_id, now_dt):
+                    return {"status": "skipped", "reason": "inactive_account", "symbol": norm_sym}
+
+            bars_by_tf = await self._load_review_bars(account_id, norm_sym, snapshot)
+            d1_bars = list(bars_by_tf.get("D1") or [])
+            h4_bars = list(bars_by_tf.get("H4") or [])
+            h1_bars = list(bars_by_tf.get("H1") or [])
+            daily_recap = summarize_daily_close_recap(
+                d1_bars,
+                h4_bars=h4_bars,
+                h1_bars=h1_bars,
+                target_bar_time=bar_time,
+            )
+            if daily_recap.get("status") != "ok":
+                return {"status": "skipped", "reason": "insufficient_d1_data", "symbol": norm_sym}
+
+            trade_date = str(daily_recap.get("trade_date") or "")
+            if not manual and trade_date:
+                claimed = await self._store.claim_bar_close_event(
+                    account_id, norm_sym, "D1_DAILY_REVIEW", trade_date
+                )
+                if not claimed:
+                    return {
+                        "status": "skipped",
+                        "reason": "already_reviewed",
+                        "symbol": norm_sym,
+                        "trade_date": trade_date,
+                    }
+
+            close_px = float(daily_recap["close"])
+            daily_structure = analyze_daily_vacuum(d1_bars, current_price=close_px)
+            existing_ledger = await self._store.get_watch_ledger(account_id, norm_sym)
+
+            wf_out = await self._workflow.run(
+                account_id,
+                norm_sym,
+                {
+                    "analysisRole": "daily_close_review",
+                    "previousLedger": existing_ledger,
+                    "patrolContext": {
+                        "trigger_type": "manual_daily_review" if manual else "d1_close",
+                        "bar_time": bar_time or daily_recap.get("bar_time"),
+                        "daily_recap": daily_recap,
+                        "daily_structure": daily_structure,
+                    },
+                    "skipFeishu": True,
+                    "skipPublish": True,
+                    "forceAnalyze": True,
+                },
+            )
+            ai_res = _extract_ai_result(wf_out, norm_sym) or {}
+            title, content, card = build_daily_close_review_card(
+                account_id=account_id,
+                symbol=norm_sym,
+                daily_recap=daily_recap,
+                daily_structure=daily_structure,
+                ai_result=ai_res,
+                execution_mode=self.execution_mode,
+                now=now_dt,
+            )
+            await self._alerts.route(
+                account_id=account_id,
+                symbol=norm_sym,
+                level="notify",
+                category="daily_close_review",
+                title=title,
+                content=content,
+                card=card,
+                dedup_key=f"daily:{account_id}:{norm_sym}:{trade_date}",
+                bypass_cooldown=True,
+            )
+            summary = (
+                f"{norm_sym} 每日收盘复盘 ({trade_date}): "
+                f"{daily_recap.get('candle_type')} {daily_recap.get('change_pct')}%, "
+                f"结构={daily_structure.get('macro_bias')}"
+            )
+            log_entry = await self._store.append_patrol_log(
+                {
+                    "account_id": account_id,
+                    "symbol": norm_sym,
+                    "trigger_type": "manual_daily_review" if manual else "d1_close",
+                    "tier": "daily_close_review",
+                    "alert_level": "notify",
+                    "action_taken": "daily_close_reviewed",
+                    "summary": summary,
+                    "details": {
+                        "trade_date": trade_date,
+                        "daily_recap": daily_recap,
+                        "daily_structure_bias": daily_structure.get("macro_bias"),
+                    },
+                }
+            )
+            return {
+                "status": "ok",
+                "symbol": norm_sym,
+                "trade_date": trade_date,
+                "summary": summary,
+                "daily_recap": daily_recap,
+                "daily_structure": daily_structure,
+                "log": log_entry,
+            }
+
+    async def run_weekly_close_review(
+        self,
+        account_id: str,
+        symbol: str,
+        *,
+        bar_time: str | None = None,
+        manual: bool = False,
+        snapshot: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """每周收盘后的周内走势复盘分析（使用 D1 周度汇总，不修改日内账本，不触发开仓）。"""
+        norm_sym = _norm_symbol(symbol)
+        lock = self._lock_for(account_id, norm_sym)
+        async with lock:
+            now_dt = self._now_fn()
+            if now_dt.tzinfo is None:
+                now_dt = now_dt.replace(tzinfo=UTC)
+
+            if not manual and snapshot is None:
+                if not await self._is_post_close_account_active(account_id, now_dt):
+                    return {"status": "skipped", "reason": "inactive_account", "symbol": norm_sym}
+
+            bars_by_tf = await self._load_review_bars(account_id, norm_sym, snapshot)
+            d1_bars = list(bars_by_tf.get("D1") or [])
+            weekly_recap = summarize_weekly_close_recap(d1_bars, reference_bar_time=bar_time)
+            if weekly_recap.get("status") != "ok":
+                return {"status": "skipped", "reason": "insufficient_d1_data", "symbol": norm_sym}
+
+            iso_week = str(weekly_recap.get("iso_week") or "")
+            if not manual and iso_week:
+                claimed = await self._store.claim_bar_close_event(
+                    account_id, norm_sym, "W1_WEEKLY_REVIEW", iso_week
+                )
+                if not claimed:
+                    return {
+                        "status": "skipped",
+                        "reason": "already_reviewed",
+                        "symbol": norm_sym,
+                        "iso_week": iso_week,
+                    }
+
+            wk_close = float(weekly_recap["week_close"])
+            daily_structure = analyze_daily_vacuum(d1_bars, current_price=wk_close)
+            existing_ledger = await self._store.get_watch_ledger(account_id, norm_sym)
+
+            wf_out = await self._workflow.run(
+                account_id,
+                norm_sym,
+                {
+                    "analysisRole": "weekly_close_review",
+                    "previousLedger": existing_ledger,
+                    "patrolContext": {
+                        "trigger_type": "manual_weekly_review" if manual else "weekly_close",
+                        "bar_time": bar_time or weekly_recap.get("week_end_date"),
+                        "weekly_recap": weekly_recap,
+                        "daily_structure": daily_structure,
+                    },
+                    "skipFeishu": True,
+                    "skipPublish": True,
+                    "forceAnalyze": True,
+                },
+            )
+            ai_res = _extract_ai_result(wf_out, norm_sym) or {}
+            title, content, card = build_weekly_close_review_card(
+                account_id=account_id,
+                symbol=norm_sym,
+                weekly_recap=weekly_recap,
+                daily_structure=daily_structure,
+                ai_result=ai_res,
+                execution_mode=self.execution_mode,
+                now=now_dt,
+            )
+            await self._alerts.route(
+                account_id=account_id,
+                symbol=norm_sym,
+                level="digest",
+                category="weekly_close_review",
+                title=title,
+                content=content,
+                card=card,
+                dedup_key=f"weekly:{account_id}:{norm_sym}:{iso_week}",
+                bypass_cooldown=True,
+            )
+            summary = (
+                f"{norm_sym} 每周收盘复盘 ({iso_week}): "
+                f"{weekly_recap.get('weekly_candle_type')} {weekly_recap.get('change_pct')}%, "
+                f"结构={daily_structure.get('macro_bias')}"
+            )
+            log_entry = await self._store.append_patrol_log(
+                {
+                    "account_id": account_id,
+                    "symbol": norm_sym,
+                    "trigger_type": "manual_weekly_review" if manual else "weekly_close",
+                    "tier": "weekly_close_review",
+                    "alert_level": "digest",
+                    "action_taken": "weekly_close_reviewed",
+                    "summary": summary,
+                    "details": {
+                        "iso_week": iso_week,
+                        "weekly_recap": weekly_recap,
+                        "daily_structure_bias": daily_structure.get("macro_bias"),
+                    },
+                }
+            )
+            return {
+                "status": "ok",
+                "symbol": norm_sym,
+                "iso_week": iso_week,
+                "summary": summary,
+                "weekly_recap": weekly_recap,
+                "daily_structure": daily_structure,
+                "log": log_entry,
+            }
+
+    async def handle_d1_bar_close(
+        self,
+        account_id: str,
+        symbol: str,
+        *,
+        bar_time: str,
+        snapshot: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """响应 D1 收盘事件: 执行每日收盘复盘；若为本周最后一个交易日则顺带执行每周收盘复盘。"""
+        norm_sym = _norm_symbol(symbol)
+        daily_out = await self.run_daily_close_review(
+            account_id,
+            norm_sym,
+            bar_time=bar_time,
+            snapshot=snapshot,
+        )
+        bars_by_tf = await self._load_review_bars(account_id, norm_sym, snapshot)
+        d1_bars = list(bars_by_tf.get("D1") or [])
+        weekly_out: dict[str, Any] | None = None
+        if is_weekly_close_bar(d1_bars, target_bar_time=bar_time):
+            weekly_out = await self.run_weekly_close_review(
+                account_id,
+                norm_sym,
+                bar_time=bar_time,
+                snapshot=snapshot,
+            )
+        return {
+            "status": "ok",
+            "symbol": norm_sym,
+            "daily_review": daily_out,
+            "weekly_review": weekly_out,
+        }
+
+    async def check_post_close_reviews(
+        self,
+        account_id: str,
+        symbol: str,
+        *,
+        now: datetime | None = None,
+    ) -> dict[str, Any]:
+        """周五收盘后定时兜底检查: 无需等周一开盘新 K 线，即可完成周五每日复盘与每周复盘。"""
+        now_dt = now or self._now_fn()
+        if now_dt.tzinfo is None:
+            now_dt = now_dt.replace(tzinfo=UTC)
+        utc_now = now_dt.astimezone(UTC)
+        in_friday_post_close = utc_now.weekday() == 4 and (utc_now.hour * 60 + utc_now.minute) >= (22 * 60 + 5)
+        in_saturday_post_close = utc_now.weekday() == 5 and utc_now.hour < 12
+        if not (in_friday_post_close or in_saturday_post_close):
+            return {"status": "skipped", "reason": "outside_weekly_post_close_window"}
+
+        norm_sym = _norm_symbol(symbol)
+        d1_bars = await self._store.get_bars(account_id, norm_sym, "D1", limit=30)
+        if not d1_bars:
+            return {"status": "skipped", "reason": "insufficient_d1_data"}
+        latest_bar_time = str(d1_bars[-1].get("time") or "")
+        daily_out = await self.run_daily_close_review(account_id, norm_sym, bar_time=latest_bar_time)
+        weekly_out = await self.run_weekly_close_review(account_id, norm_sym, bar_time=latest_bar_time)
+        return {
+            "status": "ok",
+            "symbol": norm_sym,
+            "daily_review": daily_out,
+            "weekly_review": weekly_out,
+        }
 
     async def _enqueue_cancel_pending(self, account_id: str, symbol: str, reasons: list[str]) -> bool:
         from uuid import uuid4

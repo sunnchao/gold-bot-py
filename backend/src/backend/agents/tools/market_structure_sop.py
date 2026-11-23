@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Sequence
+from datetime import UTC, datetime
 from math import isfinite
 from typing import Any, Literal
 
@@ -509,8 +511,316 @@ def build_confluence_levels(
     return scored[:12]
 
 
+def _parse_bar_timestamp(raw: Any) -> datetime | None:
+    """将 Unix 秒/毫秒、ISO8601 或 MT4 点分日期字符串解析为 UTC datetime。"""
+    if isinstance(raw, (int, float)) and not isinstance(raw, bool):
+        val = float(raw)
+        if not isfinite(val):
+            return None
+        if abs(val) > 1e12:
+            val /= 1000.0
+        try:
+            return datetime.fromtimestamp(val, tz=UTC)
+        except (OSError, OverflowError, ValueError):
+            return None
+
+    if not isinstance(raw, str):
+        return None
+    s = raw.strip()
+    if not s:
+        return None
+    if re.fullmatch(r"-?\d+(?:\.\d+)?", s):
+        val = float(s)
+        if abs(val) > 1e12:
+            val /= 1000.0
+        try:
+            return datetime.fromtimestamp(val, tz=UTC)
+        except (OSError, OverflowError, ValueError):
+            return None
+
+    mt_match = re.match(r"^(\d{4})\.(\d{2})\.(\d{2})(?:[ T](\d{2}):(\d{2})(?::(\d{2}))?)?$", s)
+    if mt_match:
+        yr, mo, dy, hr, mi, sc = (
+            int(mt_match.group(1)),
+            int(mt_match.group(2)),
+            int(mt_match.group(3)),
+            int(mt_match.group(4) or 0),
+            int(mt_match.group(5) or 0),
+            int(mt_match.group(6) or 0),
+        )
+        return datetime(yr, mo, dy, hr, mi, sc, tzinfo=UTC)
+
+    iso = s[:-1] + "+00:00" if s.endswith("Z") else s
+    try:
+        dt = datetime.fromisoformat(iso)
+    except ValueError:
+        return None
+    return dt.replace(tzinfo=UTC) if dt.tzinfo is None else dt.astimezone(UTC)
+
+
+def _select_d1_bar_index(
+    bars: Sequence[dict[str, Any]],
+    target_bar_time: str | None = None,
+    *,
+    default_last: bool = False,
+) -> int:
+    if not bars:
+        return -1
+    if isinstance(target_bar_time, str) and target_bar_time.strip():
+        needle = target_bar_time.strip()
+        for idx in range(len(bars) - 1, -1, -1):
+            if str(bars[idx].get("time") or "").strip() == needle:
+                return idx
+        needle_dt = _parse_bar_timestamp(needle)
+        if needle_dt is not None:
+            for idx in range(len(bars) - 1, -1, -1):
+                bar_dt = _parse_bar_timestamp(bars[idx].get("time"))
+                if bar_dt is not None and bar_dt.date() == needle_dt.date():
+                    return idx
+    if default_last:
+        return len(bars) - 1
+    return len(bars) - 2 if len(bars) >= 2 else 0
+
+
+def is_weekly_close_bar(
+    d1_bars: Sequence[dict[str, Any]],
+    target_bar_time: str | None = None,
+) -> bool:
+    """判断目标已收盘 D1 K 线是否构成周度收盘（周五或节假日提前跨周的最后交易日）。"""
+    valid = [
+        b
+        for b in d1_bars
+        if _to_float(b.get("high")) is not None and _to_float(b.get("low")) is not None
+    ]
+    if not valid:
+        return False
+    idx = _select_d1_bar_index(valid, target_bar_time=target_bar_time, default_last=False)
+    if idx < 0:
+        return False
+    target_dt = _parse_bar_timestamp(valid[idx].get("time"))
+    if target_dt is None:
+        return False
+    if target_dt.weekday() == 4:
+        return True
+    if idx + 1 < len(valid):
+        next_dt = _parse_bar_timestamp(valid[idx + 1].get("time"))
+        if next_dt is not None and next_dt.isocalendar()[:2] != target_dt.isocalendar()[:2]:
+            return True
+    return False
+
+
+def summarize_daily_close_recap(
+    d1_bars: Sequence[dict[str, Any]],
+    *,
+    h4_bars: Sequence[dict[str, Any]] | None = None,
+    h1_bars: Sequence[dict[str, Any]] | None = None,
+    target_bar_time: str | None = None,
+) -> dict[str, Any]:
+    """汇总刚收盘 D1 K 线的日内走势回顾统计（仅做复盘统计，不施加开仓限制）。"""
+    valid = [
+        b
+        for b in d1_bars
+        if _to_float(b.get("open")) is not None
+        and _to_float(b.get("high")) is not None
+        and _to_float(b.get("low")) is not None
+        and _to_float(b.get("close")) is not None
+    ]
+    if not valid:
+        return {"status": "insufficient_data"}
+
+    idx = _select_d1_bar_index(valid, target_bar_time=target_bar_time, default_last=False)
+    bar = valid[idx]
+    prev_bar = valid[idx - 1] if idx > 0 else None
+
+    o = float(bar["open"])
+    h = float(bar["high"])
+    low = float(bar["low"])
+    c = float(bar["close"])
+    bar_dt = _parse_bar_timestamp(bar.get("time"))
+    trade_date = bar_dt.date().isoformat() if bar_dt is not None else str(bar.get("time") or "-")
+
+    net_change = c - o
+    change_pct = (net_change / o * 100.0) if o > 0 else 0.0
+    amplitude = max(0.0, h - low)
+    body_ratio = (abs(net_change) / amplitude * 100.0) if amplitude > 0 else 0.0
+    if body_ratio < 15.0:
+        candle_type = "十字星震荡"
+    elif net_change >= 0:
+        candle_type = "阳线收涨"
+    else:
+        candle_type = "阴线收跌"
+
+    prev_high = float(prev_bar["high"]) if prev_bar is not None else None
+    prev_low = float(prev_bar["low"]) if prev_bar is not None else None
+    prev_close = float(prev_bar["close"]) if prev_bar is not None else None
+    if prev_high is not None and prev_low is not None:
+        broke_up = h > prev_high
+        broke_down = low < prev_low
+        if broke_up and broke_down:
+            vs_prev_day = "吞没前日区间 (高破低穿)"
+        elif broke_up:
+            vs_prev_day = "突破前日高点"
+        elif broke_down:
+            vs_prev_day = "跌破前日低点"
+        else:
+            vs_prev_day = "前日区间内波动"
+    else:
+        vs_prev_day = "无前日对照"
+
+    h4_close = _to_float(h4_bars[-1].get("close")) if h4_bars else None
+    h1_close = _to_float(h1_bars[-1].get("close")) if h1_bars else None
+
+    return {
+        "status": "ok",
+        "bar_time": str(bar.get("time") or ""),
+        "trade_date": trade_date,
+        "open": _round_price(o, c),
+        "high": _round_price(h, c),
+        "low": _round_price(low, c),
+        "close": _round_price(c, c),
+        "net_change": round(net_change, 4 if c < 200 else 2),
+        "change_pct": round(change_pct, 2),
+        "amplitude": _round_price(amplitude, c),
+        "body_ratio": round(body_ratio, 1),
+        "candle_type": candle_type,
+        "prev_high": _round_price(prev_high, c) if prev_high is not None else None,
+        "prev_low": _round_price(prev_low, c) if prev_low is not None else None,
+        "prev_close": _round_price(prev_close, c) if prev_close is not None else None,
+        "vs_prev_day": vs_prev_day,
+        "h4_close": _round_price(h4_close, c) if h4_close is not None else None,
+        "h1_close": _round_price(h1_close, c) if h1_close is not None else None,
+    }
+
+
+def summarize_weekly_close_recap(
+    d1_bars: Sequence[dict[str, Any]],
+    *,
+    reference_bar_time: str | None = None,
+) -> dict[str, Any]:
+    """按 ISO 自然周聚合 D1 K 线，生成每周收盘后的周内走势复盘统计。"""
+    timed_bars: list[tuple[datetime, dict[str, Any]]] = []
+    for bar in d1_bars:
+        if (
+            _to_float(bar.get("open")) is None
+            or _to_float(bar.get("high")) is None
+            or _to_float(bar.get("low")) is None
+            or _to_float(bar.get("close")) is None
+        ):
+            continue
+        dt = _parse_bar_timestamp(bar.get("time"))
+        if dt is not None:
+            timed_bars.append((dt, bar))
+
+    if not timed_bars:
+        return {"status": "insufficient_data"}
+
+    timed_bars.sort(key=lambda item: item[0])
+    target_idx = _select_d1_bar_index(
+        [b for _, b in timed_bars],
+        target_bar_time=reference_bar_time,
+        default_last=True,
+    )
+    target_dt = timed_bars[target_idx][0]
+    target_week = target_dt.isocalendar()[:2]
+
+    week_items = [(dt, b) for dt, b in timed_bars if dt.isocalendar()[:2] == target_week]
+    if not week_items:
+        return {"status": "insufficient_data"}
+
+    first_week_dt = week_items[0][0]
+    prior_items = [(dt, b) for dt, b in timed_bars if dt < first_week_dt]
+    prev_week_items: list[tuple[datetime, dict[str, Any]]] = []
+    if prior_items:
+        prev_week_key = prior_items[-1][0].isocalendar()[:2]
+        prev_week_items = [(dt, b) for dt, b in prior_items if dt.isocalendar()[:2] == prev_week_key]
+
+    week_open = float(week_items[0][1]["open"])
+    week_high = max(float(b["high"]) for _, b in week_items)
+    week_low = min(float(b["low"]) for _, b in week_items)
+    week_close = float(week_items[-1][1]["close"])
+    net_change = week_close - week_open
+    change_pct = (net_change / week_open * 100.0) if week_open > 0 else 0.0
+    week_range = max(0.0, week_high - week_low)
+    body_ratio = (abs(net_change) / week_range * 100.0) if week_range > 0 else 0.0
+
+    if body_ratio < 15.0:
+        weekly_candle_type = "周线十字震荡"
+    elif net_change >= 0:
+        weekly_candle_type = "周线收阳"
+    else:
+        weekly_candle_type = "周线收阴"
+
+    up_days = sum(1 for _, b in week_items if float(b["close"]) > float(b["open"]))
+    down_days = sum(1 for _, b in week_items if float(b["close"]) < float(b["open"]))
+
+    daily_breakdown: list[dict[str, Any]] = []
+    for dt, b in week_items:
+        bo = float(b["open"])
+        bc = float(b["close"])
+        bh = float(b["high"])
+        bl = float(b["low"])
+        pct = ((bc - bo) / bo * 100.0) if bo > 0 else 0.0
+        daily_breakdown.append(
+            {
+                "date": dt.date().isoformat(),
+                "open": _round_price(bo, week_close),
+                "high": _round_price(bh, week_close),
+                "low": _round_price(bl, week_close),
+                "close": _round_price(bc, week_close),
+                "change_pct": round(pct, 2),
+            }
+        )
+
+    prev_week_high: float | None = None
+    prev_week_low: float | None = None
+    prev_week_close: float | None = None
+    if prev_week_items:
+        prev_week_high = max(float(b["high"]) for _, b in prev_week_items)
+        prev_week_low = min(float(b["low"]) for _, b in prev_week_items)
+        prev_week_close = float(prev_week_items[-1][1]["close"])
+        broke_up = week_high > prev_week_high
+        broke_down = week_low < prev_week_low
+        if broke_up and broke_down:
+            vs_prev_week = "吞没上周区间 (上破下穿)"
+        elif broke_up:
+            vs_prev_week = "突破上周高点"
+        elif broke_down:
+            vs_prev_week = "跌破上周低点"
+        else:
+            vs_prev_week = "上周区间内震荡"
+    else:
+        vs_prev_week = "无上周对照"
+
+    iso_year, iso_wk = target_week
+    return {
+        "status": "ok",
+        "iso_week": f"{iso_year}-W{iso_wk:02d}",
+        "week_start_date": week_items[0][0].date().isoformat(),
+        "week_end_date": week_items[-1][0].date().isoformat(),
+        "trading_days_count": len(week_items),
+        "week_open": _round_price(week_open, week_close),
+        "week_high": _round_price(week_high, week_close),
+        "week_low": _round_price(week_low, week_close),
+        "week_close": _round_price(week_close, week_close),
+        "net_change": round(net_change, 4 if week_close < 200 else 2),
+        "change_pct": round(change_pct, 2),
+        "week_range": _round_price(week_range, week_close),
+        "weekly_candle_type": weekly_candle_type,
+        "up_days": up_days,
+        "down_days": down_days,
+        "prev_week_high": _round_price(prev_week_high, week_close) if prev_week_high is not None else None,
+        "prev_week_low": _round_price(prev_week_low, week_close) if prev_week_low is not None else None,
+        "prev_week_close": _round_price(prev_week_close, week_close) if prev_week_close is not None else None,
+        "vs_prev_week": vs_prev_week,
+        "daily_breakdown": daily_breakdown,
+    }
+
+
 __all__ = [
     "analyze_daily_vacuum",
     "build_confluence_levels",
     "compute_day_range",
+    "is_weekly_close_bar",
+    "summarize_daily_close_recap",
+    "summarize_weekly_close_recap",
 ]

@@ -1,7 +1,8 @@
-"""SOP 自动巡检与 HTF/M15 复盘飞书交互卡片构建器。"""
+"""SOP 自动巡检与多周期(1H/4H、M15、D1 日/周收盘)复盘飞书交互卡片构建器。"""
 
 from __future__ import annotations
 
+import re
 from collections.abc import Sequence
 from datetime import UTC, datetime
 from math import isfinite
@@ -9,10 +10,11 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 _BEIJING_TZ = ZoneInfo("Asia/Shanghai")
+_HTF_ABBR_RE = re.compile(r"\bhtf\b", re.IGNORECASE)
 
 _TRIGGER_REASON_LABELS: dict[str, str] = {
-    "htf_bootstrap": "首次锚定",
-    "htf_schedule_due": "定时复盘",
+    "htf_bootstrap": "高周期(1H/4H)首次锚定",
+    "htf_schedule_due": "高周期(1H/4H)定时复盘",
     "volatility_move": "价格异动",
     "key_level_breakout": "阻力突破",
     "key_level_breakdown": "支撑跌破",
@@ -22,9 +24,15 @@ _TRIGGER_REASON_LABELS: dict[str, str] = {
     "playbook_invalidated": "剧本失效",
     "logic_exhausted": "目标兑现重建",
     "no_active_playbook": "无活跃剧本重建",
-    "manual_htf": "手动 HTF 复盘",
+    "manual_htf": "手动高周期(1H/4H)复盘",
     "manual_m15": "手动 M15 复盘",
     "m15_close": "M15 收盘",
+    "d1_close": "D1 日线收盘",
+    "weekly_close": "每周收盘",
+    "daily_close_review": "每日收盘复盘",
+    "weekly_close_review": "每周收盘复盘",
+    "manual_daily_review": "手动每日复盘",
+    "manual_weekly_review": "手动每周复盘",
     "patrol": "例行巡检",
 }
 
@@ -36,9 +44,11 @@ _DIRECTION_LABELS: dict[str, str] = {
 
 _ACTION_LABELS: dict[str, str] = {
     "no_op": "稳态观察",
-    "htf_reviewed": "HTF 复盘",
+    "htf_reviewed": "高周期(1H/4H)复盘",
     "m15_wait": "M15 观察",
     "m15_entry_signal": "🎯 M15 入场信号",
+    "daily_close_reviewed": "📅 每日收盘复盘",
+    "weekly_close_reviewed": "📊 每周收盘复盘",
     "state_transition_only": "⚡ 状态迁徙",
     "data_failure_silent_retry": "⚠️ 数据异常重试",
     "data_failure_alert": "🚨 连续数据异常",
@@ -96,17 +106,29 @@ def _fmt_positive_list(values: Any, *, limit: int = 3) -> str:
     return ", ".join(formatted[:limit]) if formatted else "-"
 
 
-def _clip_text(value: Any, max_len: int) -> str:
+def _sanitize_display_text(value: Any) -> str:
+    """将展示文本中的缩写统一展开为完整名称并压缩空白，避免用户卡片出现 HTF 等缩写。"""
     if not isinstance(value, str):
         return ""
-    cleaned = " ".join(value.split())
+    collapsed = " ".join(value.split())
+    return _HTF_ABBR_RE.sub("高周期(1H/4H)", collapsed)
+
+
+def _clip_text(value: Any, max_len: int) -> str:
+    cleaned = _sanitize_display_text(value)
+    if not cleaned:
+        return ""
     if len(cleaned) <= max_len:
         return cleaned
     return cleaned[: max(1, max_len - 1)].rstrip() + "…"
 
 
 def _format_reasons(reasons: Sequence[str] | None, *, fallback: str = "例行触发") -> str:
-    items = [_TRIGGER_REASON_LABELS.get(str(r), str(r)) for r in (reasons or []) if str(r).strip()]
+    items = [
+        _TRIGGER_REASON_LABELS.get(str(r), _sanitize_display_text(str(r)))
+        for r in (reasons or [])
+        if str(r).strip()
+    ]
     return "、".join(dict.fromkeys(items)) if items else fallback
 
 
@@ -210,12 +232,16 @@ def build_htf_review_card(
     execution_mode: str,
     now: datetime | None = None,
 ) -> tuple[str, str, dict[str, Any]]:
-    """构建 HTF 锚定更新/例行复盘飞书交互卡片，返回 (title, fallback_md, card)。"""
+    """构建高周期(1H/4H)日内方向更新/例行复盘飞书交互卡片，返回 (title, fallback_md, card)。"""
     anchor = _as_dict(ledger.get("htf_anchor"))
     intraday_dir = str(anchor.get("intraday_direction") or "wait").lower()
     macro_bias = str(anchor.get("macro_bias") or ai_result.get("bias") or "neutral").lower()
     conf = _to_float(anchor.get("confidence") or ai_result.get("confidence")) or 0.0
-    title = f"🔄 HTF 方向更新 · {symbol}" if changed else f"🧭 HTF 例行复盘 · {symbol}"
+    title = (
+        f"🔄 高周期(1H/4H)日内方向更新 · {symbol}"
+        if changed
+        else f"🧭 高周期(1H/4H)例行复盘 · {symbol}"
+    )
     template = "green" if intraday_dir == "long" else ("red" if intraday_dir == "short" else "blue")
 
     dir_text = _DIRECTION_LABELS.get(intraday_dir, intraday_dir)
@@ -227,10 +253,10 @@ def build_htf_review_card(
     elements: list[dict[str, Any]] = [
         _fields_div(("账户", account_id), ("品种", symbol)),
         _fields_div(("当前价格", _fmt_price(current_price)), ("触发原因", reason_text)),
-        _fields_div(("日内方向", dir_text), ("宏观 / 置信度", f"{macro_bias} ({conf:.0f}%)")),
+        _fields_div(("日内整体方向 (1H/4H)", dir_text), ("高周期偏向 / 置信度", f"{macro_bias} ({conf:.0f}%)")),
         _fields_div(
-            ("短期目标", short_targets),
-            ("长期目标", long_targets),
+            ("日内短期目标", short_targets),
+            ("延伸参考目标", long_targets),
         ),
         _md_div(f"**否决边界:** {veto_text}"),
     ]
@@ -271,11 +297,14 @@ def build_htf_review_card(
     )
 
     fallback_md = (
-        f"{symbol} HTF 复盘 ({reason_text})\n"
+        f"{symbol} 高周期(1H/4H)复盘 ({reason_text})\n"
         f"方向: {intraday_dir} ({macro_bias}, {conf:.0f}%) | 现价: {_fmt_price(current_price)}\n"
         f"短期目标: {short_targets} | 否决边界: {veto_text}"
     )
     return title, fallback_md, _make_card(title, template, elements)
+
+
+build_intraday_direction_review_card = build_htf_review_card
 
 
 def build_m15_review_card(
@@ -314,7 +343,7 @@ def build_m15_review_card(
         _fields_div(("账户", account_id), ("品种", symbol)),
         _fields_div(("当前价格", _fmt_price(current_price)), ("触发原因", reason_text)),
         _fields_div(
-            ("HTF 前提方向", _DIRECTION_LABELS.get(intraday_dir, intraday_dir)),
+            ("高周期(1H/4H)前提方向", _DIRECTION_LABELS.get(intraday_dir, intraday_dir)),
             ("否决边界", _format_veto(anchor)),
         ),
     ]
@@ -338,7 +367,11 @@ def build_m15_review_card(
             )
         )
     else:
-        status_note = "逆 HTF 日内方向开仓已拦截" if counter_blocked else f"保持观察 · 置信度 {conf:.0f}%"
+        status_note = (
+            "逆高周期(1H/4H)日内方向开仓已拦截"
+            if counter_blocked
+            else f"保持观察 · 置信度 {conf:.0f}%"
+        )
         elements.append(_md_div(f"**M15 结论:** {status_note}"))
         pb_rows = _format_playbooks(ledger.get("playbooks"), max_items=1)
         if pb_rows:
@@ -356,7 +389,7 @@ def build_m15_review_card(
     )
 
     fallback_md = (
-        f"{title} | 现价 {_fmt_price(current_price)} | HTF {intraday_dir} | 触发 {reason_text}"
+        f"{title} | 现价 {_fmt_price(current_price)} | 高周期(1H/4H) {intraday_dir} | 触发 {reason_text}"
     )
     return title, fallback_md, _make_card(title, template, elements)
 
@@ -480,8 +513,176 @@ def build_patrol_cycle_card(
     return title, "\n".join(fallback_lines), _make_card(title, template, elements)
 
 
+def _fmt_signed(value: Any, *, suffix: str = "") -> str:
+    num = _to_float(value)
+    if num is None:
+        return "-"
+    sign = "+" if num > 0 else ""
+    text = f"{num:.4f}".rstrip("0").rstrip(".") if abs(num) < 10 else f"{num:.2f}"
+    return f"{sign}{text}{suffix}"
+
+
+def build_daily_close_review_card(
+    *,
+    account_id: str,
+    symbol: str,
+    daily_recap: dict[str, Any],
+    daily_structure: dict[str, Any] | None,
+    ai_result: dict[str, Any],
+    execution_mode: str,
+    now: datetime | None = None,
+) -> tuple[str, str, dict[str, Any]]:
+    """构建每日收盘后的日内走势复盘飞书交互卡片（使用日线 D1 收盘与 1H/4H 结构数据）。"""
+    trade_date = str(daily_recap.get("trade_date") or "-")
+    net_change = _to_float(daily_recap.get("net_change")) or 0.0
+    candle_type = str(daily_recap.get("candle_type") or "-")
+    title = f"📅 每日收盘日内走势复盘 · {symbol} ({trade_date})"
+    template = "green" if net_change > 0 else ("red" if net_change < 0 else "blue")
+
+    open_px = _fmt_price(daily_recap.get("open"))
+    close_px = _fmt_price(daily_recap.get("close"))
+    high_px = _fmt_price(daily_recap.get("high"))
+    low_px = _fmt_price(daily_recap.get("low"))
+    amp_px = _fmt_price(daily_recap.get("amplitude"))
+    chg_txt = f"{_fmt_signed(net_change)} ({_fmt_signed(daily_recap.get('change_pct'), suffix='%')})"
+    vs_prev = str(daily_recap.get("vs_prev_day") or "-")
+
+    daily_struct = _as_dict(daily_structure)
+    macro_bias = str(daily_struct.get("macro_bias") or ai_result.get("bias") or "neutral")
+    prior_hi = _fmt_price(daily_struct.get("prior_major_high"))
+    prior_lo = _fmt_price(daily_struct.get("prior_major_low"))
+
+    prev_range_txt = f"{_fmt_price(daily_recap.get('prev_high'))} / {_fmt_price(daily_recap.get('prev_low'))}"
+    elements: list[dict[str, Any]] = [
+        _fields_div(("账户", account_id), ("品种", symbol)),
+        _fields_div(("复盘交易日", trade_date), ("日线收线 / 涨跌", f"{candle_type} · {chg_txt}")),
+        _fields_div(
+            ("开盘 / 收盘", f"{open_px} / {close_px}"),
+            ("最高 / 最低 (振幅)", f"{high_px} / {low_px} ({amp_px})"),
+        ),
+        _fields_div(("相对前日结构", vs_prev), ("日线结构偏向", macro_bias)),
+        _fields_div(("前日高 / 低", prev_range_txt), ("日线重要参考位", f"前高 {prior_hi} / 前低 {prior_lo}")),
+    ]
+
+    arb = _as_dict(ai_result.get("arbitration"))
+    tech = _as_dict(ai_result.get("technical"))
+    review_note = _clip_text(
+        arb.get("reasoning") or tech.get("rationale") or ai_result.get("indicators_summary") or "",
+        360,
+    )
+    if review_note:
+        elements.append(_md_div(f"**每日走势复盘总结:**\n{review_note}"))
+
+    elements.append({"tag": "hr"})
+    elements.append(
+        _note_block(
+            f"北京时间 {_fmt_beijing_time(now)} · 数据周期：日线(D1) + 高周期(1H/4H) "
+            f"· 模式 {execution_mode} · 仅复盘不开仓"
+        )
+    )
+
+    fallback_md = (
+        f"{title}\n"
+        f"收线: {candle_type} {chg_txt} | 开 {open_px} 高 {high_px} 低 {low_px} 收 {close_px}\n"
+        f"相对前日: {vs_prev} | 日线偏向: {macro_bias}"
+    )
+    return title, fallback_md, _make_card(title, template, elements)
+
+
+def build_weekly_close_review_card(
+    *,
+    account_id: str,
+    symbol: str,
+    weekly_recap: dict[str, Any],
+    daily_structure: dict[str, Any] | None,
+    ai_result: dict[str, Any],
+    execution_mode: str,
+    now: datetime | None = None,
+) -> tuple[str, str, dict[str, Any]]:
+    """构建每周收盘后的周内走势复盘飞书交互卡片（使用日线 D1 周度汇总数据）。"""
+    iso_week = str(weekly_recap.get("iso_week") or "-")
+    start_d = str(weekly_recap.get("week_start_date") or "-")
+    end_d = str(weekly_recap.get("week_end_date") or "-")
+    net_change = _to_float(weekly_recap.get("net_change")) or 0.0
+    wk_type = str(weekly_recap.get("weekly_candle_type") or "-")
+    title = f"📊 每周收盘周内走势复盘 · {symbol} ({iso_week})"
+    template = "green" if net_change > 0 else ("red" if net_change < 0 else "blue")
+
+    wk_open = _fmt_price(weekly_recap.get("week_open"))
+    wk_close = _fmt_price(weekly_recap.get("week_close"))
+    wk_high = _fmt_price(weekly_recap.get("week_high"))
+    wk_low = _fmt_price(weekly_recap.get("week_low"))
+    wk_range = _fmt_price(weekly_recap.get("week_range"))
+    chg_txt = f"{_fmt_signed(net_change)} ({_fmt_signed(weekly_recap.get('change_pct'), suffix='%')})"
+    up_days = weekly_recap.get("up_days", 0)
+    down_days = weekly_recap.get("down_days", 0)
+    days_cnt = weekly_recap.get("trading_days_count", 0)
+    vs_prev_wk = str(weekly_recap.get("vs_prev_week") or "-")
+
+    daily_struct = _as_dict(daily_structure)
+    macro_bias = str(daily_struct.get("macro_bias") or ai_result.get("bias") or "neutral")
+    targets = [
+        _fmt_price(t.get("price"))
+        for t in (daily_struct.get("measured_targets") or [])[:3]
+        if isinstance(t, dict) and t.get("price") is not None
+    ]
+    targets_txt = ", ".join(t for t in targets if t != "-") or "-"
+
+    elements: list[dict[str, Any]] = [
+        _fields_div(("账户", account_id), ("品种", symbol)),
+        _fields_div(
+            ("复盘周期", f"{iso_week} ({start_d} ~ {end_d})"),
+            ("周线收线 / 涨跌", f"{wk_type} · {chg_txt}"),
+        ),
+        _fields_div(
+            ("周开 / 周收", f"{wk_open} / {wk_close}"),
+            ("周高 / 周低 (振幅)", f"{wk_high} / {wk_low} ({wk_range})"),
+        ),
+        _fields_div(
+            ("日线节奏", f"共 {days_cnt} 交易日 · 涨 {up_days} / 跌 {down_days}"),
+            ("相对上周结构", vs_prev_wk),
+        ),
+        _fields_div(("周后日线结构偏向", macro_bias), ("下周延伸参考位", targets_txt)),
+    ]
+
+    breakdown = [d for d in (weekly_recap.get("daily_breakdown") or []) if isinstance(d, dict)]
+    if breakdown:
+        day_lines = [
+            f"- {d.get('date')}: 开 `{_fmt_price(d.get('open'))}` 收 `{_fmt_price(d.get('close'))}` "
+            f"({_fmt_signed(d.get('change_pct'), suffix='%')})"
+            for d in breakdown
+        ]
+        elements.append(_md_div("**周内逐日走势明细:**\n" + "\n".join(day_lines)))
+
+    arb = _as_dict(ai_result.get("arbitration"))
+    tech = _as_dict(ai_result.get("technical"))
+    review_note = _clip_text(
+        arb.get("reasoning") or tech.get("rationale") or ai_result.get("indicators_summary") or "",
+        360,
+    )
+    if review_note:
+        elements.append(_md_div(f"**每周走势复盘与下周展望:**\n{review_note}"))
+
+    elements.append({"tag": "hr"})
+    elements.append(
+        _note_block(
+            f"北京时间 {_fmt_beijing_time(now)} · 数据周期：日线(D1)周度汇总 · 模式 {execution_mode} · 仅复盘不开仓"
+        )
+    )
+
+    fallback_md = (
+        f"{title}\n"
+        f"收线: {wk_type} {chg_txt} | 周开 {wk_open} 高 {wk_high} 低 {wk_low} 收 {wk_close}\n"
+        f"相对上周: {vs_prev_wk} | 下周参考位: {targets_txt}"
+    )
+    return title, fallback_md, _make_card(title, template, elements)
+
+
 __all__ = [
+    "build_daily_close_review_card",
     "build_htf_review_card",
+    "build_intraday_direction_review_card",
     "build_m15_review_card",
     "build_patrol_cycle_card",
+    "build_weekly_close_review_card",
 ]
