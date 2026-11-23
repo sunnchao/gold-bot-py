@@ -110,12 +110,16 @@ class SchedulerService:
         shadow: ShadowServiceProtocol | None = None,
         store: EaStore | None = None,
         now_iso: Callable[[], str] | None = None,
+        patrol: Any = None,
+        patrol_interval_seconds: int = 300,
     ) -> None:
         self._analysis = analysis
         self._command_lifecycle = command_lifecycle
         self._shadow = shadow
         self._store = store
         self._now_iso = now_iso if now_iso is not None else _default_now_iso
+        self._patrol = patrol
+        self._patrol_interval_seconds = max(15, int(patrol_interval_seconds))
         self._ai_stop_loss_queued_at_ms: dict[str, float] = {}
         self._started = False
         self._apscheduler: Any = None
@@ -151,7 +155,7 @@ class SchedulerService:
             await self._analysis.persist_position_states(account_id, symbol, position_states)
 
     # ------------------------------------------------------------------ 调度生命周期
-    async def start(self, *, position_review: bool = True) -> None:
+    async def start(self, *, position_review: bool = True, sop_patrol: bool = True) -> None:
         """启动 APScheduler 周期任务 + taskiq 内存 broker(调度入口)。
 
         任务本体就是 enqueue_analysis / enqueue_position_review(与 TS 的 job 语义一致);
@@ -180,6 +184,13 @@ class SchedulerService:
         scheduler = AsyncIOScheduler(timezone=UTC)
         if position_review:
             scheduler.add_job(self._position_review_cycle, "interval", minutes=1, id="scheduler:position_review")
+        if self._patrol is not None and sop_patrol:
+            scheduler.add_job(
+                self._patrol_cycle,
+                "interval",
+                seconds=self._patrol_interval_seconds,
+                id="scheduler:sop_patrol",
+            )
         scheduler.add_job(
             self._event_cancellation_cycle, "interval", seconds=10,
             id="scheduler:event_cancellation", next_run_time=datetime.now(UTC),
@@ -194,6 +205,29 @@ class SchedulerService:
             self._apscheduler = None
         self._broker = None
         self._started = False
+
+    async def _patrol_cycle(self) -> None:
+        if self._patrol is None or self._store is None:
+            return
+        for account_id in await self._store.list_account_ids():
+            if not await self._can_run_live_analysis(account_id):
+                continue
+            reg = await self._get_registration(account_id)
+            hb = await self._get_heartbeat(account_id)
+            symbols = list(
+                dict.fromkeys(
+                    [
+                        *string_array_field(reg, "ai_symbols"),
+                        *string_array_field(hb, "ai_symbols"),
+                        *(await self._store.list_symbols(account_id)),
+                    ]
+                )
+            )
+            for symbol in symbols:
+                try:
+                    await self._patrol.run_patrol(account_id, symbol, trigger_type="patrol")
+                except Exception as exc:  # noqa: BLE001
+                    print(f"[SOP] patrol cycle error account={account_id} symbol={symbol} err={exc}")
 
     async def _analysis_cycle(self) -> None:
         store = self._store
@@ -878,6 +912,8 @@ def create_scheduler_service(options: dict[str, Any]) -> SchedulerService:
         shadow=options.get("shadow"),
         store=options.get("store"),
         now_iso=options.get("now_iso"),
+        patrol=options.get("patrol"),
+        patrol_interval_seconds=int(options.get("patrol_interval_seconds") or 300),
     )
 
 

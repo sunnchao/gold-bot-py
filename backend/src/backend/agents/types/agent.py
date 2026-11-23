@@ -7,7 +7,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from typing import Literal
+from typing import Any, Literal
 
 from backend.agents.types.analysis import (
     ArbitrationResult,
@@ -121,6 +121,7 @@ class AISignalResult:
     trade_recommendation: TradeRecommendation | None = None
     trade_plan: TradePlan | None = None
     dual_trade_plan: DualTradePlan | None = None  # 双向下单支持
+    sop_context: dict[str, Any] | None = None
 
 
 # --- Analysis State ---

@@ -481,6 +481,7 @@ async def handle_admin_route(request: dict, deps: dict, helpers: dict) -> JsonRe
             and parts[2] == "events"
             and parts[3] == "stream"
         )
+        or (len(parts) >= 4 and parts[0] == "api" and parts[1] == "v1" and parts[2] == "sop")
     )
     is_go_method_agnostic_admin_read = (
         (len(parts) == 3 and parts[0] == "api" and parts[1] == "v1" and parts[2] == "accounts")
@@ -761,6 +762,43 @@ async def handle_admin_route(request: dict, deps: dict, helpers: dict) -> JsonRe
             "body": None,
             "rawBody": helpers["event_stream_snapshot"](store, deps["now_iso"]()),
         }
+
+    # --- /api/v1/sop/ledger/:account_id/:symbol & /api/v1/sop/patrol-logs/:account_id[/:symbol] ---
+    if len(parts) >= 5 and parts[0] == "api" and parts[1] == "v1" and parts[2] == "sop":
+        resource = parts[3]
+        acc_id = _decode_path_segment(parts[4])
+        if resource == "ledger" and len(parts) >= 6:
+            raw_sym = _decode_path_segment(parts[5])
+            norm_sym = raw_sym.strip().upper()
+            ledger = await store.get_watch_ledger(acc_id, norm_sym)
+            return {
+                "statusCode": 200,
+                "body": {
+                    "account_id": acc_id,
+                    "symbol": norm_sym,
+                    "ledger": ledger,
+                },
+            }
+        if resource == "patrol-logs":
+            log_sym: str | None = _decode_path_segment(parts[5]) if len(parts) >= 6 else None
+            log_norm_sym: str | None = log_sym.strip().upper() if log_sym else None
+            qs = parse_qs(urlsplit(str(request.get("url") or "")).query)
+            raw_limit = (qs.get("limit") or ["50"])[0]
+            try:
+                limit_val = max(1, min(int(raw_limit), 500))
+            except ValueError:
+                limit_val = 50
+            since_list = qs.get("since") or []
+            since_val = since_list[0] if since_list else None
+            logs = await store.list_patrol_logs(acc_id, log_norm_sym, limit=limit_val, since=since_val)
+            return {
+                "statusCode": 200,
+                "body": {
+                    "account_id": acc_id,
+                    "symbol": log_norm_sym,
+                    "logs": logs,
+                },
+            }
 
     return error(404, "not found")
 

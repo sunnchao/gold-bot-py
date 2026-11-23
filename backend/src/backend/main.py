@@ -11,6 +11,7 @@ from backend.api.app import create_api_app
 from backend.core.config import load_gold_bot_env
 from backend.core.database import create_store_from_env, ensure_store_schema
 from backend.notifications import FeishuNotifier
+from backend.services.sop import AlertRouter, PatrolService
 from backend.trading_core.riskgate.economic_calendar import load_economic_calendar
 
 
@@ -37,14 +38,44 @@ async def trigger_llm_analysis(account_id: str, symbol: str, timeframe: str, bar
     )
 
 
+feishu_notifier = FeishuNotifier(
+    webhook_url=runtime_env.GB_FEISHU_WEBHOOK_URL,
+    secret=runtime_env.GB_FEISHU_SECRET,
+    log=print,
+)
+sop_patrol: PatrolService | None = None
+if runtime_env.GB_SOP_PATROL_ENABLED:
+    sop_execution_mode: Literal["advisory_only", "integrated"] = (
+        "integrated" if runtime_env.GB_SOP_EXECUTION_MODE == "integrated" else "advisory_only"
+    )
+    sop_patrol = PatrolService(
+        store=store,
+        workflow_service=agent_workflow,
+        alert_router=AlertRouter(feishu=feishu_notifier),
+        execution_mode=sop_execution_mode,
+        htf_review_minutes=runtime_env.GB_SOP_HTF_REVIEW_MINUTES,
+        move_trigger_pct=runtime_env.GB_SOP_MOVE_TRIGGER_PCT,
+        m15_always_run_entry=runtime_env.GB_SOP_M15_ALWAYS_RUN_ENTRY,
+    )
+
+
+async def trigger_patrol_on_bar_close(account_id: str, symbol: str, timeframe: str, bar_time: str) -> None:
+    if sop_patrol is None:
+        await trigger_llm_analysis(account_id, symbol, timeframe, bar_time)
+        return
+    ttype = "m15_close" if timeframe.strip().upper() == "M15" else f"{timeframe.strip().lower()}_close"
+    await sop_patrol.run_patrol(account_id, symbol, trigger_type=ttype)
+
+
 app_options: dict[str, object] = {
     "store": store,
     "llm_analysis_trigger": trigger_llm_analysis,
-    "feishu": FeishuNotifier(
-        webhook_url=runtime_env.GB_FEISHU_WEBHOOK_URL,
-        secret=runtime_env.GB_FEISHU_SECRET,
-        log=print,
-    ),
+    "patrol_trigger": trigger_patrol_on_bar_close if sop_patrol is not None else None,
+    "sop_patrol": sop_patrol,
+    "sop_patrol_enabled": runtime_env.GB_SOP_PATROL_ENABLED,
+    "sop_execution_mode": runtime_env.GB_SOP_EXECUTION_MODE,
+    "sop_patrol_interval_seconds": runtime_env.GB_SOP_PATROL_INTERVAL_SECONDS,
+    "feishu": feishu_notifier,
 }
 if agent_token:
     app_options.update(
@@ -63,7 +94,10 @@ app.router.add_event_handler("shutdown", app.state.scheduler.stop)
 async def initialize_persistence() -> None:
     load_economic_calendar()
     await ensure_store_schema(store)
-    await app.state.scheduler.start(position_review=False)
+    await app.state.scheduler.start(
+        position_review=False,
+        sop_patrol=runtime_env.GB_SOP_PATROL_ENABLED,
+    )
 
 app.add_middleware(
     CORSMiddleware,

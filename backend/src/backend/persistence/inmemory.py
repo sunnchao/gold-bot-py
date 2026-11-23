@@ -68,8 +68,11 @@ class InMemoryEaStore(EaStore):
         self._closed_trades: list[EaRecord] = []
         self._daily_equities: dict[str, float] = {}
         self._bar_close_events: set[tuple[str, str, str, str]] = set()
+        self._watch_ledgers: dict[tuple[str, str], EaRecord] = {}
+        self._patrol_logs: list[EaRecord] = []
         self._next_decision_event_id = 1
         self._next_pending_signal_id = 1
+        self._next_patrol_log_id = 1
 
     # ------------------------------------------------------------------ 快照
     def _snapshot(self, kind: str, account: str, symbol: str, timeframe: str = "") -> EaRecord | None:
@@ -510,6 +513,76 @@ class InMemoryEaStore(EaStore):
         key = f"{account_id_}|{utc_date}"
         if key not in self._daily_equities:
             self._daily_equities[key] = equity
+
+    # ---- SOP 增量记忆账本 & 巡检日志
+    async def get_watch_ledger(self, account_id_: str, symbol: str) -> EaRecord | None:
+        key = (account_id_, normalize_symbol(symbol))
+        existing = self._watch_ledgers.get(key)
+        return clone_record(existing) if existing is not None else None
+
+    async def save_watch_ledger(self, account_id_: str, symbol: str, ledger: EaRecord) -> EaRecord:
+        norm_symbol = normalize_symbol(symbol)
+        key = (account_id_, norm_symbol)
+        existing = self._watch_ledgers.get(key)
+        next_version = (
+            int(existing.get("version") or 0) + 1
+            if existing is not None
+            else max(1, int(ledger.get("version") or 1))
+        )
+        now = current_timestamp()
+        stored = clone_record(ledger)
+        stored["account_id"] = account_id_
+        stored["symbol"] = norm_symbol
+        stored["version"] = next_version
+        stored["updated_at"] = now
+        stored["htf_reviewed_at"] = stored.get("htf_reviewed_at")
+        stored["m15_reviewed_at"] = stored.get("m15_reviewed_at")
+        self._watch_ledgers[key] = stored
+        return clone_record(stored)
+
+    async def append_patrol_log(self, payload: EaRecord) -> EaRecord:
+        log_id = str(payload.get("id") or f"patrol-{self._next_patrol_log_id}")
+        self._next_patrol_log_id += 1
+        raw_details = payload.get("details")
+        entry: EaRecord = {
+            "id": log_id,
+            "account_id": str(payload["account_id"]),
+            "symbol": normalize_symbol(str(payload["symbol"])),
+            "trigger_type": str(payload.get("trigger_type") or ""),
+            "tier": str(payload.get("tier") or ""),
+            "alert_level": str(payload.get("alert_level") or "silent"),
+            "action_taken": str(payload.get("action_taken") or ""),
+            "summary": str(payload.get("summary") or ""),
+            "details": clone_record(raw_details) if isinstance(raw_details, dict) else {},
+            "created_at": str(payload.get("created_at") or current_timestamp()),
+        }
+        self._patrol_logs.append(entry)
+        return clone_record(entry)
+
+    async def list_patrol_logs(
+        self,
+        account_id_: str,
+        symbol: str | None = None,
+        *,
+        limit: int = 50,
+        since: str | None = None,
+    ) -> list[EaRecord]:
+        safe_limit = max(1, min(int(limit), 500))
+        norm_symbol = normalize_symbol(symbol) if symbol is not None and symbol.strip() else None
+        since_val = since.strip() if since is not None and since.strip() else None
+        filtered = [
+            entry
+            for entry in self._patrol_logs
+            if entry["account_id"] == account_id_
+            and (norm_symbol is None or entry["symbol"] == norm_symbol)
+            and (since_val is None or entry["created_at"] >= since_val)
+        ]
+        ordered = sorted(
+            filtered,
+            key=lambda item: (str(item["created_at"]), str(item["id"])),
+            reverse=True,
+        )
+        return [clone_record(item) for item in ordered[:safe_limit]]
 
     async def close(self) -> None:
         return None

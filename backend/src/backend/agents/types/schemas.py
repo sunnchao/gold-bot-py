@@ -625,6 +625,10 @@ class GoldbotPayloadSchema(_StrictModel):
     trend_context: TrendContextSchema | None = None
     harmonic_context: HarmonicContextSchema | None = None
     breakout_levels: list[BreakoutLevel] | None = None
+    daily_structure: dict[str, Any] | None = None
+    confluence_levels: list[dict[str, Any]] | None = None
+    day_range: dict[str, Any] | None = None
+    watch_ledger: dict[str, Any] | None = None
 
 
 # ---------------------------------------------------------------- safeParseLLM + helpers

@@ -72,6 +72,8 @@ def test_creates_all_expected_tables(db_path: str) -> None:
             "closed_trades",
             "daily_equity",
             "bar_close_events",
+        "watch_ledgers",
+        "patrol_logs",
         ):
             assert expected in tables, f"missing table {expected}"
     finally:

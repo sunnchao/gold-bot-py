@@ -762,3 +762,92 @@ async def test_list_commands_orders_by_created_at(store: EaStore) -> None:
     commands = await store.list_commands("acc-1")
     assert len(commands) == 2
     assert [c["command_id"] for c in commands] == ["list-1", "list-2"]
+
+
+async def test_watch_ledger_roundtrip_and_version_increment(store: EaStore) -> None:
+    assert await store.get_watch_ledger("acc-1", "XAUUSD") is None
+
+    saved_v1 = await store.save_watch_ledger(
+        "acc-1",
+        "xauusd",
+        {
+            "htf_anchor": {"macro_bias": "bullish", "intraday_direction": "long"},
+            "key_levels": [{"price": 4000.0, "tier": "core"}],
+            "playbooks": [{"id": "pb-1", "state": "armed"}],
+            "htf_reviewed_at": "2026-11-19T08:00:00Z",
+            "m15_reviewed_at": None,
+        },
+    )
+    assert saved_v1["symbol"] == "XAUUSD"
+    assert saved_v1["version"] == 1
+    assert saved_v1["htf_reviewed_at"] == "2026-11-19T08:00:00Z"
+
+    # 修改返回副本不能污染存储状态
+    saved_v1["key_levels"].append({"price": 9999.0})
+    loaded_v1 = await store.get_watch_ledger("acc-1", " XAUUSD ")
+    assert loaded_v1 is not None
+    assert loaded_v1["version"] == 1
+    assert len(loaded_v1["key_levels"]) == 1
+
+    saved_v2 = await store.save_watch_ledger(
+        "acc-1",
+        "XAUUSD",
+        {
+            **loaded_v1,
+            "m15_reviewed_at": "2026-11-19T08:15:00Z",
+        },
+    )
+    assert saved_v2["version"] == 2
+    assert saved_v2["m15_reviewed_at"] == "2026-11-19T08:15:00Z"
+
+
+async def test_patrol_logs_append_and_query(store: EaStore) -> None:
+    await store.append_patrol_log(
+        {
+            "id": "pl-1",
+            "account_id": "acc-1",
+            "symbol": "xauusd",
+            "trigger_type": "htf_schedule",
+            "tier": "htf_anchor",
+            "alert_level": "notify",
+            "action_taken": "htf_reviewed",
+            "summary": "H1/H4 锚定完成",
+            "details": {"bias": "long"},
+            "created_at": "2026-11-19T08:00:00Z",
+        }
+    )
+    await store.append_patrol_log(
+        {
+            "id": "pl-2",
+            "account_id": "acc-1",
+            "symbol": "xagusd",
+            "trigger_type": "m15_close",
+            "tier": "m15_entry",
+            "alert_level": "silent",
+            "action_taken": "no_setup",
+            "summary": "无动作",
+            "details": {},
+            "created_at": "2026-11-19T08:15:00Z",
+        }
+    )
+    await store.append_patrol_log(
+        {
+            "id": "pl-3",
+            "account_id": "acc-1",
+            "symbol": "XAUUSD",
+            "trigger_type": "key_level_break",
+            "tier": "m15_entry",
+            "alert_level": "actionable",
+            "action_taken": "entry_signal",
+            "summary": "破位站稳触发",
+            "details": {"level": 4050.0},
+            "created_at": "2026-11-19T08:30:00Z",
+        }
+    )
+
+    xau_logs = await store.list_patrol_logs("acc-1", "XAUUSD")
+    assert [row["id"] for row in xau_logs] == ["pl-3", "pl-1"]
+    assert xau_logs[0]["details"] == {"level": 4050.0}
+
+    all_since = await store.list_patrol_logs("acc-1", since="2026-11-19T08:15:00Z", limit=10)
+    assert [row["id"] for row in all_since] == ["pl-3", "pl-2"]

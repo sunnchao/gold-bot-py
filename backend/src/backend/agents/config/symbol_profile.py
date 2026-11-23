@@ -112,7 +112,7 @@ PROFILES: dict[str, SymbolProfile] = {
     "XAGUSD": _build_profile(
         "XAGUSD", "白银/美元 (Silver/USD)", 3, 0.01,
         {"M15": (0.03, 0.20), "M30": (0.05, 0.30), "H1": (0.10, 0.60), "H4": (0.20, 1.20)},
-        1.5, 3.0, "high", "typically 20–40 USD/oz", "metal", True, (15, 50),
+        1.5, 3.0, "high", "typically 20–120 USD/oz", "metal", True, (15, 50),
     ),
     "US100CASH": _build_profile(
         "US100CASH", "纳斯达克100指数 (US100 Cash CFD)", 2, 1.0,

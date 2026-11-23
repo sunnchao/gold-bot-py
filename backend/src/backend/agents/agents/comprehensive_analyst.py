@@ -1071,6 +1071,128 @@ def strip_hoisted_pivot_fields(indicator: JSONDict) -> JSONDict:
     return out
 
 
+def _format_sop_realtime_section(
+    payload: JSONDict,
+    options: JSONDict | None = None,
+) -> str:
+    """当 payload 或 options 含 SOP 结构/增量记忆字段时, 构造紧凑的 SOP 前提注入块。"""
+    opts = options or {}
+    daily = payload.get("daily_structure") if isinstance(payload.get("daily_structure"), dict) else None
+    conf = payload.get("confluence_levels") if isinstance(payload.get("confluence_levels"), list) else None
+    day_range = payload.get("day_range") if isinstance(payload.get("day_range"), dict) else None
+    ledger = opts.get("previousLedger") if isinstance(opts.get("previousLedger"), dict) else payload.get("watch_ledger")
+    role = str(opts.get("analysisRole") or "")
+    patrol_ctx = opts.get("patrolContext") if isinstance(opts.get("patrolContext"), dict) else None
+
+    if not any([daily, conf, day_range, ledger, role, patrol_ctx]):
+        return ""
+
+    blocks: list[str] = ["\n### SOP Structure & Multi-Timeframe Premise"]
+    if daily and daily.get("status") == "ok":
+        blocks.append(
+            f"- **D1 Structure:** macro_bias={daily.get('macro_bias')} | in_vacuum={daily.get('in_vacuum')} | "
+            f"vacuum_zone={stable_stringify(daily.get('vacuum_zone'))} | "
+            f"prior_high={daily.get('prior_major_high')} | prior_low={daily.get('prior_major_low')} | "
+            f"measured_targets={stable_stringify(daily.get('measured_targets'))}"
+        )
+    if day_range and day_range.get("status") == "ok":
+        blocks.append(
+            f"- **Day Range & ATR Budget:** realized={day_range.get('realized_range')} / "
+            f"expected_atr={day_range.get('expected_atr')} ({day_range.get('atr_consumed_pct')}%), "
+            f"stage={day_range.get('expansion_stage')}, exhausted={day_range.get('range_exhausted')}, "
+            f"bounds=[{day_range.get('intraday_lower_bound')}, {day_range.get('intraday_upper_bound')}]"
+        )
+    if conf:
+        top_levels = [
+            f"{lv.get('price')}({lv.get('role')}/{lv.get('tier')}/srcs={','.join(lv.get('sources') or [])})"
+            for lv in conf[:6]
+            if isinstance(lv, dict)
+        ]
+        if top_levels:
+            blocks.append(f"- **Confluence Key Levels:** {' | '.join(top_levels)}")
+    if isinstance(ledger, dict) or role:
+        from backend.services.sop.ledger import format_ledger_prompt_block
+
+        blocks.append(format_ledger_prompt_block(ledger if isinstance(ledger, dict) else None, role=role or "standard"))
+    if patrol_ctx:
+        blocks.append(f"- **Patrol Trigger Context:** {stable_stringify(patrol_ctx)}")
+    return "\n".join(blocks) + "\n"
+
+
+def _build_sop_context(
+    *,
+    result: JSONDict,
+    payload: JSONDict,
+    options: JSONDict,
+) -> JSONDict:
+    """从分析结果与上下文中归纳 SOP 结构化前提/靶位/否决边界。"""
+    raw_arb = result.get("arbitration")
+    arb: JSONDict = raw_arb if isinstance(raw_arb, dict) else {}
+    raw_trade = arb.get("trade_recommendation")
+    trade: JSONDict = raw_trade if isinstance(raw_trade, dict) else {}
+    raw_daily = payload.get("daily_structure")
+    daily: JSONDict | None = raw_daily if isinstance(raw_daily, dict) else None
+    raw_dr = payload.get("day_range")
+    day_range: JSONDict | None = raw_dr if isinstance(raw_dr, dict) else None
+    raw_pl = options.get("previousLedger")
+    prev_ledger: JSONDict | None = raw_pl if isinstance(raw_pl, dict) else None
+    role = str(options.get("analysisRole") or "standard")
+
+    raw_dir = str(arb.get("final_direction") or trade.get("direction") or "hold").lower()
+    if raw_dir in ("long", "buy", "bullish"):
+        inferred_dir = "long"
+    elif raw_dir in ("short", "sell", "bearish"):
+        inferred_dir = "short"
+    else:
+        inferred_dir = "wait"
+
+    # 若处于 M15 切入层且既有 HTF 锚定存在, 优先保留既有 HTF 锚定方向作审计对照
+    htf_anchor = prev_ledger.get("htf_anchor") if isinstance(prev_ledger, dict) else None
+    htf_dir = (
+        str(htf_anchor.get("intraday_direction") or inferred_dir)
+        if role == "m15_entry" and isinstance(htf_anchor, dict)
+        else inferred_dir
+    )
+
+    short_targets: list[float] = []
+    for k in ("take_profit_1", "take_profit_2"):
+        val = trade.get(k)
+        if isinstance(val, (int, float)) and val > 0:
+            short_targets.append(float(val))
+
+    long_targets: list[float] = []
+    if daily and isinstance(daily.get("measured_targets"), list):
+        for t in daily["measured_targets"][:3]:
+            if isinstance(t, dict) and isinstance(t.get("price"), (int, float)):
+                long_targets.append(float(t["price"]))
+
+    sl = trade.get("stop_loss")
+    sl_num = float(sl) if isinstance(sl, (int, float)) and sl > 0 else None
+    veto_boundary: JSONDict | None = None
+    if role == "m15_entry" and isinstance(htf_anchor, dict) and isinstance(htf_anchor.get("veto_boundary"), dict):
+        veto_boundary = dict(htf_anchor["veto_boundary"])
+    elif sl_num is not None:
+        veto_boundary = {
+            "long_invalid_below": sl_num if htf_dir == "long" else None,
+            "short_invalid_above": sl_num if htf_dir == "short" else None,
+            "reason": str(arb.get("reasoning") or "HTF 结构边界"),
+        }
+
+    inferred_macro = (
+        "bullish" if htf_dir == "long" else ("bearish" if htf_dir == "short" else "neutral")
+    )
+    return {
+        "analysis_role": role,
+        "macro_bias": (daily or {}).get("macro_bias") or inferred_macro,
+        "intraday_direction": htf_dir,
+        "short_term_targets": short_targets,
+        "long_term_targets": long_targets,
+        "veto_boundary": veto_boundary,
+        "day_range": day_range,
+        "daily_structure": daily,
+    }
+
+
 def build_realtime_data_prompt(
     payload: JSONDict,
     pending_signal: JSONDict | None,
@@ -1078,6 +1200,7 @@ def build_realtime_data_prompt(
     profile: JSONDict,
     harmonic_volatile: JSONDict | None,
     market_only: bool = False,
+    options: JSONDict | None = None,
 ) -> str:
     """镜像 buildRealtimeDataPrompt:每请求变化的实时层(不缓存)。"""
     market = payload.get("market") or {}
@@ -1148,7 +1271,7 @@ def build_realtime_data_prompt(
 {stable_stringify(harmonic_volatile) if harmonic_volatile else 'none'}
 
 {pending_signal_text}
-
+{_format_sop_realtime_section(payload, options)}
 ### Final Reminders
 - Output MUST include all 5 top-level sections: TECHNICAL, WAVE, CHANLUN, RISK, ARBITRATION
 - {reminder}
@@ -2037,9 +2160,27 @@ class ComprehensiveAnalystService:
         market = payload.get("market") or {}
         current_price = market.get("bid") or market.get("ask") or 0
 
+        sop_role = options.get("analysisRole")
+        symbol_system_text = build_symbol_system_prompt(profile)
+        if sop_role == "htf_anchor":
+            symbol_system_text += (
+                "\n\n## SOP ROLE: HTF_ANCHOR (TIER 1)\n"
+                "- Primary mission: establish D1/H4/H1 macro bias, intraday direction, short/long targets, "
+                "structural veto boundary, and primary/backup playbooks with clear invalidation rules.\n"
+                "- Keep M15 triggers subordinate to the HTF structure."
+            )
+        elif sop_role == "m15_entry":
+            symbol_system_text += (
+                "\n\n## SOP ROLE: M15_ENTRY (TIER 2)\n"
+                "- Primary mission: execute precise M15 entry timing, SL/TP refinement strictly UNDER the "
+                "persisted WatchLedger HTF Anchor premise.\n"
+                "- Do NOT overturn HTF intraday direction unless veto boundary breach is confirmed "
+                "with double evidence."
+            )
+
         system_blocks = [
             SystemBlock(build_common_system_prompt(), cacheable=True),
-            SystemBlock(build_symbol_system_prompt(profile), cacheable=True),
+            SystemBlock(symbol_system_text, cacheable=True),
         ]
 
         structure_result = build_static_context_prompt(payload, symbol, self.structure_cache)
@@ -2061,6 +2202,7 @@ class ComprehensiveAnalystService:
                     profile,
                     structure_result["harmonicVolatile"],
                     market_only,
+                    options=options,
                 ),
                 cacheable=False,
             ),
@@ -2258,6 +2400,17 @@ class ComprehensiveAnalystService:
                     {"symbol": symbol, "type": trade_action.get("type"), "side": trade_action.get("side")},
                     "tradeAction decided",
                 )
+
+        if (
+            options.get("analysisRole") is not None
+            or payload.get("daily_structure") is not None
+            or payload.get("day_range") is not None
+        ):
+            result["sop_context"] = _build_sop_context(
+                result=result,
+                payload=payload,
+                options=options,
+            )
 
         return result
 

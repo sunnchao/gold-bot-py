@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Literal
+from typing import Any, Literal
 
 __all__ = [
     "AccountInfo",
@@ -288,3 +288,7 @@ class GoldbotPayload:
     bars: dict[str, list[GoldbotBar]] | None = None
     trend_context: TrendContextPayload | None = None
     harmonic_context: HarmonicContextPayload | None = None
+    daily_structure: dict[str, Any] | None = None
+    confluence_levels: list[dict[str, Any]] | None = None
+    day_range: dict[str, Any] | None = None
+    watch_ledger: dict[str, Any] | None = None

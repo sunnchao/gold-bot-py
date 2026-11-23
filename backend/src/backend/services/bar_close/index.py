@@ -22,10 +22,12 @@ class BarCloseEventService:
         store: EaStore,
         llm_trigger: AnalysisTrigger | None = None,
         technical_trigger: AnalysisTrigger | None = None,
+        patrol_trigger: AnalysisTrigger | None = None,
     ) -> None:
         self._store = store
         self._llm_trigger = llm_trigger
         self._technical_trigger = technical_trigger
+        self._patrol_trigger = patrol_trigger
         self._tasks: set[asyncio.Future[None]] = set()
         self._logger = logging.getLogger("goldbot.bar_close")
 
@@ -64,6 +66,10 @@ class BarCloseEventService:
         return True
 
     def _trigger_for(self, timeframe: str) -> AnalysisTrigger | None:
+        if self._patrol_trigger is not None:
+            if timeframe in (TRIGGER_TIMEFRAME, "H1", "H4"):
+                return self._patrol_trigger
+            return None
         if timeframe == TRIGGER_TIMEFRAME:
             return self._llm_trigger
         return None

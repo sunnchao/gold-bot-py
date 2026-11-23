@@ -22,6 +22,38 @@ class GoldBotEnv:
     GB_DISCORD_WEBHOOK_URL: str
     GB_FEISHU_WEBHOOK_URL: str
     GB_FEISHU_SECRET: str
+    GB_SOP_PATROL_ENABLED: bool = True
+    GB_SOP_EXECUTION_MODE: str = "advisory_only"
+    GB_SOP_PATROL_INTERVAL_SECONDS: int = 300
+    GB_SOP_HTF_REVIEW_MINUTES: int = 60
+    GB_SOP_MOVE_TRIGGER_PCT: float = 0.5
+    GB_SOP_M15_ALWAYS_RUN_ENTRY: bool = False
+
+
+def _parse_int_default(raw: str | None, default: int, *, minimum: int) -> int:
+    if raw is None or not raw.strip():
+        return default
+    try:
+        val = int(raw.strip())
+    except ValueError:
+        return default
+    return max(minimum, val)
+
+
+def _parse_float_default(raw: str | None, default: float, *, minimum: float) -> float:
+    if raw is None or not raw.strip():
+        return default
+    try:
+        val = float(raw.strip())
+    except ValueError:
+        return default
+    return max(minimum, val)
+
+
+def _parse_sop_mode(raw: str | None) -> str:
+    if raw is not None and raw.strip().lower() == "integrated":
+        return "integrated"
+    return "advisory_only"
 
 
 def load_gold_bot_env(source: Mapping[str, str | None] | None = None) -> GoldBotEnv:
@@ -40,6 +72,18 @@ def load_gold_bot_env(source: Mapping[str, str | None] | None = None) -> GoldBot
         GB_DISCORD_WEBHOOK_URL=_string(env, "GB_DISCORD_WEBHOOK_URL", ""),
         GB_FEISHU_WEBHOOK_URL=_string(env, "GB_FEISHU_WEBHOOK_URL", ""),
         GB_FEISHU_SECRET=_string(env, "GB_FEISHU_SECRET", ""),
+        GB_SOP_PATROL_ENABLED=_parse_boolean(env.get("GB_SOP_PATROL_ENABLED"), True),
+        GB_SOP_EXECUTION_MODE=_parse_sop_mode(env.get("GB_SOP_EXECUTION_MODE")),
+        GB_SOP_PATROL_INTERVAL_SECONDS=_parse_int_default(
+            env.get("GB_SOP_PATROL_INTERVAL_SECONDS"), 300, minimum=15
+        ),
+        GB_SOP_HTF_REVIEW_MINUTES=_parse_int_default(
+            env.get("GB_SOP_HTF_REVIEW_MINUTES"), 60, minimum=5
+        ),
+        GB_SOP_MOVE_TRIGGER_PCT=_parse_float_default(
+            env.get("GB_SOP_MOVE_TRIGGER_PCT"), 0.5, minimum=0.05
+        ),
+        GB_SOP_M15_ALWAYS_RUN_ENTRY=_parse_boolean(env.get("GB_SOP_M15_ALWAYS_RUN_ENTRY"), False),
     )
 
 

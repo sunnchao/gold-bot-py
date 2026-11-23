@@ -133,6 +133,24 @@ async def evaluate_ai_approve_pending_gate(gate_input: AIApprovePendingGateInput
             if lots < 0.01:
                 return _reject("trend.weak_lots_below_min")
 
+    if gate_input.get("enforceSopLedger") is True:
+        watch_ledger = await store.get_watch_ledger(account_id, tradable_symbol)
+        if isinstance(watch_ledger, dict):
+            htf_anchor = watch_ledger.get("htf_anchor")
+            if isinstance(htf_anchor, dict):
+                htf_dir = str(htf_anchor.get("intraday_direction") or "wait").lower()
+                side_up = _string_field(trade_plan, "side").strip().upper()
+                if (htf_dir == "long" and side_up == "SELL") or (htf_dir == "short" and side_up == "BUY"):
+                    return _reject("sop.m15_counter_htf_blocked")
+                veto = htf_anchor.get("veto_boundary")
+                if isinstance(veto, dict):
+                    inv_low = veto.get("long_invalid_below")
+                    inv_high = veto.get("short_invalid_above")
+                    if htf_dir == "long" and isinstance(inv_low, (int, float)) and current_price < float(inv_low):
+                        return _reject("sop.veto_boundary_breached")
+                    if htf_dir == "short" and isinstance(inv_high, (int, float)) and current_price > float(inv_high):
+                        return _reject("sop.veto_boundary_breached")
+
     positions = await store.get_positions(account_id, tradable_symbol)
     side = _string_field(trade_plan, "side")
     if _has_open_position_on_side(positions, tradable_symbol, side, "ai_signal"):

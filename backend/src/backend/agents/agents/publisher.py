@@ -482,6 +482,26 @@ def build_feishu_card(account_id: str, symbol: str, result: JSONDict) -> JSONDic
                 lines.append(tr["rationale"])
             analysis_sections.append({"tag": "div", "text": {"tag": "lark_md", "content": "\n".join(lines)}})
 
+    if isinstance(result.get("sop_context"), dict):
+        sop = result["sop_context"]
+        sop_lines = [
+            "**🧭 SOP 增量记忆 & 盯盘框架:**",
+            f"角色层级: `{sop.get('analysis_role', 'standard')}` | 宏观偏置: {sop.get('macro_bias')} "
+            f"| 日内前提: {sop.get('intraday_direction')}",
+            f"短期目标: {sop.get('short_term_targets') or []} | 长期目标: {sop.get('long_term_targets') or []}",
+        ]
+        if sop.get("veto_boundary"):
+            sop_lines.append(f"否决边界: {sop['veto_boundary']}")
+        if isinstance(sop.get("day_range"), dict) and sop["day_range"].get("status") == "ok":
+            dr = sop["day_range"]
+            sop_lines.append(
+                f"当日振幅: {dr.get('realized_range')} "
+                f"({dr.get('atr_consumed_pct')}% ATR / {dr.get('expansion_stage')})"
+            )
+        if sop.get("sop_blocks"):
+            sop_lines.append(f"SOP 拦截标记: {', '.join(sop['sop_blocks'])}")
+        analysis_sections.append({"tag": "div", "text": {"tag": "lark_md", "content": "\n".join(sop_lines)}})
+
     analysis_sections.append({"tag": "hr"})
     analysis_sections.append(
         {

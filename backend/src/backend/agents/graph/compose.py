@@ -628,6 +628,78 @@ def compose_final_signal(state: AnalysisGraphState) -> AISignalResult | None:
         })
         trade_plan = dual_trade_plan = None
 
+    sop_blocks: list[str] = []
+    analysis_role = state.get("analysisRole")
+    raw_prev_ledger = state.get("previousLedger")
+    prev_ledger: dict[str, Any] | None = raw_prev_ledger if isinstance(raw_prev_ledger, dict) else None
+    raw_patrol_ctx = state.get("patrolContext")
+    patrol_ctx: dict[str, Any] = raw_patrol_ctx if isinstance(raw_patrol_ctx, dict) else {}
+    payload_day_range = _get(state.get("payload"), "day_range")
+    raw_triggers = patrol_ctx.get("trigger_reasons")
+    trigger_reasons = [str(r) for r in raw_triggers] if isinstance(raw_triggers, list) else []
+
+    if prev_ledger is not None:
+        raw_anchor = prev_ledger.get("htf_anchor")
+        htf_anchor: dict[str, Any] = raw_anchor if isinstance(raw_anchor, dict) else {}
+        htf_dir = str(htf_anchor.get("intraday_direction") or "wait").lower()
+        arb_dir = str(_get(arbitration, "final_direction") or "hold").lower()
+        arb_action = str(_get(arbitration, "action") or "hold").lower()
+        proposed_dir = (
+            "long" if arb_dir in ("long", "buy", "bullish")
+            else ("short" if arb_dir in ("short", "sell", "bearish") else None)
+        )
+        has_veto_breach = "veto_boundary_breached" in trigger_reasons
+        has_reclaim_or_break = any(
+            r in trigger_reasons
+            for r in (
+                "false_breakout_reclaim",
+                "false_breakdown_reclaim",
+                "key_level_breakout",
+                "key_level_breakdown",
+                "playbook_invalidated",
+            )
+        )
+        double_evidence = bool(
+            patrol_ctx.get("double_evidence")
+            or patrol_ctx.get("veto_confirmed")
+            or (has_veto_breach and has_reclaim_or_break)
+        )
+
+        if (
+            htf_dir in ("long", "short")
+            and proposed_dir in ("long", "short")
+            and proposed_dir != htf_dir
+            and arb_action == "open"
+            and not double_evidence
+        ):
+            if analysis_role == "m15_entry":
+                sop_blocks.append("sop.m15_counter_htf_blocked")
+            sop_blocks.append("sop.reverse_missing_double_evidence")
+
+        playbooks = [p for p in (prev_ledger.get("playbooks") or []) if isinstance(p, dict)]
+        all_exhausted = bool(playbooks) and all(str(p.get("state") or "").lower() == "exhausted" for p in playbooks)
+        range_exhausted = isinstance(payload_day_range, dict) and payload_day_range.get("range_exhausted") is True
+        if (
+            analysis_role == "m15_entry"
+            and arb_action == "open"
+            and ("logic_exhausted" in trigger_reasons or (all_exhausted and range_exhausted))
+        ):
+            sop_blocks.append("sop.logic_exhausted")
+
+    if sop_blocks:
+        confidence = min(confidence, 20)
+        arbitration = _with_arbitration(
+            arbitration,
+            {
+                "action": "hold",
+                "final_direction": "hold",
+                "confidence": confidence,
+                "reasoning": f"{_get(arbitration, 'reasoning', '')} | {' | '.join(sop_blocks)}",
+                "trade_recommendation": None,
+            },
+        )
+        trade_plan = dual_trade_plan = None
+
     risk_level = _get(risk_assessment, "riskLevel")
     trade_action_type = _get(trade_action, "type")
     risk_blocking = [code for code in filters["blocking"] if code != EVENT_BLACKOUT]
@@ -645,6 +717,8 @@ def compose_final_signal(state: AnalysisGraphState) -> AISignalResult | None:
     warnings = _get(risk_assessment, "warnings")
     if warnings:
         alert_reason_parts.append("; ".join(warnings))
+    if sop_blocks:
+        alert_reason_parts.append("; ".join(sop_blocks))
     alert_reason = "; ".join(alert_reason_parts) or None
 
     if technical is not None:
@@ -662,6 +736,11 @@ def compose_final_signal(state: AnalysisGraphState) -> AISignalResult | None:
         }
     else:
         sr_levels = None
+
+    raw_sop_ctx = _get(state.get("comprehensiveAnalysis"), "sop_context")
+    sop_ctx: dict[str, Any] | None = dict(raw_sop_ctx) if isinstance(raw_sop_ctx, dict) else None
+    if sop_blocks:
+        sop_ctx = {**(sop_ctx or {}), "sop_blocks": list(sop_blocks)}
 
     return AISignalResult(
         bias=bias,  # type: ignore[arg-type]
@@ -707,6 +786,7 @@ def compose_final_signal(state: AnalysisGraphState) -> AISignalResult | None:
         trade_recommendation=_get(arbitration, "trade_recommendation"),
         trade_plan=trade_plan,
         dual_trade_plan=dual_trade_plan,
+        sop_context=sop_ctx,
     )
 
 

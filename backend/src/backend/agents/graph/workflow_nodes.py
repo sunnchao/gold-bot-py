@@ -150,6 +150,7 @@ class ComprehensiveAnalystLike(Protocol):
         symbol: str,
         pending_signal: PendingSignal | None,
         all_current_prices: dict[str, float],
+        options: dict[str, Any] | None = None,
     ) -> ComprehensiveAnalysisResult: ...
     async def run_market_insight(
         self,
@@ -417,10 +418,19 @@ class WorkflowNodes:
                 if price > 0:
                     all_current_prices[sym] = price
 
+            sop_options: dict[str, Any] = {}
+            if state.get("analysisRole") is not None:
+                sop_options["analysisRole"] = state.get("analysisRole")
+            if state.get("previousLedger") is not None:
+                sop_options["previousLedger"] = state.get("previousLedger")
+            if state.get("patrolContext") is not None:
+                sop_options["patrolContext"] = state.get("patrolContext")
+
             if (
                 self.config is not None
                 and self.config.market_first_enabled is True
                 and self.market_insight_cache is not None
+                and not sop_options
             ):
                 return await self._comprehensive_market_first(state, payloads, all_current_prices)
 
@@ -429,12 +439,21 @@ class WorkflowNodes:
                 payload = payloads.get(symbol)
                 if payload is None:
                     continue
-                result = await self.comprehensive_analyst.run(
-                    payload,
-                    symbol,
-                    (state.get("pendingSignals") or {}).get(symbol),
-                    all_current_prices,
-                )
+                if sop_options:
+                    result = await self.comprehensive_analyst.run(
+                        payload,
+                        symbol,
+                        (state.get("pendingSignals") or {}).get(symbol),
+                        all_current_prices,
+                        sop_options,
+                    )
+                else:
+                    result = await self.comprehensive_analyst.run(
+                        payload,
+                        symbol,
+                        (state.get("pendingSignals") or {}).get(symbol),
+                        all_current_prices,
+                    )
                 entries.append((symbol, {"result": as_dict_shallow(result)}))
 
             return self._analysis_result_payload(state, entries, market_first=False)

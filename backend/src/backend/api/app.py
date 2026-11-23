@@ -177,6 +177,8 @@ def create_api_app(options: dict) -> FastAPI:
             "shadow": shadow,
             "store": store,
             "now_iso": now_iso,
+            "patrol": options.get("sop_patrol"),
+            "patrol_interval_seconds": options.get("sop_patrol_interval_seconds", 300),
         }
     )
 
@@ -194,6 +196,7 @@ def create_api_app(options: dict) -> FastAPI:
         store,
         llm_trigger=options.get("llm_analysis_trigger"),
         technical_trigger=technical_analysis_trigger,
+        patrol_trigger=options.get("patrol_trigger"),
     )
     on_bar_closed = options.get("on_bar_closed") or bar_close_events.dispatch
 
@@ -240,6 +243,9 @@ def create_api_app(options: dict) -> FastAPI:
     app.state.scheduler = scheduler
     app.state.analysis_service = analysis_service
     app.state.ai_approve_cooldown = options.get("ai_approve_cooldown") or _create_ai_approve_cooldown_default()
+    app.state.sop_patrol = options.get("sop_patrol")
+    app.state.sop_patrol_enabled = bool(options.get("sop_patrol_enabled", False))
+    app.state.sop_execution_mode = str(options.get("sop_execution_mode") or "advisory_only")
     # admin 路由的 token 记录表(镜像 TS tokenRecords):首次请求前由 _register_token_bootstrap 填充
     app.state.token_records = {}
 
@@ -380,6 +386,8 @@ def _register_ea_endpoints(app: FastAPI) -> None:
                     "ai_approve_cooldown": app.state.ai_approve_cooldown,
                     "discord": app.state.discord,
                     "feishu": app.state.feishu,
+                    "sop_patrol_enabled": app.state.sop_patrol_enabled,
+                    "sop_execution_mode": app.state.sop_execution_mode,
                 },
                 {
                     "analysis_payload": analysis_payload,
@@ -763,6 +771,7 @@ def _register_admin_api(app: FastAPI) -> None:
                     "token_accounts": app.state.token_accounts,
                     "admin_tokens": app.state.admin_tokens,
                     "token_records": app.state.token_records,
+                    "sop_patrol": app.state.sop_patrol,
                 },
                 {
                     "trading_core_analysis": trading_core_analysis,

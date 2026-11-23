@@ -21,6 +21,8 @@ from backend.trading_core.riskgate.economic_calendar import (
 __all__ = [
     "evaluate_market_filters",
     "evaluate_risk_gate",
+    "friday_close_reminder_stage",
+    "is_monday_open_observation_window",
 ]
 
 # 风控常量(镜像 TS 模块级字面值)
@@ -127,6 +129,16 @@ _symbol_meta: dict[str, dict[str, Any]] = {
         "minSLDistance": 0.5,
         "maxSLDistance": 100,
     },
+    "XAGUSD": {
+        "symbol": "XAGUSD",
+        "contractSize": 5000,
+        "minLot": 0.01,
+        "maxLot": 50,
+        "lotStep": 0.01,
+        "maxSpread": 80,
+        "minSLDistance": 0.05,
+        "maxSLDistance": 15,
+    },
 }
 
 _EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
@@ -144,12 +156,15 @@ def _nullish_or(value: Any, default: Any) -> Any:
     return default if value is None else value
 
 
-def _as_utc_dt(value: str | None) -> datetime:
+def _as_utc_dt(value: str | datetime | None) -> datetime:
     """解析 ISO 时间(镜像 new Date(...));缺省用 UTC now,naive 时间按 UTC。"""
     if value is None:
         return datetime.now(UTC)
-    text = value[:-1] + "+00:00" if value.endswith("Z") else value
-    dt = datetime.fromisoformat(text)
+    if isinstance(value, datetime):
+        dt = value
+    else:
+        text = value[:-1] + "+00:00" if value.endswith("Z") else value
+        dt = datetime.fromisoformat(text)
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=UTC)
     return dt.astimezone(UTC)
@@ -231,9 +246,37 @@ def reduced_window_rejection(input_: dict[str, Any], symbol: str) -> str | None:
     return None
 
 
+def is_monday_open_observation_window(now: datetime, symbol: str = "XAUUSD") -> bool:
+    """周一早盘开盘观察窗口(UTC 周日 22:00-23:30 / 北京时间周一 06:00-07:30)。"""
+    del symbol
+    utc_now = now.astimezone(UTC) if now.tzinfo else now.replace(tzinfo=UTC)
+    if utc_now.weekday() != 6:
+        return False
+    mins = utc_now.hour * 60 + utc_now.minute
+    return 22 * 60 <= mins < 23 * 60 + 30
+
+
+def friday_close_reminder_stage(now: datetime, symbol: str = "XAUUSD") -> str | None:
+    """周五收盘清仓提醒阶段(20:00 UTC 禁开窗口之前): 18:00-19:15 reminder / 19:15-20:00 urgent。"""
+    if is_symbol_close_window(now, symbol):
+        return None
+    utc_now = now.astimezone(UTC) if now.tzinfo else now.replace(tzinfo=UTC)
+    if utc_now.weekday() != 4:
+        return None
+    mins = utc_now.hour * 60 + utc_now.minute
+    if 18 * 60 <= mins < 19 * 60 + 15:
+        return "flatten_reminder"
+    if 19 * 60 + 15 <= mins < 20 * 60:
+        return "flatten_urgent"
+    return None
+
+
 def metadata_for(symbol: str) -> dict[str, Any]:
     """镜像 metadataFor():按归一符号取元数据,未收录回退 XAUUSD。"""
-    return _symbol_meta.get(base_symbol(symbol), _symbol_meta["XAUUSD"])
+    base = base_symbol(symbol)
+    if base in {"XAGUSD", "SILVER", "SILVERM"}:
+        return _symbol_meta["XAGUSD"]
+    return _symbol_meta.get(base, _symbol_meta["XAUUSD"])
 
 
 def max_spread_for_market_filter(symbol: str) -> float:
@@ -659,6 +702,14 @@ def evaluate_market_filters(input_: dict[str, Any]) -> dict[str, Any]:
         add("spread.too_wide", "blocking")
     if is_symbol_close_window(now, symbol):
         add("session.friday_close_window", "blocking")
+    elif _get(input_, "includeSopSessionWarnings", False) is True:
+        friday_stage = friday_close_reminder_stage(now, symbol)
+        if friday_stage == "flatten_reminder":
+            add("session.friday_flatten_reminder", "warning")
+        elif friday_stage == "flatten_urgent":
+            add("session.friday_flatten_urgent", "warning")
+    if _get(input_, "includeSopSessionWarnings", False) is True and is_monday_open_observation_window(now, symbol):
+        add("session.monday_open_observation", "warning")
     if is_symbol_rollover_window(now, symbol):
         add("session.rollover_window", "warning")
     if is_symbol_low_liquidity_session(now, symbol):

@@ -594,7 +594,7 @@ _PROFILES: dict[str, dict[str, Any]] = {
         "sl_atr_multiplier": 1.5,
         "tp_atr_multiplier": 3.0,
         "volatility_level": "high",
-        "price_range_hint": "typically 20–40 USD/oz",
+        "price_range_hint": "typically 20–120 USD/oz",
         "price_range": [15, 50],
         "asset_class": "metal",
         "volume_reliable": True,

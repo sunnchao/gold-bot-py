@@ -827,7 +827,8 @@ async def analysis_payload(store: EaStore, account_id: str, symbol: str, timesta
     }
     market_status = analysis_market_status(heartbeat, latest_tick, timestamp)
     d1_bars = flatten_bar_records(await store.get_bars(account_id, symbol, "D1"))
-    trend_bars = {**enriched, "D1": enrich_analysis_bars(d1_bars)}
+    enriched_d1 = enrich_analysis_bars(d1_bars)
+    trend_bars = {**enriched, "D1": enriched_d1}
     harmonic_context = build_harmonic_context_payload(enriched)
     smc_context = build_smc_context_payload(enriched)
     candlestick_patterns = build_candlestick_patterns_payload(enriched)
@@ -835,6 +836,41 @@ async def analysis_payload(store: EaStore, account_id: str, symbol: str, timesta
     strategy_mapping = analysis_strategy_mapping(
         {**DEFAULT_STRATEGY_MAPPING, **(record_field(registration, "strategy_mapping") or {})}
     )
+    ref_price = number_field(latest_tick, "bid") or number_field(latest_tick, "ask")
+    trend_ctx = trend_context(trend_bars)
+    h1_bars = enriched.get("H1") or []
+    h1_atr_raw = h1_bars[-1].get("atr") if h1_bars and isinstance(h1_bars[-1], dict) else None
+    h1_atr = float(h1_atr_raw) if isinstance(h1_atr_raw, (int, float)) else None
+    d1_atr_raw = enriched_d1[-1].get("atr") if enriched_d1 and isinstance(enriched_d1[-1], dict) else None
+    d1_atr = float(d1_atr_raw) if isinstance(d1_atr_raw, (int, float)) else None
+
+    from backend.agents.tools.market_structure_sop import (
+        analyze_daily_vacuum,
+        build_confluence_levels,
+        compute_day_range,
+    )
+
+    daily_structure = analyze_daily_vacuum(enriched_d1, ref_price, atr_d1=d1_atr)
+    confluence_levels = build_confluence_levels(
+        symbol,
+        d1_bars=enriched_d1,
+        h4_bars=enriched.get("H4"),
+        h1_bars=h1_bars,
+        m15_bars=enriched.get("M15"),
+        smc_data=smc_context,
+        trend_context=trend_ctx,
+        daily_structure=daily_structure,
+        current_price=ref_price,
+    )
+    day_range = compute_day_range(
+        symbol,
+        enriched_d1,
+        h1_bars,
+        ref_price,
+        atr_d1=d1_atr,
+        atr_h1=h1_atr,
+    )
+    watch_ledger = await store.get_watch_ledger(account_id, symbol)
     return {
         "account": {
             "account_id": account_id,
@@ -851,9 +887,7 @@ async def analysis_payload(store: EaStore, account_id: str, symbol: str, timesta
         "bars": payload_bars,
         "harmonic_context": harmonic_context,
         "smc_context": smc_context,
-        "breakout_levels": build_breakout_levels(
-            trend_bars, number_field(latest_tick, "bid") or number_field(latest_tick, "ask"), smc_context
-        ),
+        "breakout_levels": build_breakout_levels(trend_bars, ref_price, smc_context),
         "candlestick_patterns": candlestick_patterns,
         "indicators": indicator_packs(enriched),
         "market": {
@@ -886,7 +920,11 @@ async def analysis_payload(store: EaStore, account_id: str, symbol: str, timesta
         "status": "OK",
         "strategy_mapping": strategy_mapping,
         "timestamp": shanghai_timestamp(timestamp),
-        "trend_context": trend_context(trend_bars),
+        "trend_context": trend_ctx,
+        "daily_structure": daily_structure,
+        "confluence_levels": confluence_levels,
+        "day_range": day_range,
+        "watch_ledger": watch_ledger,
     }
 
 
@@ -1544,7 +1582,7 @@ def _notify_ai_result(state: dict, account_id: str, symbol: str, trade_plan: dic
         if discord is not None:
             await discord.send({"content": summary})
         feishu = state.get("feishu")
-        if feishu is not None:
+        if feishu is not None and not state.get("sop_patrol_enabled"):
             await feishu.send({"title": "GOLD-BOT", "content": summary})
 
     try:
@@ -1707,6 +1745,7 @@ async def queue_ai_approve_pending_commands(
                 "nowIso": event_timestamp,
                 "cooldown": deps["ai_approve_cooldown"],
                 "positionStates": position_states,
+                "enforceSopLedger": deps.get("sop_execution_mode") == "integrated",
             }
         )
         if not pending_gate.get("accepted", False):

@@ -1195,5 +1195,192 @@ class SqliteEaStore:
             )
             await conn.commit()
 
+    # ---- SOP 增量记忆账本 & 巡检日志
+    async def get_watch_ledger(self, account_id_: str, symbol: str) -> EaRecord | None:
+        norm_symbol = normalize_symbol(symbol)
+        async with self._connect() as conn:
+            row = await self._row(
+                conn,
+                """
+                SELECT account_id, symbol, ledger_json, version, htf_reviewed_at, m15_reviewed_at, updated_at
+                FROM watch_ledgers
+                WHERE account_id = :account AND upper(trim(symbol)) = :symbol
+                """,
+                account=account_id_,
+                symbol=norm_symbol,
+            )
+        if row is None:
+            return None
+        parsed = from_json(row["ledger_json"])
+        data: EaRecord = dict(parsed) if isinstance(parsed, dict) else {}
+        data["account_id"] = str(row["account_id"])
+        data["symbol"] = normalize_symbol(str(row["symbol"]))
+        data["version"] = int(row["version"])
+        data["htf_reviewed_at"] = row["htf_reviewed_at"]
+        data["m15_reviewed_at"] = row["m15_reviewed_at"]
+        data["updated_at"] = str(row["updated_at"])
+        return data
+
+    async def save_watch_ledger(self, account_id_: str, symbol: str, ledger: EaRecord) -> EaRecord:
+        norm_symbol = normalize_symbol(symbol)
+        now = current_timestamp()
+        async with self._connect() as conn:
+            existing = await self._row(
+                conn,
+                """
+                SELECT version
+                FROM watch_ledgers
+                WHERE account_id = :account AND upper(trim(symbol)) = :symbol
+                """,
+                account=account_id_,
+                symbol=norm_symbol,
+            )
+            next_version = (
+                int(existing["version"]) + 1
+                if existing is not None
+                else max(1, int(ledger.get("version") or 1))
+            )
+            stored = clone_record(ledger)
+            stored["account_id"] = account_id_
+            stored["symbol"] = norm_symbol
+            stored["version"] = next_version
+            stored["updated_at"] = now
+            htf_reviewed_at = stored.get("htf_reviewed_at")
+            m15_reviewed_at = stored.get("m15_reviewed_at")
+            stored["htf_reviewed_at"] = htf_reviewed_at
+            stored["m15_reviewed_at"] = m15_reviewed_at
+            await conn.execute(
+                text(
+                    """
+                    INSERT INTO watch_ledgers (
+                        account_id, symbol, ledger_json, version, htf_reviewed_at, m15_reviewed_at, updated_at
+                    ) VALUES (
+                        :account_id, :symbol, :ledger_json, :version, :htf_reviewed_at, :m15_reviewed_at, :updated_at
+                    )
+                    ON CONFLICT(account_id, symbol) DO UPDATE SET
+                        ledger_json = excluded.ledger_json,
+                        version = excluded.version,
+                        htf_reviewed_at = excluded.htf_reviewed_at,
+                        m15_reviewed_at = excluded.m15_reviewed_at,
+                        updated_at = excluded.updated_at
+                    """
+                ),
+                {
+                    "account_id": account_id_,
+                    "symbol": norm_symbol,
+                    "ledger_json": to_json(stored),
+                    "version": next_version,
+                    "htf_reviewed_at": htf_reviewed_at,
+                    "m15_reviewed_at": m15_reviewed_at,
+                    "updated_at": now,
+                },
+            )
+            await conn.commit()
+        return clone_record(stored)
+
+    async def append_patrol_log(self, payload: EaRecord) -> EaRecord:
+        from uuid import uuid4
+
+        log_id = str(payload.get("id") or uuid4())
+        account_id_ = str(payload["account_id"])
+        symbol = normalize_symbol(str(payload["symbol"]))
+        trigger_type = str(payload.get("trigger_type") or "")
+        tier = str(payload.get("tier") or "")
+        alert_level = str(payload.get("alert_level") or "silent")
+        action_taken = str(payload.get("action_taken") or "")
+        summary = str(payload.get("summary") or "")
+        raw_details = payload.get("details")
+        details: EaRecord = clone_record(raw_details) if isinstance(raw_details, dict) else {}
+        created_at = str(payload.get("created_at") or current_timestamp())
+        async with self._connect() as conn:
+            await conn.execute(
+                text(
+                    """
+                    INSERT INTO patrol_logs (
+                        id, account_id, symbol, trigger_type, tier, alert_level,
+                        action_taken, summary, details_json, created_at
+                    ) VALUES (
+                        :id, :account_id, :symbol, :trigger_type, :tier, :alert_level,
+                        :action_taken, :summary, :details_json, :created_at
+                    )
+                    """
+                ),
+                {
+                    "id": log_id,
+                    "account_id": account_id_,
+                    "symbol": symbol,
+                    "trigger_type": trigger_type,
+                    "tier": tier,
+                    "alert_level": alert_level,
+                    "action_taken": action_taken,
+                    "summary": summary,
+                    "details_json": to_json(details),
+                    "created_at": created_at,
+                },
+            )
+            await conn.commit()
+        return {
+            "id": log_id,
+            "account_id": account_id_,
+            "symbol": symbol,
+            "trigger_type": trigger_type,
+            "tier": tier,
+            "alert_level": alert_level,
+            "action_taken": action_taken,
+            "summary": summary,
+            "details": details,
+            "created_at": created_at,
+        }
+
+    async def list_patrol_logs(
+        self,
+        account_id_: str,
+        symbol: str | None = None,
+        *,
+        limit: int = 50,
+        since: str | None = None,
+    ) -> list[EaRecord]:
+        safe_limit = max(1, min(int(limit), 500))
+        clauses = ["account_id = :account"]
+        params: dict[str, Any] = {"account": account_id_, "limit": safe_limit}
+        if symbol is not None and symbol.strip():
+            clauses.append("upper(trim(symbol)) = :symbol")
+            params["symbol"] = normalize_symbol(symbol)
+        if since is not None and since.strip():
+            clauses.append("created_at >= :since")
+            params["since"] = since.strip()
+        where_sql = " AND ".join(clauses)
+        async with self._connect() as conn:
+            rows = await self._rows(
+                conn,
+                f"""
+                SELECT id, account_id, symbol, trigger_type, tier, alert_level,
+                       action_taken, summary, details_json, created_at
+                FROM patrol_logs
+                WHERE {where_sql}
+                ORDER BY created_at DESC, id DESC
+                LIMIT :limit
+                """,
+                **params,
+            )
+        out: list[EaRecord] = []
+        for row in rows:
+            parsed_details = from_json(row["details_json"])
+            out.append(
+                {
+                    "id": str(row["id"]),
+                    "account_id": str(row["account_id"]),
+                    "symbol": normalize_symbol(str(row["symbol"])),
+                    "trigger_type": str(row["trigger_type"]),
+                    "tier": str(row["tier"]),
+                    "alert_level": str(row["alert_level"]),
+                    "action_taken": str(row["action_taken"]),
+                    "summary": str(row["summary"]),
+                    "details": parsed_details if isinstance(parsed_details, dict) else {},
+                    "created_at": str(row["created_at"]),
+                }
+            )
+        return out
+
     async def close(self) -> None:
         await self._engine.dispose()

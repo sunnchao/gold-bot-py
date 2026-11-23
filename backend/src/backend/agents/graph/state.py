@@ -7,7 +7,7 @@ Field values use the shared dataclass types from ``backend.agents.types``.
 
 from __future__ import annotations
 
-from typing import Annotated, NotRequired, TypedDict
+from typing import Annotated, Any, NotRequired, TypedDict
 
 from backend.agents.types.agent import AISignalResult, AnalysisLog
 from backend.agents.types.analysis import (
@@ -73,6 +73,9 @@ class AnalysisGraphState(TypedDict, total=False):
     durations: NotRequired[dict[str, int] | None]
     skipFeishu: NotRequired[bool | None]
     forceAnalyze: NotRequired[bool | None]
+    analysisRole: NotRequired[str | None]
+    previousLedger: NotRequired[dict[str, Any] | None]
+    patrolContext: NotRequired[dict[str, Any] | None]
 
 
 AnalysisGraphStateType = AnalysisGraphState
