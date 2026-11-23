@@ -147,35 +147,77 @@ class PatrolService:
         tick = await self._store.get_latest_tick(account_id, norm_sym)
         heartbeat = await self._store.get_heartbeat(account_id)
         bars_by_tf: dict[str, Sequence[dict[str, Any]]] = {}
-        for tf in ("M15", "H1", "H4", "D1"):
+        for tf in ("M15", "M30", "H1", "H4", "D1"):
             bars_by_tf[tf] = await self._store.get_bars(account_id, norm_sym, tf, limit=200)
 
         price: float | None = None
         if isinstance(tick, dict):
             for k in ("bid", "ask", "last"):
                 val = tick.get(k)
-                if isinstance(val, (int, float)) and isfinite(val):
+                if isinstance(val, (int, float)) and not isinstance(val, bool) and isfinite(val):
                     price = float(val)
                     break
         if price is None and bars_by_tf.get("M15"):
             raw_c = bars_by_tf["M15"][-1].get("close")
-            if isinstance(raw_c, (int, float)) and isfinite(raw_c):
+            if isinstance(raw_c, (int, float)) and not isinstance(raw_c, bool) and isfinite(raw_c):
                 price = float(raw_c)
 
-        market_open = True
-        if isinstance(heartbeat, dict) and heartbeat.get("market_open") is False:
-            market_open = False
+        now_dt = self._now_fn()
+        if now_dt.tzinfo is None:
+            now_dt = now_dt.replace(tzinfo=UTC)
+        now_iso = now_dt.isoformat().replace("+00:00", "Z")
+
+        market_open = (heartbeat.get("market_open") is not False) if isinstance(heartbeat, dict) else True
+        trade_allowed = (heartbeat.get("is_trade_allowed") is not False) if isinstance(heartbeat, dict) else True
         stale = tick is None and not bars_by_tf.get("M15")
 
-        spread = float(tick.get("spread") or 0.0) if isinstance(tick, dict) else 0.0
+        last_tick_at = ""
+        if isinstance(tick, dict):
+            for ts_key in ("received_at", "updated_at"):
+                raw_ts = tick.get(ts_key)
+                if isinstance(raw_ts, str) and raw_ts.strip():
+                    last_tick_at = raw_ts.strip()
+                    break
+            if not last_tick_at and tick:
+                last_tick_at = now_iso
+
+        raw_spread = tick.get("spread") if isinstance(tick, dict) else None
+        spread = (
+            float(raw_spread)
+            if isinstance(raw_spread, (int, float)) and not isinstance(raw_spread, bool) and isfinite(raw_spread)
+            else 0.0
+        )
+
+        configured_max_spread: float | None = None
+        for source in (tick, heartbeat):
+            if not isinstance(source, dict):
+                continue
+            cand = source.get("max_spread")
+            if isinstance(cand, (int, float)) and not isinstance(cand, bool) and isfinite(cand) and cand > 0:
+                configured_max_spread = float(cand)
+                break
+
+        tick_state: dict[str, Any] = dict(tick) if isinstance(tick, dict) else {}
+        tick_state["symbol"] = norm_sym
+        tick_state["spread"] = spread
+        if configured_max_spread is not None:
+            tick_state["maxSpread"] = configured_max_spread
+
         filters = evaluate_market_filters(
             {
                 "symbol": norm_sym,
-                "now": self._now_fn(),
-                "spread": spread,
-                "maxSpread": 50.0,
+                "now": now_dt,
                 "includeSopSessionWarnings": True,
-                "state": {"heartbeat": heartbeat or {}, "tick": tick or {}, "bars": bars_by_tf},
+                "runtime": {
+                    "marketOpen": market_open,
+                    "isTradeAllowed": trade_allowed,
+                    "lastTickAt": last_tick_at,
+                },
+                "state": {
+                    "heartbeat": heartbeat or {},
+                    "tick": tick_state,
+                    "bars": bars_by_tf,
+                },
             }
         )
         return {

@@ -468,3 +468,101 @@ async def test_routine_htf_m15_wait_and_patrol_cycle_all_deliver_feishu_cards() 
     rep_quiet = await patrol_quiet.notify_patrol_cycle("81124211", [r_noop])
     assert rep_quiet is not None and rep_quiet["sent"] is False
     assert len(feishu.messages) == 4
+
+
+async def test_default_snapshot_unblocks_live_tick_and_runs_m15_when_always_run_enabled() -> None:
+    store = InMemoryEaStore()
+    feishu = FakeFeishu()
+    now = datetime(2026, 11, 23, 12, 45, tzinfo=UTC)
+    now_iso = now.isoformat().replace("+00:00", "Z")
+
+    await store.save_heartbeat(
+        {
+            "account_id": "81124211",
+            "connected": True,
+            "market_open": True,
+            "is_trade_allowed": True,
+            "max_spread": 99.0,
+            "last_heartbeat_at": now_iso,
+        }
+    )
+    await store.save_tick(
+        {
+            "account_id": "81124211",
+            "symbol": "GOLDm#",
+            "bid": 3621.5,
+            "ask": 3621.8,
+            "spread": 31.0,
+            "max_spread": 99.0,
+            "received_at": now_iso,
+        }
+    )
+    await store.save_bars(
+        {
+            "account_id": "81124211",
+            "symbol": "GOLDM#",
+            "timeframe": "M15",
+            "bars": [{"time": "2026-11-23T12:30:00Z", "open": 3620, "high": 3622, "low": 3619, "close": 3621.5}],
+        }
+    )
+    await store.save_bars(
+        {
+            "account_id": "81124211",
+            "symbol": "GOLDM#",
+            "timeframe": "H1",
+            "bars": [{"time": "2026-11-23T12:00:00Z", "open": 3620, "high": 3623, "low": 3618, "close": 3621.5}],
+        }
+    )
+    await store.save_watch_ledger(
+        "81124211",
+        "GOLDM#",
+        {
+            "account_id": "81124211",
+            "symbol": "GOLDM#",
+            "version": 1,
+            "htf_reviewed_at": now_iso,
+            "htf_anchor": {
+                "macro_bias": "bearish",
+                "intraday_direction": "short",
+                "short_term_targets": [3596.0],
+                "veto_boundary": {"short_invalid_above": 3655.0},
+                "anchor_price": 3621.5,
+            },
+            "playbooks": [
+                {
+                    "id": "pb-1",
+                    "role": "primary",
+                    "direction": "short",
+                    "state": "armed",
+                    "trigger_zone": {"low": 3600.0, "high": 3610.0},
+                    "stop_loss": 3655.0,
+                    "invalid_if": {"price_above": 3655.0},
+                }
+            ],
+        },
+    )
+
+    calls: list[str | None] = []
+
+    async def wf_handler(_acc: str, _sym: str, state: dict[str, Any]) -> dict[str, Any]:
+        calls.append(state.get("analysisRole"))
+        return {"ai_result": {"bias": "bearish", "confidence": 72, "trade_action": "HOLD"}}
+
+    patrol = PatrolService(
+        store=store,
+        workflow_service=StubWorkflow(wf_handler),
+        alert_router=AlertRouter(feishu=feishu, now_fn=lambda: now),
+        m15_always_run_entry=True,
+        now_fn=lambda: now,
+    )
+
+    snap = await patrol._default_snapshot("81124211", "GOLDM#")
+    assert snap["market_filters"]["blocked"] is False
+    assert snap["market_filters"]["blocking"] == []
+
+    res = await patrol.run_patrol("81124211", "GOLDM#", trigger_type="m15_close")
+    assert res["status"] == "ok"
+    assert res["htf_ran"] is False
+    assert res["m15_ran"] is True
+    assert calls == ["m15_entry"]
+    assert len(feishu.messages) == 1
