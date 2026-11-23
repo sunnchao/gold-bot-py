@@ -55,8 +55,8 @@ Given technical analysis, account data and market data, produce a structured MAR
 - Typical price range: {profile['price_range_hint']}
 - Volatility: {profile['volatility_level']}
 - 1 pip = {profile['pip_value']}
-- Suggested SL: {profile['sl_atr_multiplier']}× ATR
-- Suggested TP: {profile['tp_atr_multiplier']}× ATR
+- SL/TP: derive from K-line structure only (swing high/low, hub edge, harmonic invalidation).
+  Do NOT use ATR multiples or fixed point distances as the source of a level.
 
 ## CRITICAL OUTPUT RULES
 1. Output structured MARKDOWN text using ## RISK section header and - Key: Value format.
@@ -88,7 +88,7 @@ CRITICAL: Before outputting ANY price value, you MUST verify it matches the ACTU
 - Add On: true | false
 
 ## RISK CALCULATION GUIDELINES
-- suggestedSL should be placed below the nearest support (for long) or above nearest resistance (for short), with an ATR buffer
+- suggestedSL MUST sit just beyond the structural invalidation level (nearest support for long, nearest resistance for short) and cite that level
 - CRITICAL: For a LONG position, suggestedSL MUST be BELOW the current price. For a SHORT position, suggestedSL MUST be ABOVE the current price.
 - suggestedTP should target the next significant resistance (for long) or support (for short)
 - maxPositionSize should ensure that a stop-loss hit does not exceed 2% of account equity
@@ -128,14 +128,13 @@ def build_semi_static_data(
 
 Instrument: {profile['name']} ({profile['symbol']})
 Volatility: {profile['volatility_level']}
-Suggested SL: {profile['sl_atr_multiplier']}x ATR
-Suggested TP: {profile['tp_atr_multiplier']}x ATR
+SL/TP source: K-line structure only (no ATR multiple, no fixed distance)
 
 Technical Analysis Structure:
 {stable_stringify(technical) if technical else 'Unavailable'}
 
 Risk Rules Reference:
-- suggestedSL below nearest support (long) or above nearest resistance (short), with ATR buffer
+- suggestedSL just beyond the structural invalidation level (nearest support for long, nearest resistance for short); cite the level
 - suggestedTP targets next significant resistance (long) or support (short)
 - maxPositionSize: stop-loss hit <= 2% of account equity
 - Risk/reward ratio >= 1:2

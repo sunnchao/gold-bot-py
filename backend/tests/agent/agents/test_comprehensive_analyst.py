@@ -88,8 +88,10 @@ def test_minimal_wave_and_chanlun_evidence_cannot_claim_confirmation():
     assert wave["evidence"]["status"] == "unavailable"
     assert wave["direction"] is None
     assert wave["confidence"] == 0
-    assert wave["evidence"]["confirmedAt"] is None
-    assert wave["evidence"]["statusReason"]
+    # 静态契约上移到 system prompt,evidence 里只保留实例字段(不再重复 confirmedAt/statusReason)。
+    assert "confirmedAt" not in wave["evidence"]
+    assert "statusReason" not in wave["evidence"]
+    assert wave["evidence"]["reason"]
     wave_with_source = ca.summarize_wave_structure({**wave, "sourceTimeframe": "M30"})
     assert wave_with_source["evidence"]["sourceTimeframe"] == "M30"
     assert chanlun["evidence"]["status"] == "unavailable"
@@ -353,7 +355,9 @@ def test_summarize_wave_structure_exposes_real_labels():
     assert summary["confidence"] == 75
     assert len(summary["impulseWaves"]) == 5
     assert len(summary["correctiveWaves"]) == 3
-    assert summary["evidence"]["algorithmVersion"] == ca.STRUCTURE_EVIDENCE_VERSION
+    # 静态契约(algorithmVersion/invalidationCriteria)已上移到 system prompt 槽位说明。
+    assert "algorithmVersion" not in summary["evidence"]
+    assert summary["evidence"]["reason"]
 
 
 def test_summarize_wave_structure_stays_unavailable_for_local_swings_only():
@@ -977,7 +981,9 @@ async def test_keeps_harmonic_volatile_fields_out_of_semi_static_layer():
 
     assert '"type":"bat"' in first_user_layers[h1_tier].text
     assert '"direction":"bullish"' in first_user_layers[h1_tier].text
-    assert '"x_price":2300' in first_user_layers[h1_tier].text
+    # X/A/B/C 原始点位与 ab/bc/cd ratio 属检测器中间量,已从台账层剔除。
+    assert '"x_price":2300' not in first_user_layers[h1_tier].text
+    assert '"xd_ratio":0.886' in first_user_layers[h1_tier].text
     assert '"prz_low":2313' in first_user_layers[h1_tier].text
     assert '"stop_loss":2308' in first_user_layers[h1_tier].text
     assert '"target_1":2325' in first_user_layers[h1_tier].text

@@ -60,8 +60,7 @@ ALL 5 sections are REQUIRED on every response.
 - Typical price range: {profile['price_range_hint']}
 - Volatility: {profile['volatility_level']}
 - 1 pip = {profile['pip_value']}
-- Suggested SL: {profile['sl_atr_multiplier']}× ATR
-- Suggested TP: {profile['tp_atr_multiplier']}× ATR
+- SL/TP: structural levels only (swing high/low, hub edge, harmonic invalidation); no ATR formula
 
 ## CRITICAL OUTPUT RULES
 1. Output structured MARKDOWN text using ## SECTION headers and - Key: Value format.

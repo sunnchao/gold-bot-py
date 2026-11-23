@@ -273,29 +273,26 @@ HARMONIC_VOLATILE_KEYS = {"score", "completion_pct", "reason"}
 
 
 def sanitize_harmonic_pattern_stable(pattern: Any) -> JSONDict | None:
+    """抽出谐波形态的决策必需字段。
+
+    只保留方向/区间/风控价位与质量指标:ratios(ab/bc/cd)与 X/A/B/C 原始点位属于
+    检测器的中间量,对下单决策无增量信息,却占了 HARMONIC_CTX 一半体积,故剔除。
+    """
     if not _is_record(pattern):
         return None
     stable_keys = [
         "type",
         "direction",
         "timeframe",
-        "x_price",
-        "a_price",
-        "b_price",
-        "c_price",
-        "d_price",
-        "ab_ratio",
-        "bc_ratio",
-        "cd_ratio",
-        "xd_ratio",
+        "status",
+        "invalidated",
         "prz_low",
         "prz_high",
         "stop_loss",
         "target_1",
         "target_2",
         "confidence",
-        "invalidated",
-        "status",
+        "xd_ratio",
     ]
     sanitized: JSONDict = {}
     for key in stable_keys:
@@ -318,45 +315,43 @@ def sanitize_harmonic_context_stable(payload: JSONDict) -> JSONDict | None:
     harmonic_context = payload.get("harmonic_context")
     if not _is_record(harmonic_context):
         return None
-    h4_patterns = harmonic_context.get("h4_patterns") or []
-    h1_patterns = harmonic_context.get("h1_patterns") or []
-    m30_patterns = harmonic_context.get("m30_patterns") or []
+
+    active_pattern = sanitize_harmonic_pattern_stable(harmonic_context.get("active_pattern"))
+
+    def _project(items: Any) -> list[JSONDict]:
+        patterns = [p for p in (sanitize_harmonic_pattern_stable(item) for item in (items or [])) if p]
+        # active_pattern 与列表项重复时只保留 active_pattern 一份,避免同一形态出现两次。
+        if active_pattern is not None:
+            patterns = [p for p in patterns if p != active_pattern]
+        return patterns
+
     return {
-        "h4_patterns": [
-            p for p in (sanitize_harmonic_pattern_stable(item) for item in h4_patterns) if p
-        ],
-        "h1_patterns": [
-            p for p in (sanitize_harmonic_pattern_stable(item) for item in h1_patterns) if p
-        ],
-        "m30_patterns": [
-            p for p in (sanitize_harmonic_pattern_stable(item) for item in m30_patterns) if p
-        ],
-        "active_pattern": sanitize_harmonic_pattern_stable(harmonic_context.get("active_pattern")) or None,
+        "h4_patterns": _project(harmonic_context.get("h4_patterns")),
+        "h1_patterns": _project(harmonic_context.get("h1_patterns")),
+        "m30_patterns": _project(harmonic_context.get("m30_patterns")),
+        "active_pattern": active_pattern,
         "direction_bias": harmonic_context.get("direction_bias"),
     }
 
 
 def sanitize_harmonic_context_volatile(payload: JSONDict) -> JSONDict | None:
+    """只保留随 tick 变化的谐波增量:active 形态的完成度 + 总体评分/摘要。
+
+    形态列表本身属半静态层(HARMONIC_CTX),这里不再重复 9 份 score/reason,
+    否则同一份信息在 stable 与 volatile 各出现一次。
+    """
     harmonic_context = payload.get("harmonic_context")
     if not _is_record(harmonic_context):
         return None
-    h4_patterns = harmonic_context.get("h4_patterns") or []
-    h1_patterns = harmonic_context.get("h1_patterns") or []
-    m30_patterns = harmonic_context.get("m30_patterns") or []
-    return {
-        "h4_patterns": [
-            p for p in (sanitize_harmonic_pattern_volatile(item) for item in h4_patterns) if p
-        ],
-        "h1_patterns": [
-            p for p in (sanitize_harmonic_pattern_volatile(item) for item in h1_patterns) if p
-        ],
-        "m30_patterns": [
-            p for p in (sanitize_harmonic_pattern_volatile(item) for item in m30_patterns) if p
-        ],
-        "active_pattern": sanitize_harmonic_pattern_volatile(harmonic_context.get("active_pattern")) or None,
-        "score": harmonic_context.get("score"),
-        "summary": harmonic_context.get("summary"),
-    }
+    out: JSONDict = {}
+    active_volatile = sanitize_harmonic_pattern_volatile(harmonic_context.get("active_pattern"))
+    if active_volatile:
+        out["active"] = active_volatile
+    if harmonic_context.get("score") is not None:
+        out["score"] = harmonic_context["score"]
+    if harmonic_context.get("summary"):
+        out["summary"] = harmonic_context["summary"]
+    return out if out else None
 
 
 @dataclass
@@ -650,6 +645,19 @@ ALL 5 sections are REQUIRED on every response. Do not omit any section.
 11. Read the economic event window before recommending a trade. In blackout, do not propose new orders.
     In the reduced window, no add-on or dual-direction trades; the execution engine scales size.
 
+## SL / TP — STRUCTURE ONLY (禁止套用公式)
+Never derive SL or TP from an ATR multiple, a fixed point/pip distance, a percentage, or a round
+number. Only the K-line structure delivered in the anchors may set a level; ATR is a sanity check
+on the result, never its source.
+- SL = the level that proves the setup wrong, first of: {{WAVE_STRUCT}}.swingPoints extreme →
+  {{CHANLUN_STRUCT}}.hubs edge → {{HARMONIC_CTX}}.active_pattern.stop_loss →
+  {{TESTED_KEY_LEVELS}} sweep/broken level. Put it just beyond that level; if the resulting stop is
+  too wide for the setup, drop the trade — never shrink the stop to fit.
+- TP1 = nearest opposing structure (prior swing, hub edge, touched/intrabar_broken level).
+  TP2 = next structural objective (major swing, measured move, confluence).
+- Mandatory evidence: `Trade SL Basis: <slot + level>` and `Trade TP Basis: <slot + level>`.
+  Naming an ATR multiple or a point distance as the basis is a failed response.
+
 ## DUAL-DIRECTION TRADING (双向下单)
 
 When the market is in a clear ranging/consolidation phase (technical.phase is "ranging" or "consolidation"), AND both BUY and SELL directions have valid setups with confidence ≥ 60, you MAY output a dual-direction recommendation.
@@ -750,9 +758,11 @@ Do NOT mix these up. Keep them separate.
 - Trade Direction: buy | sell | hold | dual
 - Trade Trigger Basis: pullback_limit | closed_breakout | intrabar_breakout | range_fade
 - Trade Entry Price: <number>
-- Trade Stop Loss: <absolute stop loss price level>
-- Trade Take Profit 1: <absolute take profit price level>
-- Trade Take Profit 2: <absolute take profit price level>
+- Trade Stop Loss: <absolute stop loss price level, taken from the structural invalidation described above>
+- Trade Take Profit 1: <absolute take profit price level, first opposing structure>
+- Trade Take Profit 2: <absolute take profit price level, next structural objective>
+- Trade SL Basis: <slot + exact level that invalidates the setup, e.g. WAVE_STRUCT swing low 3648.2>
+- Trade TP Basis: <slot + exact level targeted, e.g. H1 hub upper edge 3689.0>
 - Trade Risk Reward Ratio: <number>
 - Trade Position Size Lots: <string e.g. 0.05-0.1>
 - Trade Rationale: <string>
@@ -772,27 +782,39 @@ Do NOT mix these up. Keep them separate.
 - Priority: H1/M30 patterns are primary confirmation, M15 is timing signal
 
 
-## ANCHOR REFERENCE SYSTEM (锚点引用)
-The following anchors will be provided in subsequent messages.
-You MUST reference them by their anchor ID without recalculating.
+## STRUCTURE EVIDENCE CONTRACT (Static Reference)
+Applies to the `evidence` object inside {{WAVE_STRUCT}} and {{CHANLUN_STRUCT}}:
+- `name`: engine name (elliott_wave | chanlun); `status`: observed | unavailable
+- `sourceTimeframe`: the closed-bar timeframe the engine ran on
+- `observedPoints`: how many points the engine actually saw
+- `reason`: why the structure is (or is not) usable — quote it, do not rewrite it
+- `occurredAt` / `confirmedAt` are intentionally absent: never invent confirmation timestamps
+- Invalidation rule (applies to every structure): recompute on each new closed bar, or when the
+  impulse/corrective labeling no longer satisfies Elliott rules. algorithmVersion: programmatic-structure-v2
 
-- {{WAVE_STRUCT}}: Pre-computed Elliott Wave structure
-  - wave_count, wave_confirmation, extension_wave, corrective_type
-  - Use exactly as provided; do NOT re-analyze wave structure
-- {{CHANLUN_STRUCT}}: Pre-computed Chanlun (缠论) structure
-  - bi_direction, duan_direction, zhongshu_state, buy_sell_point
-  - Use exactly as provided; do NOT re-analyze chanlun structure
-- {{CANDLESTICK_PATTERNS}}: Detected candlestick patterns by timeframe
-  - Array of pattern strings per timeframe (e.g., {"H1": ["bullish_engulfing"]})
-- {{HARMONIC_CTX}}: Pre-computed harmonic pattern detection
-  - Programmatic detector output: detected_pattern, direction, confidence, PRZ, stop_loss, target levels
-  - Use exactly as provided without modification; harmonic analysis is injected by system, not LLM-generated
+## ANCHOR REFERENCE SYSTEM (锚点引用 / 槽位)
+Each anchor below arrives as a `### <SLOT>` section in a later message. Quote the slot; never
+recalculate its content and never re-derive it from raw bars.
+
+- {{STRATEGY_MAPPING}} — EA-side strategy contract (static)
+- {{ACCOUNT_STATIC}} — broker / leverage / currency / server (static)
+- {{WAVE_STRUCT}} — H1 tier: direction, validation, confidence, impulseWaves, correctiveWaves, swingPoints, evidence
+- {{CHANLUN_STRUCT}} — H1 tier: fractals, strokes, hubs, evidence
+- {{HARMONIC_CTX}} — H1 tier, semi-static: h4/h1/m30 patterns (type, direction, PRZ, SL, targets, confidence, xd_ratio) + active_pattern + direction_bias
+- {{HARMONIC_DELTA}} — realtime delta of the active pattern only: score, completion_pct, reason
+- {{PIVOT_LEVELS_<TF>}} — pp/r1/s1 per timeframe (H4, H1, M30, M15)
+- {{CANDLESTICK_PATTERNS_<TF>}} — detected pattern strings per timeframe
+- {{TESTED_KEY_LEVELS}} — computed levels with state (closed_confirmed | intrabar_broken | touched)
+- {{INDICATORS}} — live M15/M30/H1/H4 indicator snapshot (divergence fields hoisted to {{DIVERGENCE}})
+- {{DIVERGENCE}} — MACD/RSI divergence plus the confidence-impact rule
 
 ## INTEGRATION INSTRUCTIONS
-- The WAVE section MUST use {{WAVE_STRUCT}} data without modification
-- The CHANLUN section MUST use {{CHANLUN_STRUCT}} data without modification
-- Harmonic pattern analysis is injected from {{HARMONIC_CTX}} programmatically — do NOT output a HARMONIC section
-- Mention aligned patterns from {{CANDLESTICK_PATTERNS}} in technical.indicators_summary"""  # noqa: E501
+- The WAVE section MUST use {{WAVE_STRUCT}} without modification
+- The CHANLUN section MUST use {{CHANLUN_STRUCT}} without modification
+- Harmonic analysis is injected programmatically from {{HARMONIC_CTX}} + {{HARMONIC_DELTA}} — do NOT output a HARMONIC section
+- Mention aligned patterns from {{CANDLESTICK_PATTERNS_<TF>}} in technical.indicators_summary
+- Only `closed_confirmed` in {{TESTED_KEY_LEVELS}} permits a breakout entry; `intrabar_broken` / `touched` do not
+- Do not restate the slot contents verbatim; cite the levels and states you actually used"""  # noqa: E501
 
 
 def build_symbol_system_prompt(profile: JSONDict) -> str:
@@ -803,8 +825,6 @@ def build_symbol_system_prompt(profile: JSONDict) -> str:
 - Typical price range: {profile['price_range_hint']}
 - Volatility: {profile['volatility_level']}
 - 1 pip = {profile['pip_value']}
-- Suggested SL: {profile['sl_atr_multiplier']}x ATR from current price (MUST output as absolute price level)
-- Suggested TP: {profile['tp_atr_multiplier']}x ATR from current price (MUST output as absolute price level)
 - All prices must fit this instrument's range (~{profile['price_range_hint']}).
 
 ## ANALYSIS TASK
@@ -828,23 +848,18 @@ def _structure_evidence(
     reason: str,
     observed_points: int,
 ) -> JSONDict:
-    """Return an auditable evidence envelope without inventing confirmation times."""
+    """Return an auditable evidence envelope without inventing confirmation times.
+
+    occurredAt/confirmedAt 恒为 null、invalidationCriteria 与 algorithmVersion 是静态样板,
+    原先逐条重复写在每个结构里(WAVE + CHANLUN × 每个 tier),纯属重复占位。这些静态契约
+    统一上移到 system prompt 的 STRUCTURE EVIDENCE CONTRACT 槽位,这里只留实例字段。
+    """
     return {
         "name": name,
         "status": status,
         "sourceTimeframe": source_timeframe,
         "observedPoints": observed_points,
-        "occurredAt": None,
-        "confirmedAt": None,
-        "invalidationCriteria": (
-            "Invalidate on structure recompute (new closed bar) or when the "
-            "impulse/corrective labeling no longer satisfies Elliott rules."
-        ),
-        "algorithmVersion": STRUCTURE_EVIDENCE_VERSION,
         "reason": reason,
-        # Keep the first shipped spelling additive for consumers that already
-        # render it; new consumers should use the canonical `reason` field.
-        "statusReason": reason,
     }
 
 
@@ -1069,6 +1084,25 @@ def strip_hoisted_pivot_fields(indicator: JSONDict) -> JSONDict:
     for field in PIVOT_FIELDS:
         out.pop(field, None)
     return out
+
+
+# 这些字段已提升到 {{DIVERGENCE}} 槽位,指标快照里不再重复一份。
+HOISTED_DIVERGENCE_FIELDS = ("macd_divergence", "rsi_divergence")
+
+
+def strip_hoisted_indicator_fields(indicator: JSONDict) -> JSONDict:
+    out = strip_hoisted_pivot_fields(indicator)
+    for field in HOISTED_DIVERGENCE_FIELDS:
+        out.pop(field, None)
+    return out
+
+
+# 这些字段已由 {{PRICE_CONTEXT}} 行呈现,{{MARKET_SNAPSHOT}} 不再重复。
+HOISTED_MARKET_FIELDS = ("bid", "ask")
+
+
+def strip_hoisted_market_fields(market: JSONDict) -> JSONDict:
+    return {k: v for k, v in market.items() if k not in HOISTED_MARKET_FIELDS}
 
 
 def _format_sop_realtime_section(
@@ -1372,10 +1406,19 @@ def build_realtime_data_prompt(
     market = payload.get("market") or {}
     indicators = payload.get("indicators") or {}
     current_price = market.get("bid") or market.get("ask") or 0
-    m15 = strip_hoisted_pivot_fields(select_indicator(indicators, "M15", "m15"))
-    m30 = strip_hoisted_pivot_fields(select_indicator(indicators, "M30", "m30"))
-    h1 = strip_hoisted_pivot_fields(select_indicator(indicators, "H1", "h1"))
-    h4 = strip_hoisted_pivot_fields(select_indicator(indicators, "H4", "h4"))
+    m15_indicator = select_indicator(indicators, "M15", "m15")
+    m30_indicator = select_indicator(indicators, "M30", "m30")
+    h1_indicator = select_indicator(indicators, "H1", "h1")
+    h4_indicator = select_indicator(indicators, "H4", "h4")
+    # 背离字段先取值(要进 {{DIVERGENCE}} 槽位),再从指标快照里剔除,避免同一数据出现两份。
+    divergence_m30 = m30_indicator.get("macd_divergence")
+    rsi_m30 = m30_indicator.get("rsi_divergence")
+    divergence_h1 = h1_indicator.get("macd_divergence")
+    rsi_h1 = h1_indicator.get("rsi_divergence")
+    m15 = strip_hoisted_indicator_fields(m15_indicator)
+    m30 = strip_hoisted_indicator_fields(m30_indicator)
+    h1 = strip_hoisted_indicator_fields(h1_indicator)
+    h4 = strip_hoisted_indicator_fields(h4_indicator)
 
     market_status = payload.get("market_status") or {}
     stable_market_status = {k: v for k, v in market_status.items() if k != "mt4_server_time"}
@@ -1397,9 +1440,6 @@ def build_realtime_data_prompt(
 {stable_stringify(pending_signal) if pending_signal else 'none'}"""
     )
 
-    divergence_m30 = m30.get("macd_divergence")
-    rsi_m30 = m30.get("rsi_divergence")
-
     reminder = (
         "Risk and arbitration must describe market structure only; do not infer account-specific actions."
         if market_only
@@ -1408,32 +1448,32 @@ def build_realtime_data_prompt(
 
     return f"""## REAL-TIME MARKET DATA (Dynamic — no caching)
 
-### Current Price & Market Context
+### PRICE_CONTEXT
 - **{symbol}: {current_price:.{profile['price_precision']}f}**
 - Market status: {stable_stringify(stable_market_status)}
 - Market filters and economic calendar: {stable_stringify(payload.get('market_filters') or {})}
 
-### Tested Key Levels (computed from bars and liquidity sweeps)
+### TESTED_KEY_LEVELS (computed from bars and liquidity sweeps)
 {stable_stringify(payload_breakout_levels(payload, current_price))}
 
-### Market Data
-{stable_stringify(market)}
+### MARKET_SNAPSHOT
+{stable_stringify(strip_hoisted_market_fields(market))}
 
 {account_positions}
 
-### Multi-Timeframe Indicators (Live)
+### INDICATORS (live)
 - **M15:** {stable_stringify(m15)}
 - **M30:** {stable_stringify(m30)}
 - **H1:** {stable_stringify(h1)}
 - **H4:** {stable_stringify(h4)}
 
-### Divergence Signals (Technical Indicator Engine)
-- **MACD Divergence:** H1={h1.get('macd_divergence') or 'none'}, M30={divergence_m30 or 'none'}
-- **RSI Divergence:** H1={h1.get('rsi_divergence') or 'none'}, M30={rsi_m30 or 'none'}
+### DIVERGENCE (MACD/RSI)
+- **MACD Divergence:** H1={divergence_h1 or 'none'}, M30={divergence_m30 or 'none'}
+- **RSI Divergence:** H1={rsi_h1 or 'none'}, M30={rsi_m30 or 'none'}
 - **Impact:** Bullish divergence → increase BUY confidence, bearish divergence → increase SELL confidence
 - Strong divergence (price extreme + contra-trend RSI/MACD) must be mentioned in technical.rationale
 
-### Harmonic Realtime (volatile)
+### HARMONIC_DELTA (volatile)
 {stable_stringify(harmonic_volatile) if harmonic_volatile else 'none'}
 
 {pending_signal_text}
@@ -1854,6 +1894,9 @@ def parse_markdown_response(
             "risk_reward_ratio": get_number_field(arb_fields, "trade_risk_reward_ratio", 0),
             "position_size_lots": get_string_field(arb_fields, "trade_position_size_lots", "0.01"),
             "rationale": get_string_field(arb_fields, "trade_rationale", ""),
+            # 结构依据必须落库:SL/TP 由哪一根 K 线的哪个结构位推出来,事后可审计。
+            "sl_basis": get_string_field(arb_fields, "trade_sl_basis", ""),
+            "tp_basis": get_string_field(arb_fields, "trade_tp_basis", ""),
         }
 
     arbitration = {
