@@ -27,6 +27,7 @@ from zoneinfo import ZoneInfo
 import httpx
 
 from backend.agents.agents._support import get_logger
+from backend.notifications.display import clean_feishu_card
 
 __all__ = [
     "FEISHU_RATE_LIMIT_BACKOFF_MS",
@@ -499,8 +500,7 @@ def build_feishu_card(account_id: str, symbol: str, result: JSONDict) -> JSONDic
             f"短期目标: {sop.get('short_term_targets') or []} | 长期目标: {sop.get('long_term_targets') or []}",
         ]
         if sop.get("veto_boundary"):
-            veto_txt = re.sub(r"\bhtf\b", "高周期(1H/4H)", str(sop["veto_boundary"]), flags=re.IGNORECASE)
-            sop_lines.append(f"否决边界: {veto_txt}")
+            sop_lines.append(f"否决边界: {sop['veto_boundary']}")
         if sop.get("sop_blocks"):
             sop_lines.append(f"规则拦截标记: {', '.join(sop['sop_blocks'])}")
         analysis_sections.append({"tag": "div", "text": {"tag": "lark_md", "content": "\n".join(sop_lines)}})
@@ -513,7 +513,7 @@ def build_feishu_card(account_id: str, symbol: str, result: JSONDict) -> JSONDic
         }
     )
 
-    return {
+    return clean_feishu_card({
         "msg_type": "interactive",
         "card": {
             "config": {"wide_screen_mode": True},
@@ -523,7 +523,7 @@ def build_feishu_card(account_id: str, symbol: str, result: JSONDict) -> JSONDic
             },
             "elements": analysis_sections,
         },
-    }
+    })
 
 
 def _search(pattern: str, text: str) -> bool:

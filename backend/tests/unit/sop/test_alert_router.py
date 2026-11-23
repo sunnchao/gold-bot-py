@@ -6,6 +6,8 @@ import json
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
+from backend.agents.agents.publisher import build_feishu_card
+from backend.notifications.display import clean_feishu_text
 from backend.services.sop.alerts import AlertRouter, SopFeishuSender
 from backend.services.sop.cards import (
     build_daily_close_review_card,
@@ -22,6 +24,26 @@ class FakeFeishu:
 
     async def send(self, payload: dict) -> None:
         self.messages.append(payload)
+
+
+def test_historical_and_model_text_is_cleaned_only_for_display() -> None:
+    reason = "顺应HTF趋势。日 ATR 预算耗尽，不开新仓。点差过大，不开新仓。止损参考 ATR 1.25。"
+    result = {"arbitration": {"reasoning": reason}, "sop_context": {"sop_blocks": ["sop.m15_counter_htf_blocked"]}}
+    legacy = build_feishu_card("acct", "XAGUSD", result)
+    ledger = {"playbooks": [{"id": "hTf-watch", "state": "armed"}]}
+    _, fallback, review = build_htf_review_card(
+        account_id="acct", symbol="XAGUSD", current_price=42, ledger=ledger, ai_result=result,
+        trigger_reasons=[], changed=False, change_reasons=[], execution_mode="advisory_only",
+    )
+    for card in (legacy, review):
+        rendered = json.dumps(card, ensure_ascii=False)
+        assert "htf" not in rendered.lower() and "预算" not in rendered
+        assert "顺应高周期(1H/4H)趋势" in rendered
+        assert "点差过大，不开新仓" in rendered and "止损参考 ATR 1.25" in rendered
+        assert rendered.count("不开新仓") == 1
+    assert "高周期(1H/4H)-watch" in str(review) and "htf" not in fallback.lower()
+    assert clean_feishu_text("Daily ATR budget exhausted, no new positions.") == ""
+    assert ledger["playbooks"][0]["id"] == "hTf-watch" and result["arbitration"]["reasoning"] == reason
 
 
 async def test_alert_router_handles_five_levels_and_urgent_cooldown_bypass() -> None:

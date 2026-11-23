@@ -2,15 +2,15 @@
 
 from __future__ import annotations
 
-import re
 from collections.abc import Sequence
 from datetime import UTC, datetime
 from math import isfinite
 from typing import Any
 from zoneinfo import ZoneInfo
 
+from backend.notifications.display import clean_feishu_card, clean_feishu_text
+
 _BEIJING_TZ = ZoneInfo("Asia/Shanghai")
-_HTF_ABBR_RE = re.compile(r"\bhtf\b", re.IGNORECASE)
 
 _TRIGGER_REASON_LABELS: dict[str, str] = {
     "htf_bootstrap": "高周期(1H/4H)首次锚定",
@@ -110,8 +110,7 @@ def _sanitize_display_text(value: Any) -> str:
     """将展示文本中的缩写统一展开为完整名称并压缩空白，避免用户卡片出现 HTF 等缩写。"""
     if not isinstance(value, str):
         return ""
-    collapsed = " ".join(value.split())
-    return _HTF_ABBR_RE.sub("高周期(1H/4H)", collapsed)
+    return " ".join(clean_feishu_text(value).split())
 
 
 def _clip_text(value: Any, max_len: int) -> str:
@@ -190,8 +189,10 @@ def _format_playbooks(playbooks: Any, *, max_items: int = 2) -> list[str]:
     return rows
 
 
-def _make_card(title: str, template: str, elements: list[dict[str, Any]]) -> dict[str, Any]:
-    return {
+def _review_card(
+    title: str, fallback: str, template: str, elements: list[dict[str, Any]],
+) -> tuple[str, str, dict[str, Any]]:
+    card = {
         "config": {"wide_screen_mode": True},
         "header": {
             "title": {"tag": "plain_text", "content": title},
@@ -199,6 +200,7 @@ def _make_card(title: str, template: str, elements: list[dict[str, Any]]) -> dic
         },
         "elements": elements,
     }
+    return clean_feishu_text(title), clean_feishu_text(fallback), clean_feishu_card(card)
 
 
 def _md_div(content: str) -> dict[str, Any]:
@@ -301,7 +303,7 @@ def build_htf_review_card(
         f"方向: {intraday_dir} ({macro_bias}, {conf:.0f}%) | 现价: {_fmt_price(current_price)}\n"
         f"短期目标: {short_targets} | 否决边界: {veto_text}"
     )
-    return title, fallback_md, _make_card(title, template, elements)
+    return _review_card(title, fallback_md, template, elements)
 
 
 build_intraday_direction_review_card = build_htf_review_card
@@ -391,7 +393,7 @@ def build_m15_review_card(
     fallback_md = (
         f"{title} | 现价 {_fmt_price(current_price)} | 高周期(1H/4H) {intraday_dir} | 触发 {reason_text}"
     )
-    return title, fallback_md, _make_card(title, template, elements)
+    return _review_card(title, fallback_md, template, elements)
 
 
 def _nearest_levels(ledger: dict[str, Any], current_price: float | None) -> tuple[str, str]:
@@ -510,7 +512,7 @@ def build_patrol_cycle_card(
             f"北京时间 {_fmt_beijing_time(now)} · 周期每 {interval_min} 分钟 · 模式 {execution_mode} · 仅巡检活跃账户"
         )
     )
-    return title, "\n".join(fallback_lines), _make_card(title, template, elements)
+    return _review_card(title, "\n".join(fallback_lines), template, elements)
 
 
 def _fmt_signed(value: Any, *, suffix: str = "") -> str:
@@ -586,7 +588,7 @@ def build_daily_close_review_card(
         f"收线: {candle_type} {chg_txt} | 开 {open_px} 高 {high_px} 低 {low_px} 收 {close_px}\n"
         f"相对前日: {vs_prev} | 日线偏向: {macro_bias}"
     )
-    return title, fallback_md, _make_card(title, template, elements)
+    return _review_card(title, fallback_md, template, elements)
 
 
 def build_weekly_close_review_card(
@@ -675,7 +677,7 @@ def build_weekly_close_review_card(
         f"收线: {wk_type} {chg_txt} | 周开 {wk_open} 高 {wk_high} 低 {wk_low} 收 {wk_close}\n"
         f"相对上周: {vs_prev_wk} | 下周参考位: {targets_txt}"
     )
-    return title, fallback_md, _make_card(title, template, elements)
+    return _review_card(title, fallback_md, template, elements)
 
 
 __all__ = [

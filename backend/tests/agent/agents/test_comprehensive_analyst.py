@@ -72,6 +72,23 @@ def make_service(client, trade_client=None):
     return ca.ComprehensiveAnalystService(client, trade_client=trade_client)
 
 
+async def test_close_reviews_use_only_the_target_session_snapshot():
+    for role, key, recap in (
+        ("daily_close_review", "daily_recap", {"close": 2330, "h1_close": 2330}),
+        ("weekly_close_review", "weekly_recap", {"week_close": 2330}),
+    ):
+        client = FakeLlmClient(stream_results=[sr(MARKDOWN_RESPONSE)])
+        live = payload_with_last_bar_close(99999)
+        live["daily_structure"] = {"status": "ok", "macro_bias": "future_only"}
+        options = {"analysisRole": role, "patrolContext": {
+            key: {"status": "ok", **recap}, "daily_structure": {"status": "ok", "macro_bias": "at_close"},
+        }}
+        await make_service(client).run(live, "XAUUSD", {"reason": "future_only"}, options=options)
+        text = "\n".join(layer.text for layer in client.stream_calls[0][1])
+        assert "2330" in text and "at_close" in text
+        assert "future_only" not in text and "99999" not in text and "REAL-TIME MARKET DATA" not in text
+
+
 def test_minimal_wave_and_chanlun_evidence_cannot_claim_confirmation():
     wave = ca.summarize_wave_structure(
         {

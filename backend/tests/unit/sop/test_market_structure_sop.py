@@ -151,3 +151,6 @@ def test_daily_and_weekly_close_recap_helpers() -> None:
     # 节假日周五休市时, 周四同样被识别为本周最后一根收盘 D1
     holiday_bars = d1_bars[:-2] + [d1_bars[-1]]
     assert is_weekly_close_bar(holiday_bars, target_bar_time="2026-11-19") is True
+    assert summarize_weekly_close_recap(holiday_bars, reference_bar_time="2026-11-19")["week_close"] == 3630
+    assert summarize_weekly_close_recap(holiday_bars, reference_bar_time="2026-11-20")["status"] != "ok"
+    assert summarize_daily_close_recap(holiday_bars, target_bar_time="2026-11-20")["status"] != "ok"

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Sequence
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from math import isfinite
 from typing import Any, Literal
 
@@ -548,7 +548,10 @@ def _parse_bar_timestamp(raw: Any) -> datetime | None:
             int(mt_match.group(5) or 0),
             int(mt_match.group(6) or 0),
         )
-        return datetime(yr, mo, dy, hr, mi, sc, tzinfo=UTC)
+        try:
+            return datetime(yr, mo, dy, hr, mi, sc, tzinfo=UTC)
+        except ValueError:
+            return None
 
     iso = s[:-1] + "+00:00" if s.endswith("Z") else s
     try:
@@ -561,8 +564,6 @@ def _parse_bar_timestamp(raw: Any) -> datetime | None:
 def _select_d1_bar_index(
     bars: Sequence[dict[str, Any]],
     target_bar_time: str | None = None,
-    *,
-    default_last: bool = False,
 ) -> int:
     if not bars:
         return -1
@@ -577,9 +578,15 @@ def _select_d1_bar_index(
                 bar_dt = _parse_bar_timestamp(bars[idx].get("time"))
                 if bar_dt is not None and bar_dt.date() == needle_dt.date():
                     return idx
-    if default_last:
-        return len(bars) - 1
-    return len(bars) - 2 if len(bars) >= 2 else 0
+        return -1
+    return len(bars) - 2 if len(bars) >= 2 else -1
+
+
+def daily_bars_through_close(
+    bars: Sequence[dict[str, Any]], target_bar_time: str | None,
+) -> list[dict[str, Any]]:
+    index = _select_d1_bar_index(bars, target_bar_time)
+    return list(bars[:index + 1])
 
 
 def is_weekly_close_bar(
@@ -594,7 +601,7 @@ def is_weekly_close_bar(
     ]
     if not valid:
         return False
-    idx = _select_d1_bar_index(valid, target_bar_time=target_bar_time, default_last=False)
+    idx = _select_d1_bar_index(valid, target_bar_time=target_bar_time)
     if idx < 0:
         return False
     target_dt = _parse_bar_timestamp(valid[idx].get("time"))
@@ -617,27 +624,30 @@ def summarize_daily_close_recap(
     target_bar_time: str | None = None,
 ) -> dict[str, Any]:
     """汇总刚收盘 D1 K 线的日内走势回顾统计（仅做复盘统计，不施加开仓限制）。"""
+    idx = _select_d1_bar_index(d1_bars, target_bar_time)
+    if idx < 0:
+        return {"status": "insufficient_data"}
+    bar = d1_bars[idx]
+    if any(_to_float(bar.get(key)) is None for key in ("open", "high", "low", "close")):
+        return {"status": "insufficient_data"}
     valid = [
         b
-        for b in d1_bars
+        for b in d1_bars[:idx]
         if _to_float(b.get("open")) is not None
         and _to_float(b.get("high")) is not None
         and _to_float(b.get("low")) is not None
         and _to_float(b.get("close")) is not None
     ]
-    if not valid:
-        return {"status": "insufficient_data"}
-
-    idx = _select_d1_bar_index(valid, target_bar_time=target_bar_time, default_last=False)
-    bar = valid[idx]
-    prev_bar = valid[idx - 1] if idx > 0 else None
+    prev_bar = valid[-1] if valid else None
 
     o = float(bar["open"])
     h = float(bar["high"])
     low = float(bar["low"])
     c = float(bar["close"])
     bar_dt = _parse_bar_timestamp(bar.get("time"))
-    trade_date = bar_dt.date().isoformat() if bar_dt is not None else str(bar.get("time") or "-")
+    if bar_dt is None:
+        return {"status": "insufficient_data"}
+    trade_date = bar_dt.date().isoformat()
 
     net_change = c - o
     change_pct = (net_change / o * 100.0) if o > 0 else 0.0
@@ -667,8 +677,17 @@ def summarize_daily_close_recap(
     else:
         vs_prev_day = "无前日对照"
 
-    h4_close = _to_float(h4_bars[-1].get("close")) if h4_bars else None
-    h1_close = _to_float(h1_bars[-1].get("close")) if h1_bars else None
+    def session_bars(series: Sequence[dict[str, Any]] | None) -> list[dict[str, Any]]:
+        return [
+            {key: item[key] for key in ("time", "open", "high", "low", "close") if key in item}
+            for item in series or []
+            if (opening := _parse_bar_timestamp(item.get("time"))) is not None
+            and bar_dt <= opening < bar_dt + timedelta(days=1)
+            and _to_float(item.get("close")) is not None
+        ]
+
+    h4_session = session_bars(h4_bars)
+    h1_session = session_bars(h1_bars)
 
     return {
         "status": "ok",
@@ -687,8 +706,10 @@ def summarize_daily_close_recap(
         "prev_low": _round_price(prev_low, c) if prev_low is not None else None,
         "prev_close": _round_price(prev_close, c) if prev_close is not None else None,
         "vs_prev_day": vs_prev_day,
-        "h4_close": _round_price(h4_close, c) if h4_close is not None else None,
-        "h1_close": _round_price(h1_close, c) if h1_close is not None else None,
+        "h4_close": _round_price(float(h4_session[-1]["close"]), c) if h4_session else None,
+        "h1_close": _round_price(float(h1_session[-1]["close"]), c) if h1_session else None,
+        "h4_bars": h4_session,
+        "h1_bars": h1_session,
     }
 
 
@@ -715,15 +736,14 @@ def summarize_weekly_close_recap(
         return {"status": "insufficient_data"}
 
     timed_bars.sort(key=lambda item: item[0])
-    target_idx = _select_d1_bar_index(
-        [b for _, b in timed_bars],
-        target_bar_time=reference_bar_time,
-        default_last=True,
-    )
+    ordered = [bar for _, bar in timed_bars]
+    if not is_weekly_close_bar(ordered, reference_bar_time):
+        return {"status": "insufficient_data"}
+    target_idx = _select_d1_bar_index(ordered, reference_bar_time)
     target_dt = timed_bars[target_idx][0]
     target_week = target_dt.isocalendar()[:2]
 
-    week_items = [(dt, b) for dt, b in timed_bars if dt.isocalendar()[:2] == target_week]
+    week_items = [(dt, b) for dt, b in timed_bars[:target_idx + 1] if dt.isocalendar()[:2] == target_week]
     if not week_items:
         return {"status": "insufficient_data"}
 

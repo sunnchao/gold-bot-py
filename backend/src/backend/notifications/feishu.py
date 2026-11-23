@@ -12,6 +12,8 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
 
+from backend.notifications.display import clean_feishu_card
+
 __all__ = [
     "DEFAULT_FEISHU_COOLDOWN_MS",
     "FeishuNotifier",
@@ -90,7 +92,7 @@ class FeishuNotifier:
         if self.secret != "":
             payload["sign"] = sign_feishu_payload(timestamp, self.secret)
 
-        asyncio.get_running_loop().create_task(self._fire(payload))
+        asyncio.get_running_loop().create_task(self._fire(clean_feishu_card(payload)))
         return True
 
     async def _fire(self, payload: dict[str, Any]) -> None:

@@ -600,7 +600,7 @@ async def test_daily_and_weekly_close_reviews_trigger_dedupe_and_skip_inactive()
         {"time": "2026-11-19", "open": 3615, "high": 3642, "low": 3608, "close": 3638},
         {"time": "2026-11-20", "open": 3638, "high": 3670, "low": 3632, "close": 3665},
     ]
-    await store.save_bars({"account_id": "81124211", "symbol": "GOLDM#", "timeframe": "D1", "bars": d1_bars})
+    await store.save_bars({"account_id": "81124211", "symbol": "GOLDM#", "timeframe": "D1", "bars": d1_bars[:-1]})
     await store.save_bars(
         {
             "account_id": "81124211",
@@ -614,7 +614,10 @@ async def test_daily_and_weekly_close_reviews_trigger_dedupe_and_skip_inactive()
             "account_id": "81124211",
             "symbol": "GOLDM#",
             "timeframe": "H1",
-            "bars": [{"time": "2026-11-20T21:00:00Z", "open": 3660, "high": 3670, "low": 3658, "close": 3665}],
+            "bars": [
+                {"time": "2026-11-19T23:00:00Z", "open": 3640, "high": 3642, "low": 3638, "close": 3638},
+                {"time": "2026-11-20T21:00:00Z", "open": 3660, "high": 3670, "low": 3658, "close": 3665},
+            ],
         }
     )
     await store.save_bars({"account_id": "90011087", "symbol": "GOLDM#", "timeframe": "D1", "bars": d1_bars})
@@ -650,9 +653,18 @@ async def test_daily_and_weekly_close_reviews_trigger_dedupe_and_skip_inactive()
     assert inactive_res["status"] == "skipped"
     assert inactive_res["reason"] == "inactive_account"
 
+    for check_time in (clock[0], clock[0] + timedelta(hours=5)):
+        delayed = await patrol.check_post_close_reviews("81124211", "GOLDM#", now=check_time)
+        assert delayed["reason"] == "awaiting_friday_d1"
+    assert not wf_calls and not feishu.messages
+    await store.save_bars({"account_id": "81124211", "symbol": "GOLDM#", "timeframe": "D1", "bars": d1_bars[-1:]})
+
     # 2) 周四 D1 收盘 -> 仅触发每日收盘复盘，不触发每周收盘复盘
     thu_res = await patrol.handle_d1_bar_close("81124211", "GOLDM#", bar_time="2026-11-19")
     assert thu_res["daily_review"]["status"] == "ok"
+    assert thu_res["daily_review"]["daily_recap"]["h1_close"] == 3638
+    assert thu_res["daily_review"]["daily_recap"]["h4_close"] is None
+    assert thu_res["daily_review"]["daily_structure"]["bars_analyzed"] == len(d1_bars) - 1
     assert thu_res["weekly_review"] is None
     assert [c["role"] for c in wf_calls] == ["daily_close_review"]
     assert wf_calls[0]["skipPublish"] is True
@@ -667,6 +679,7 @@ async def test_daily_and_weekly_close_reviews_trigger_dedupe_and_skip_inactive()
     post_res = await patrol.check_post_close_reviews("81124211", "GOLDM#", now=clock[0])
     assert post_res["daily_review"]["status"] == "ok"
     assert post_res["weekly_review"]["status"] == "ok"
+    assert post_res["weekly_review"]["weekly_recap"]["week_close"] == 3665
     assert [c["role"] for c in wf_calls[-2:]] == ["daily_close_review", "weekly_close_review"]
     assert len(feishu.messages) == 3
     assert "每日收盘日内走势复盘" in feishu.messages[1]["title"]

@@ -5,12 +5,13 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import asdict, is_dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from math import isfinite
 from typing import Any, Literal
 
 from backend.agents.tools.market_structure_sop import (
     analyze_daily_vacuum,
+    daily_bars_through_close,
     is_weekly_close_bar,
     summarize_daily_close_recap,
     summarize_weekly_close_recap,
@@ -819,7 +820,9 @@ class PatrolService:
                     }
 
             close_px = float(daily_recap["close"])
-            daily_structure = analyze_daily_vacuum(d1_bars, current_price=close_px)
+            daily_structure = analyze_daily_vacuum(
+                daily_bars_through_close(d1_bars, daily_recap["bar_time"]), current_price=close_px,
+            )
             existing_ledger = await self._store.get_watch_ledger(account_id, norm_sym)
 
             wf_out = await self._workflow.run(
@@ -932,7 +935,9 @@ class PatrolService:
                     }
 
             wk_close = float(weekly_recap["week_close"])
-            daily_structure = analyze_daily_vacuum(d1_bars, current_price=wk_close)
+            daily_structure = analyze_daily_vacuum(
+                daily_bars_through_close(d1_bars, weekly_recap["week_end_date"]), current_price=wk_close,
+            )
             existing_ledger = await self._store.get_watch_ledger(account_id, norm_sym)
 
             wf_out = await self._workflow.run(
@@ -1056,11 +1061,12 @@ class PatrolService:
 
         norm_sym = _norm_symbol(symbol)
         d1_bars = await self._store.get_bars(account_id, norm_sym, "D1", limit=30)
-        if not d1_bars:
-            return {"status": "skipped", "reason": "insufficient_d1_data"}
-        latest_bar_time = str(d1_bars[-1].get("time") or "")
-        daily_out = await self.run_daily_close_review(account_id, norm_sym, bar_time=latest_bar_time)
-        weekly_out = await self.run_weekly_close_review(account_id, norm_sym, bar_time=latest_bar_time)
+        friday = utc_now.date() - timedelta(days=utc_now.weekday() - 4)
+        target = friday.isoformat()
+        if not is_weekly_close_bar(d1_bars, target_bar_time=target):
+            return {"status": "skipped", "reason": "awaiting_friday_d1"}
+        daily_out = await self.run_daily_close_review(account_id, norm_sym, bar_time=target)
+        weekly_out = await self.run_weekly_close_review(account_id, norm_sym, bar_time=target)
         return {
             "status": "ok",
             "symbol": norm_sym,

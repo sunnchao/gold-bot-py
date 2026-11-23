@@ -13,6 +13,8 @@ from typing import Any
 
 import httpx
 
+from backend.notifications.display import clean_feishu_card
+
 ALERT_LEVELS: tuple[str, ...] = ("silent", "notify", "actionable", "urgent", "digest")
 
 _LEVEL_TEMPLATES: dict[str, str] = {
@@ -123,7 +125,7 @@ class SopFeishuSender:
             body_dict["timestamp"] = timestamp
             body_dict["sign"] = _sign_feishu(timestamp, self._secret)
 
-        body_json = json.dumps(body_dict, ensure_ascii=False)
+        body_json = json.dumps(clean_feishu_card(body_dict), ensure_ascii=False)
         async with self._send_lock:
             for attempt in range(len(self._backoff_seconds) + 1):
                 try:

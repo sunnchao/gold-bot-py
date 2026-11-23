@@ -2436,10 +2436,19 @@ class ComprehensiveAnalystService:
         logger = get_logger()
         options = options or {}
         profile = get_symbol_profile(symbol)
+        sop_role = options.get("analysisRole")
+        is_post_close_role = sop_role in ("daily_close_review", "weekly_close_review")
+        if is_post_close_role:
+            review_context = options.get("patrolContext") or {}
+            if sop_role == "daily_close_review":
+                review_price = (review_context.get("daily_recap") or {}).get("close")
+            else:
+                review_price = (review_context.get("weekly_recap") or {}).get("week_close")
+            payload = {"market": {"bid": review_price}, "daily_structure": review_context.get("daily_structure")}
+            all_current_prices = None
         market = payload.get("market") or {}
         current_price = market.get("bid") or market.get("ask") or 0
 
-        sop_role = options.get("analysisRole")
         symbol_system_text = build_symbol_system_prompt(profile)
         if sop_role == "htf_anchor":
             symbol_system_text += (
@@ -2491,30 +2500,26 @@ class ComprehensiveAnalystService:
             SystemBlock(symbol_system_text, cacheable=True),
         ]
 
-        structure_result = build_static_context_prompt(payload, symbol, self.structure_cache)
+        if is_post_close_role:
+            structure_result: JSONDict = {}
+            user_layers = [UserLayer(_format_sop_realtime_section(payload, options), cacheable=False)]
+        else:
+            structure_result = build_static_context_prompt(payload, symbol, self.structure_cache)
+            market_only = options.get("marketOnly") is True
+            user_layers = [
+                UserLayer(build_static_account_and_strategy_text(payload, market_only), cacheable=True),
+                *[UserLayer(text, cacheable=True) for text in structure_result["blockTexts"]],
+                UserLayer(
+                    build_realtime_data_prompt(
+                        payload, pending_signal, symbol, profile, structure_result["harmonicVolatile"],
+                        market_only, options=options,
+                    ),
+                    cacheable=False,
+                ),
+            ]
         # 保存本次结构,供 normalize_comprehensive / 结构化重试路径判定理论可用性。
         self._wave_structure = structure_result.get("waveStructure")
         self._chanlun_structure = structure_result.get("chanlunStructure")
-        market_only = options.get("marketOnly") is True
-
-        static_account_strategy_text = build_static_account_and_strategy_text(payload, market_only)
-
-        user_layers = [
-            UserLayer(static_account_strategy_text, cacheable=True),
-            *[UserLayer(text, cacheable=True) for text in structure_result["blockTexts"]],
-            UserLayer(
-                build_realtime_data_prompt(
-                    payload,
-                    pending_signal,
-                    symbol,
-                    profile,
-                    structure_result["harmonicVolatile"],
-                    market_only,
-                    options=options,
-                ),
-                cacheable=False,
-            ),
-        ]
 
         async def invoke_non_streaming_fallback() -> str | None:
             try:
@@ -2700,7 +2705,6 @@ class ComprehensiveAnalystService:
                 logger.warn({"symbol": symbol}, "Arbitration result invalid — applying downgrade")
                 result["arbitration"] = arb_val.fixed_arbitration
 
-        is_post_close_role = sop_role in ("daily_close_review", "weekly_close_review")
         if (
             (result.get("arbitration") is not None)
             and options.get("skipTradeAction") is not True
