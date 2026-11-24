@@ -355,3 +355,48 @@ async def test_non_market_first_comprehensive_analysis_wraps_analyst_result_for_
     assert "errors" not in result
     assert result["comprehensiveAnalyses"]["XAUUSD"]["arbitration"].final_direction == "buy"
     assert result["arbitrations"]["XAUUSD"].final_direction == "buy"
+
+
+@pytest.mark.asyncio
+async def test_comprehensive_analysis_skips_trade_action_for_htf_anchor_only() -> None:
+    insight = build_insight()
+    recorded_options: list[dict[str, Any] | None] = []
+
+    class FakeAnalyst:
+        async def run(self, payload_value, symbol, pending_signal, all_current_prices, options=None):
+            recorded_options.append(options)
+            return insight
+
+    service = WorkflowNodes(
+        goldbot_api=SimpleNamespace(),
+        comprehensive_analyst=FakeAnalyst(),
+        publisher=SimpleNamespace(),
+        logger=SimpleNamespace(
+            info=lambda *a, **k: None,
+            warn=lambda *a, **k: None,
+            error=lambda *a, **k: None,
+        ),
+        config=SimpleNamespace(market_first_enabled=False),
+        bar_source=None,
+        market_insight_cache=None,
+    )
+
+    base_state: AnalysisGraphState = {
+        "accountId": "81124211",
+        "symbol": "XAUUSD",
+        "symbols": ["XAUUSD"],
+        "timestamp": "2026-08-12T00:00:00.000Z",
+        "payloads": {"XAUUSD": payload("XAUUSD")},
+        "pendingSignals": {},
+        "logs": [],
+        "errors": [],
+    }
+    await service.comprehensive_analysis({**base_state, "analysisRole": "htf_anchor"})
+    await service.comprehensive_analysis({**base_state, "analysisRole": "m15_entry"})
+
+    assert recorded_options[0] is not None
+    assert recorded_options[0]["analysisRole"] == "htf_anchor"
+    assert recorded_options[0]["skipTradeAction"] is True
+    assert recorded_options[1] is not None
+    assert recorded_options[1]["analysisRole"] == "m15_entry"
+    assert "skipTradeAction" not in recorded_options[1]

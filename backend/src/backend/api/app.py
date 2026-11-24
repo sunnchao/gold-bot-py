@@ -387,6 +387,7 @@ def _register_ea_endpoints(app: FastAPI) -> None:
                     "ai_approve_cooldown": app.state.ai_approve_cooldown,
                     "discord": app.state.discord,
                     "feishu": app.state.feishu,
+                    "metrics": app.state.metrics,
                     "sop_patrol_enabled": app.state.sop_patrol_enabled,
                     "sop_execution_mode": app.state.sop_execution_mode,
                 },

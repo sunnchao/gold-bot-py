@@ -14,6 +14,7 @@ from backend.persistence.records import EaRecord
 
 __all__ = [
     "AI_APPROVE_MIN_RR",
+    "AI_APPROVE_MIN_TP1_RR",
     "calc_ai_approve_lots",
     "first_positive_ai_approve_take_profit",
     "pick_ai_approve_entry_price",
@@ -26,6 +27,8 @@ __all__ = [
 
 # R:R 下限(镜像 TS AI_APPROVE_MIN_RR)
 AI_APPROVE_MIN_RR = 1.25
+# 分批止盈首目标(TP1)最低 R:R 下限, 避免 60% 仓位极小盈亏比止盈后扫损净亏
+AI_APPROVE_MIN_TP1_RR = 0.75
 
 
 def pick_ai_approve_entry_price(entry_zone: EaRecord | None) -> float:
@@ -96,6 +99,13 @@ def resolve_ai_approve_executable_take_profits(input: dict[str, Any]) -> EaRecor
         min_risk_reward = AI_APPROVE_MIN_RR
 
     targets: list[EaRecord] = []
+    raw_tp1_floor = input.get("minTp1RiskReward")
+    tp1_floor = (
+        float(cast(float, raw_tp1_floor))
+        if _is_positive_finite(raw_tp1_floor)
+        else AI_APPROVE_MIN_TP1_RR
+    )
+    tp1_min_rr = min(tp1_floor, float(min_risk_reward)) if min_risk_reward > 0 else 0.0
     for index, value in enumerate(executable_values):
         label = _label_for_target_index(index)
         reward = value - entry if side == "buy" else entry - value
@@ -104,6 +114,8 @@ def resolve_ai_approve_executable_take_profits(input: dict[str, Any]) -> EaRecor
         rr = reward / risk
         if not _is_finite_number(rr):
             return _reject_take_profit("rr.invalid", label)
+        if index == 0 and len(executable_values) >= 2 and tp1_min_rr > 0 and rr + 1e-12 < tp1_min_rr:
+            return _reject_take_profit("rr.below_minimum", label)
         is_primary = index == len(executable_values) - 1
         if is_primary and min_risk_reward > 0 and rr + 1e-12 < min_risk_reward:
             return _reject_take_profit("rr.below_minimum", label)
@@ -162,20 +174,35 @@ def resolve_ai_approve_order_intent(
             return {"accepted": False, "reason": "limit_direction_mismatch"}
         if entry < current_price:
             return {"accepted": True, "orderType": "BUY_LIMIT"}
-        if _is_triggered_limit_within_protection(trade_plan, current_price):
-            return {"accepted": True, "orderType": "market"}
-        return {"accepted": False, "reason": "limit_direction_mismatch"}
+        return _check_triggered_limit_conversion(trade_plan, current_price, entry, h1_atr)
 
     if requested_order_type == "SELL_LIMIT":
         if side != "sell":
             return {"accepted": False, "reason": "limit_direction_mismatch"}
         if entry > current_price:
             return {"accepted": True, "orderType": "SELL_LIMIT"}
-        if _is_triggered_limit_within_protection(trade_plan, current_price):
-            return {"accepted": True, "orderType": "market"}
-        return {"accepted": False, "reason": "limit_direction_mismatch"}
+        return _check_triggered_limit_conversion(trade_plan, current_price, entry, h1_atr)
 
     return {"accepted": False, "reason": "order_intent.missing"}
+
+
+def _check_triggered_limit_conversion(
+    trade_plan: EaRecord,
+    current_price: float,
+    entry: float,
+    h1_atr: float,
+) -> EaRecord:
+    """Validate triggered limit-to-market conversion against protection and chase limits."""
+    if not _is_triggered_limit_within_protection(trade_plan, current_price):
+        return {"accepted": False, "reason": "limit_direction_mismatch"}
+    stop_loss = _number_field(trade_plan, "stop_loss")
+    orig_sl_dist = abs(entry - stop_loss) if stop_loss > 0 else 0.0
+    rem_sl_dist = abs(current_price - stop_loss) if stop_loss > 0 else 0.0
+    if (h1_atr > 0 and abs(current_price - entry) > h1_atr * 2.0) or (
+        orig_sl_dist > 0 and rem_sl_dist < orig_sl_dist * 0.25
+    ):
+        return {"accepted": False, "reason": "limit.chase_rejected"}
+    return {"accepted": True, "orderType": "market"}
 
 
 def validate_ai_approve_protection_direction(trade_plan: EaRecord, entry: float) -> EaRecord:

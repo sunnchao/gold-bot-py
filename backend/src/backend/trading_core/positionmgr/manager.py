@@ -1011,8 +1011,9 @@ def apply_same_side_breakeven(
 
         new_positions = [p for p in group if p["ticket"] not in previous_tickets]
         old_positions = [p for p in group if p["ticket"] in previous_tickets]
+        add_on_positions = [p for p in new_positions if not _is_split_order_sibling(p, old_positions)]
         has_favorable_add_on = False
-        if len(new_positions) > 0 and len(old_positions) > 0:
+        if len(add_on_positions) > 0 and len(old_positions) > 0:
             weighted_sum = sum(p["openPrice"] * p["lots"] for p in old_positions)
             total_lots = sum(p["lots"] for p in old_positions)
             average_price = weighted_sum / total_lots if total_lots > 0 else 0
@@ -1020,7 +1021,7 @@ def apply_same_side_breakeven(
                 has_favorable_add_on = any(
                     (side == "BUY" and p["openPrice"] > average_price)
                     or (side == "SELL" and p["openPrice"] < average_price)
-                    for p in new_positions
+                    for p in add_on_positions
                 )
 
         if not any_new_be and not has_favorable_add_on:
@@ -1051,6 +1052,30 @@ def apply_same_side_breakeven(
                 )
 
 
+def _split_comment_base(comment: str) -> tuple[str, str] | None:
+    """Return (base_comment, leg) when a position comment ends in _A or _B."""
+    text = str(comment or "").strip()
+    if len(text) < 3 or not text[-2:].startswith("_"):
+        return None
+    leg = text[-1].upper()
+    if leg not in ("A", "B"):
+        return None
+    return text[:-2], leg
+
+
+def _is_split_order_sibling(new_pos: dict[str, Any], old_positions: list[dict[str, Any]]) -> bool:
+    """Detect A/B split legs from the same order so leg B is not treated as an add-on."""
+    new_split = _split_comment_base(str(new_pos.get("comment") or ""))
+    if new_split is None:
+        return False
+    new_base, new_leg = new_split
+    for old in old_positions:
+        old_split = _split_comment_base(str(old.get("comment") or ""))
+        if old_split is not None and old_split[0] == new_base and old_split[1] != new_leg:
+            return True
+    return False
+
+
 def apply_same_side_group_stop_reanchor(
     advisories: list[dict[str, Any]],
     next_states: list[dict[str, Any]],
@@ -1070,8 +1095,9 @@ def apply_same_side_group_stop_reanchor(
 
         new_positions = [p for p in group if p["ticket"] not in previous_tickets]
         old_positions = [p for p in group if p["ticket"] in previous_tickets]
+        add_on_positions = [p for p in new_positions if not _is_split_order_sibling(p, old_positions)]
 
-        if len(new_positions) == 0 or len(old_positions) == 0:
+        if len(add_on_positions) == 0 or len(old_positions) == 0:
             continue
 
         old_weighted_sum = sum(p["openPrice"] * p["lots"] for p in old_positions)
@@ -1084,7 +1110,7 @@ def apply_same_side_group_stop_reanchor(
         has_adverse_add_on = any(
             (side == "BUY" and p["openPrice"] < old_average_price)
             or (side == "SELL" and p["openPrice"] > old_average_price)
-            for p in new_positions
+            for p in add_on_positions
         )
 
         if not has_adverse_add_on:

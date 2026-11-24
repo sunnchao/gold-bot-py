@@ -89,6 +89,9 @@ class TradePlan:
     add_on_level: int | None = None
     max_add_count: int | None = None
     max_total_lots: float | None = None
+    analysis_started_at: str | None = None
+    analysis_start_price: float | None = None
+    inference_latency_ms: int | None = None
 
 
 @dataclass

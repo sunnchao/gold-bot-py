@@ -154,3 +154,21 @@ def test_daily_and_weekly_close_recap_helpers() -> None:
     assert summarize_weekly_close_recap(holiday_bars, reference_bar_time="2026-11-19")["week_close"] == 3630
     assert summarize_weekly_close_recap(holiday_bars, reference_bar_time="2026-11-20")["status"] != "ok"
     assert summarize_daily_close_recap(holiday_bars, target_bar_time="2026-11-20")["status"] != "ok"
+
+
+def test_analyze_daily_vacuum_caps_lookback_window_and_drops_negative_targets() -> None:
+    bars: list[dict[str, float]] = []
+    # Earlier 350 bars include an extreme historical high that would otherwise stretch downward projections < 0
+    for i in range(350):
+        hi = 5000.0 if i == 100 else 3700.0
+        bars.append({"open": 3660.0, "high": hi, "low": 3640.0, "close": 3650.0})
+    # Last 150 bars decline modestly inside 3610..3680
+    for i in range(150):
+        px = 3675.0 - i * 0.4
+        bars.append({"open": px + 1.0, "high": px + 5.0, "low": px - 5.0, "close": px})
+
+    res = analyze_daily_vacuum(bars, current_price=3615.0, atr_d1=25.0)
+    assert res["status"] == "ok"
+    assert res["bars_analyzed"] == 500
+    assert res["prior_major_high"] < 4000.0
+    assert all(t["price"] > 0 for t in res["measured_targets"])

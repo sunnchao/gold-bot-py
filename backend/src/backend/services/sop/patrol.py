@@ -29,6 +29,7 @@ from backend.services.sop.cards import (
 from backend.services.sop.ledger import (
     empty_watch_ledger,
     evaluate_ledger_patrol,
+    is_failed_review_result,
     is_material_change,
     normalize_watch_ledger,
     reconcile_ledger_after_review,
@@ -458,6 +459,7 @@ class PatrolService:
             cancelled_pending = await self._enqueue_cancel_pending(account_id, symbol, patrol_eval["trigger_reasons"])
 
         htf_ran = False
+        htf_updated = False
         m15_ran = False
         highest_alert = "silent"
         tier = "patrol"
@@ -480,63 +482,70 @@ class PatrolService:
                         "current_price": float(current_price),
                     },
                     "skipFeishu": True,
+                    "skipPublish": True,
                 },
             )
             ai_res = _extract_ai_result(wf_out, symbol) or {}
             daily_struct, conf_levels = _extract_snapshot_context(wf_out, symbol)
-            prev_snapshot = deepcopy_dict(working_ledger) if existing is not None else None
-            working_ledger = reconcile_ledger_after_review(
-                working_ledger,
-                account_id=account_id,
-                symbol=symbol,
-                role="htf_anchor",
-                review_result=ai_res,
-                daily_structure=daily_struct,
-                confluence_levels=conf_levels,
-                current_price=float(current_price),
-                now=now_dt,
-            )
-            working_ledger = await self._store.save_watch_ledger(account_id, symbol, working_ledger)
-            changed, change_reasons = is_material_change(prev_snapshot, working_ledger)
-            action_taken = "htf_reviewed"
-            highest_alert = "notify"
-            anchor = working_ledger["htf_anchor"]
-            if changed:
-                summary = (
-                    f"{symbol} 高周期(1H/4H)方向更新: 方向={anchor.get('intraday_direction')} "
-                    f"短期目标={anchor.get('short_term_targets')} 变动={','.join(change_reasons)}"
-                )
+            if existing is not None and is_failed_review_result(ai_res):
+                action_taken = "htf_review_failed"
+                highest_alert = "notify"
+                summary = f"{symbol} 高周期(1H/4H)复盘失败(保留既有锚定)"
             else:
-                summary = f"{symbol} 高周期(1H/4H)例行复盘完成(核心结论无实质变更)"
-            htf_title, htf_content, htf_card = build_htf_review_card(
-                account_id=account_id,
-                symbol=symbol,
-                current_price=float(current_price),
-                ledger=working_ledger,
-                ai_result=ai_res,
-                trigger_reasons=patrol_eval["trigger_reasons"],
-                changed=changed,
-                change_reasons=change_reasons,
-                execution_mode=self.execution_mode,
-                now=now_dt,
-            )
-            await self._alerts.route(
-                account_id=account_id,
-                symbol=symbol,
-                level="notify",
-                category="htf_anchor_update" if changed else "htf_routine_review",
-                title=htf_title,
-                content=htf_content,
-                card=htf_card,
-                dedup_key=f"htf:{working_ledger.get('version')}:{working_ledger.get('htf_reviewed_at')}",
-                bypass_cooldown=True,
-            )
+                htf_updated = True
+                prev_snapshot = deepcopy_dict(working_ledger) if existing is not None else None
+                working_ledger = reconcile_ledger_after_review(
+                    working_ledger,
+                    account_id=account_id,
+                    symbol=symbol,
+                    role="htf_anchor",
+                    review_result=ai_res,
+                    daily_structure=daily_struct,
+                    confluence_levels=conf_levels,
+                    current_price=float(current_price),
+                    now=now_dt,
+                )
+                working_ledger = await self._store.save_watch_ledger(account_id, symbol, working_ledger)
+                changed, change_reasons = is_material_change(prev_snapshot, working_ledger)
+                action_taken = "htf_reviewed"
+                highest_alert = "notify"
+                anchor = working_ledger["htf_anchor"]
+                if changed:
+                    summary = (
+                        f"{symbol} 高周期(1H/4H)方向更新: 方向={anchor.get('intraday_direction')} "
+                        f"短期目标={anchor.get('short_term_targets')} 变动={','.join(change_reasons)}"
+                    )
+                else:
+                    summary = f"{symbol} 高周期(1H/4H)例行复盘完成(核心结论无实质变更)"
+                htf_title, htf_content, htf_card = build_htf_review_card(
+                    account_id=account_id,
+                    symbol=symbol,
+                    current_price=float(current_price),
+                    ledger=working_ledger,
+                    ai_result=ai_res,
+                    trigger_reasons=patrol_eval["trigger_reasons"],
+                    changed=changed,
+                    change_reasons=change_reasons,
+                    execution_mode=self.execution_mode,
+                    now=now_dt,
+                )
+                await self._alerts.route(
+                    account_id=account_id,
+                    symbol=symbol,
+                    level="notify",
+                    category="htf_anchor_update" if changed else "htf_routine_review",
+                    title=htf_title,
+                    content=htf_content,
+                    card=htf_card,
+                    dedup_key=f"htf:{working_ledger.get('version')}:{working_ledger.get('htf_reviewed_at')}",
+                    bypass_cooldown=True,
+                )
 
         # Tier 2: M15 入场时机切入 (严格以 persisted WatchLedger HTF 锚定为前提)
         run_m15 = (
             (
                 trigger_type == "m15_close"
-                and (patrol_eval["should_trigger_m15"] or htf_ran or self.m15_always_run_entry)
+                and (patrol_eval["should_trigger_m15"] or htf_updated or self.m15_always_run_entry)
             )
             or trigger_type == "manual_m15"
         ) and not market_blocked
@@ -558,97 +567,111 @@ class PatrolService:
                 },
             )
             ai_res = _extract_ai_result(wf_out, symbol) or {}
-            prev_snapshot = deepcopy_dict(working_ledger)
-            working_ledger = reconcile_ledger_after_review(
-                working_ledger,
-                account_id=account_id,
-                symbol=symbol,
-                role="m15_entry",
-                review_result=ai_res,
-                current_price=float(current_price),
-                now=now_dt,
-            )
-            working_ledger = await self._store.save_watch_ledger(account_id, symbol, working_ledger)
-
-            trade_action = str(ai_res.get("trade_action") or "").upper()
-            raw_rec = ai_res.get("trade_recommendation")
-            rec: dict[str, Any] = raw_rec if isinstance(raw_rec, dict) else {}
-            rec_action = str(rec.get("action") or rec.get("direction") or "").upper()
-            raw_arb = ai_res.get("arbitration")
-            arb: dict[str, Any] = raw_arb if isinstance(raw_arb, dict) else {}
-            raw_plan = ai_res.get("trade_plan")
-            plan: dict[str, Any] = raw_plan if isinstance(raw_plan, dict) else {}
-            plan_side = str(plan.get("side") or "").upper()
-            is_actionable = (
-                trade_action in {"BUY", "SELL"}
-                or rec_action in {"BUY", "SELL"}
-                or (
-                    str(arb.get("action") or "").lower() == "open"
-                    and plan_side in {"BUY", "SELL"}
-                    and str(plan.get("mode") or "approve").lower() != "hold"
+            if is_failed_review_result(ai_res):
+                action_taken = "m15_review_failed"
+                if highest_alert == "silent":
+                    highest_alert = "notify"
+                summary = f"{symbol} M15 切入巡检失败(保留既有剧本与锚定)"
+            else:
+                prev_snapshot = deepcopy_dict(working_ledger)
+                working_ledger = reconcile_ledger_after_review(
+                    working_ledger,
+                    account_id=account_id,
+                    symbol=symbol,
+                    role="m15_entry",
+                    review_result=ai_res,
+                    current_price=float(current_price),
+                    now=now_dt,
                 )
-            )
+                working_ledger = await self._store.save_watch_ledger(account_id, symbol, working_ledger)
 
-            side_label = (
-                trade_action
-                if trade_action in {"BUY", "SELL"}
-                else (rec_action if rec_action in {"BUY", "SELL"} else plan_side)
-            )
-            m15_title, m15_content, m15_card = build_m15_review_card(
-                account_id=account_id,
-                symbol=symbol,
-                current_price=float(current_price),
-                ledger=working_ledger,
-                ai_result=ai_res,
-                trigger_reasons=patrol_eval["trigger_reasons"],
-                is_actionable=is_actionable,
-                side_label=side_label,
-                execution_mode=self.execution_mode,
-                now=now_dt,
-            )
-
-            if is_actionable:
-                highest_alert = "actionable"
-                action_taken = "m15_entry_signal"
+                trade_action = str(ai_res.get("trade_action") or "").upper()
+                raw_rec = ai_res.get("trade_recommendation")
+                rec: dict[str, Any] = raw_rec if isinstance(raw_rec, dict) else {}
+                rec_action = str(rec.get("action") or rec.get("direction") or "").upper()
+                raw_arb = ai_res.get("arbitration")
+                arb: dict[str, Any] = raw_arb if isinstance(raw_arb, dict) else {}
+                raw_plan = ai_res.get("trade_plan")
+                plan: dict[str, Any] = raw_plan if isinstance(raw_plan, dict) else {}
+                plan_side = str(plan.get("side") or "").upper()
+                plan_mode = str(plan.get("mode") or "").lower()
+                arb_action = str(arb.get("action") or "").lower()
                 entry_val = plan.get("entry_price")
                 raw_ez = plan.get("entry_zone")
                 if entry_val is None and isinstance(raw_ez, dict):
                     entry_val = raw_ez.get("min")
-                summary = (
-                    f"{symbol} M15 入场触发 [{side_label}] "
-                    f"入场={entry_val if entry_val is not None else current_price} "
-                    f"SL={plan.get('stop_loss')} TP={plan.get('take_profits')}"
+                if entry_val is None:
+                    entry_val = rec.get("entry_price")
+                sl_val = plan.get("stop_loss")
+                if sl_val is None:
+                    sl_val = rec.get("stop_loss")
+                entry_num = float(entry_val) if isinstance(entry_val, (int, float)) else 0.0
+                sl_num = float(sl_val) if isinstance(sl_val, (int, float)) else 0.0
+                has_valid_prices = entry_num > 0 and sl_num > 0
+                plan_executable = not plan_mode or plan_mode == "approve"
+                is_actionable = plan_executable and has_valid_prices and (
+                    trade_action in {"BUY", "SELL"}
+                    or (rec_action in {"BUY", "SELL"} and arb_action in {"", "open"})
+                    or (arb_action == "open" and plan_side in {"BUY", "SELL"})
                 )
-                await self._alerts.route(
+
+                side_label = (
+                    trade_action
+                    if trade_action in {"BUY", "SELL"}
+                    else (rec_action if rec_action in {"BUY", "SELL"} else plan_side)
+                )
+                m15_title, m15_content, m15_card = build_m15_review_card(
                     account_id=account_id,
                     symbol=symbol,
-                    level="actionable",
-                    category="m15_entry_signal",
-                    title=m15_title,
-                    content=m15_content,
-                    card=m15_card,
-                    dedup_key=f"m15:{side_label}:{entry_val}:{working_ledger.get('m15_reviewed_at')}",
-                    bypass_cooldown=True,
+                    current_price=float(current_price),
+                    ledger=working_ledger,
+                    ai_result=ai_res,
+                    trigger_reasons=patrol_eval["trigger_reasons"],
+                    is_actionable=is_actionable,
+                    side_label=side_label,
+                    execution_mode=self.execution_mode,
+                    now=now_dt,
                 )
-                if self.execution_mode == "integrated" and self._queue_pending_fn is not None:
-                    await self._queue_pending_fn(account_id, symbol, ai_res)
-            else:
-                _changed_m15, _ = is_material_change(prev_snapshot, working_ledger)
-                action_taken = "m15_wait"
-                if highest_alert == "silent":
-                    highest_alert = "notify"
-                summary = f"{symbol} M15 切入巡检: 保持观察 (未触发下单条件)"
-                await self._alerts.route(
-                    account_id=account_id,
-                    symbol=symbol,
-                    level="notify",
-                    category="m15_entry_review",
-                    title=m15_title,
-                    content=m15_content,
-                    card=m15_card,
-                    dedup_key=f"m15_wait:{working_ledger.get('version')}:{working_ledger.get('m15_reviewed_at')}",
-                    bypass_cooldown=True,
-                )
+
+                if is_actionable:
+                    highest_alert = "actionable"
+                    action_taken = "m15_entry_signal"
+                    plan_tp = plan.get("take_profits") or plan.get("take_profit")
+                    summary = (
+                        f"{symbol} M15 入场触发 [{side_label}] "
+                        f"入场={entry_num} "
+                        f"SL={sl_num} TP={plan_tp}"
+                    )
+                    await self._alerts.route(
+                        account_id=account_id,
+                        symbol=symbol,
+                        level="actionable",
+                        category="m15_entry_signal",
+                        title=m15_title,
+                        content=m15_content,
+                        card=m15_card,
+                        dedup_key=f"m15:{side_label}:{entry_num}:{working_ledger.get('m15_reviewed_at')}",
+                        bypass_cooldown=True,
+                    )
+                    if self.execution_mode == "integrated" and self._queue_pending_fn is not None:
+                        await self._queue_pending_fn(account_id, symbol, ai_res)
+                else:
+                    _changed_m15, _ = is_material_change(prev_snapshot, working_ledger)
+                    action_taken = "m15_wait"
+                    if highest_alert == "silent":
+                        highest_alert = "notify"
+                    summary = f"{symbol} M15 切入巡检: 保持观察 (未触发下单条件)"
+                    await self._alerts.route(
+                        account_id=account_id,
+                        symbol=symbol,
+                        level="notify",
+                        category="m15_entry_review",
+                        title=m15_title,
+                        content=m15_content,
+                        card=m15_card,
+                        dedup_key=f"m15_wait:{working_ledger.get('version')}:{working_ledger.get('m15_reviewed_at')}",
+                        bypass_cooldown=True,
+                    )
 
         # 若未触发任何 LLM 调用但也发生了状态迁徙
         if not htf_ran and not m15_ran and patrol_eval["state_transitions"]:

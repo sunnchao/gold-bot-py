@@ -18,8 +18,11 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import os
 import re
+import time
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import Any, TypeGuard
 
 from backend.agents.agents._support import (
@@ -118,8 +121,12 @@ def get_payload_bars(payload: JSONDict, timeframe: str) -> list[JSONDict]:
 def payload_breakout_levels(payload: JSONDict, current_price: float) -> list[BreakoutLevel]:
     levels = payload.get("breakout_levels")
     if levels is not None:
-        return levels
-    bars = {tf: get_payload_bars(payload, tf) for tf in ("D1", "H4", "H1", "M30", "M15")}
+        return [
+            level
+            for level in levels
+            if not isinstance(level, dict) or str(level.get("timeframe") or "").upper() != "D1"
+        ]
+    bars = {tf: get_payload_bars(payload, tf) for tf in ("H4", "H1", "M30", "M15")}
     return build_breakout_levels(bars, current_price, payload.get("smc_context"))
 
 
@@ -1187,16 +1194,20 @@ def _format_sop_realtime_section(
 
     if conf:
         if not is_post_close:
-            intraday_conf = [
+            selected_conf = [
                 lv
                 for lv in conf
-                if isinstance(lv, dict) and any(not str(s).startswith("D1_") for s in (lv.get("sources") or []))
+                if isinstance(lv, dict)
+                and (
+                    not (lv.get("sources") or [])
+                    or any(not str(s).startswith("D1_") for s in (lv.get("sources") or []))
+                )
             ]
-            selected_conf = intraday_conf or [lv for lv in conf if isinstance(lv, dict)]
         else:
             selected_conf = [lv for lv in conf if isinstance(lv, dict)]
         top_levels = [
-            f"{lv.get('price')}({lv.get('role')}/{lv.get('tier')}/srcs={','.join(lv.get('sources') or [])})"
+            f"{lv.get('price')}({lv.get('role')}/{lv.get('tier')}/srcs="
+            f"{','.join(str(s) for s in (lv.get('sources') or []) if is_post_close or not str(s).startswith('D1_'))})"
             for lv in selected_conf[:6]
         ]
         if top_levels:
@@ -1390,7 +1401,6 @@ def _build_sop_context(
             or _normalize_sop_direction(tech.get("bias"))
             or _normalize_sop_direction(dow.get("primary_trend"))
             or _intraday_h1_h4_direction(trend_ctx)
-            or _normalize_sop_direction(trend_ctx.get("consensus_direction"))
             or "wait"
         )
 
@@ -1407,7 +1417,13 @@ def _build_sop_context(
     for k in ("take_profit_1", "take_profit_2"):
         val = trade.get(k)
         if isinstance(val, (int, float)) and val > 0:
-            short_targets.append(float(val))
+            vf = float(val)
+            if current_px is not None and current_px > 0:
+                if htf_dir == "long" and vf <= current_px:
+                    continue
+                if htf_dir == "short" and vf >= current_px:
+                    continue
+            short_targets.append(vf)
     if not short_targets and not is_post_close and htf_dir in ("long", "short"):
         short_targets = _pick_directional_short_targets(
             direction=htf_dir,
@@ -2292,6 +2308,16 @@ class ComprehensiveAnalystService:
         self.client = client
         self.app_config = app_config or {}
         self.trade_model = trade_model
+        self.last_run_meta: dict[str, JSONDict] = {}
+        self._has_dedicated_trade_client = trade_client is not None
+        raw_trade_timeout = (app_config or {}).get("trade_timeout_ms") or os.environ.get(
+            "LLM_TRADE_TIMEOUT", "35000"
+        )
+        try:
+            parsed_trade_timeout = int(raw_trade_timeout)
+        except (TypeError, ValueError):
+            parsed_trade_timeout = 35000
+        self._m15_timeout_ms = max(5000, min(120000, parsed_trade_timeout))
         self.structure_cache = StructureCache()
         # 当前 run() 计算出的程序化结构,供 normalize/重试路径共用,
         # 使 _neutralize_unsupported_theory 能按"结构是否真实可用"判断。
@@ -2309,11 +2335,21 @@ class ComprehensiveAnalystService:
         system_blocks: list[SystemBlock],
         user_layers: list[UserLayer],
         symbol: str,
+        *,
+        client: LlmClient | None = None,
+        extra_opts: dict[str, Any] | None = None,
     ) -> JSONDict | None:
         """镜像 retryWithStructuredOutput:强制 tool_use 结构化重试(Phase 4.2)。"""
         logger = get_logger()
+        active = client or self.client
+        retry_opts: dict[str, Any] = {
+            "tools": COMPREHENSIVE_ANALYSIS_TOOLS,
+            "toolChoice": {"type": "tool", "name": "submit_comprehensive_analysis"},
+        }
+        if extra_opts:
+            retry_opts.update(extra_opts)
         try:
-            result = await self.client.stream_layered(
+            result = await active.stream_layered(
                 system_blocks,
                 [
                     *user_layers,
@@ -2324,10 +2360,7 @@ class ComprehensiveAnalystService:
                         cacheable=False,
                     ),
                 ],
-                {
-                    "tools": COMPREHENSIVE_ANALYSIS_TOOLS,
-                    "toolChoice": {"type": "tool", "name": "submit_comprehensive_analysis"},
-                },
+                retry_opts,
             )
             tool_use = result.tool_use
             if tool_use is None:
@@ -2434,9 +2467,14 @@ class ComprehensiveAnalystService:
     ) -> JSONDict:
         """镜像 run:分层 prompt -> Markdown/JSON 双格式解析 -> 重试 -> 校验 -> 决策。"""
         logger = get_logger()
+        started_wall = datetime.now(UTC).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+        started_mono = time.monotonic()
         options = options or {}
         profile = get_symbol_profile(symbol)
         sop_role = options.get("analysisRole")
+        use_fast_trade_client = sop_role == "m15_entry" and self._has_dedicated_trade_client
+        active_client = self.trade_client if use_fast_trade_client else self.client
+        call_opts: dict[str, Any] = {"timeoutMs": self._m15_timeout_ms} if use_fast_trade_client else {}
         is_post_close_role = sop_role in ("daily_close_review", "weekly_close_review")
         if is_post_close_role:
             review_context = options.get("patrolContext") or {}
@@ -2456,6 +2494,10 @@ class ComprehensiveAnalystService:
                 "- Primary mission: analyze **1-hour (1H) and 4-hour (4H)** market structure to establish "
                 "intraday overall trend direction, key structural levels, short-term targets, structural "
                 "veto boundary, and primary/backup playbooks with clear invalidation prices.\n"
+                "- Direction anchoring & playbook planning only: do NOT execute or publish live orders here "
+                "(order entry is delegated strictly to M15 entry timing). Still provide your directional bias, "
+                "reference structural stop/targets, and invalidation boundary so the WatchLedger can anchor "
+                "M15 entries.\n"
                 "- Keep M15 entry signals subordinate to the 1H/4H intraday direction.\n"
                 "- Do NOT use Daily (D1) bars as the intraday direction driver (D1 is reserved for "
                 "post-close daily/weekly reviews).\n"
@@ -2471,6 +2513,10 @@ class ComprehensiveAnalystService:
                 "- Do NOT overturn the 1H/4H intraday direction unless veto boundary breach is confirmed "
                 "with double evidence.\n"
                 "- Do NOT block or refuse new positions due to daily ATR budget or daily range exhaustion.\n"
+                "- Entry discipline: for `pullback_limit`, keep entry within 1.5x H1 ATR of current price "
+                "and before 60% of the distance to TP1 has elapsed.\n"
+                "- Stop/Target discipline: place stop_loss structurally within 0.6x–2.2x H1 ATR, keep "
+                "TP1 R:R >= 1.0 (never < 0.75) and TP2 R:R >= 1.5.\n"
                 "- Terminology rule: NEVER output the abbreviation 'HTF' or 'htf' anywhere in Chinese or "
                 "English text; always write full terms such as '高周期(1H/4H)' or '1小时/4小时高周期'."
             )
@@ -2523,10 +2569,13 @@ class ComprehensiveAnalystService:
 
         async def invoke_non_streaming_fallback() -> str | None:
             try:
-                fallback_raw = await self.client.invoke_layered(system_blocks, user_layers)
+                if call_opts:
+                    fallback_raw = await active_client.invoke_layered(system_blocks, user_layers, call_opts)
+                else:
+                    fallback_raw = await active_client.invoke_layered(system_blocks, user_layers)
                 if fallback_raw.strip() == "":
                     logger.warn(
-                        {"symbol": symbol, "model": self.client.get_model()},
+                        {"symbol": symbol, "model": active_client.get_model()},
                         "comprehensiveAnalysis: non-streaming fallback also returned empty content",
                     )
                 return fallback_raw
@@ -2538,7 +2587,10 @@ class ComprehensiveAnalystService:
                 return None
 
         try:
-            streamed = await self.client.stream_layered(system_blocks, user_layers)
+            if call_opts:
+                streamed = await active_client.stream_layered(system_blocks, user_layers, call_opts)
+            else:
+                streamed = await active_client.stream_layered(system_blocks, user_layers)
             if streamed.content.strip():
                 raw = streamed.content
             else:
@@ -2575,7 +2627,13 @@ class ComprehensiveAnalystService:
                         {"symbol": symbol, "rawPrefix": raw[:200]},
                         "comprehensiveAnalysis: both Markdown and JSON parse failed",
                     )
-                    retried = await self.retry_with_structured_output(system_blocks, user_layers, symbol)
+                    retried = await self.retry_with_structured_output(
+                        system_blocks,
+                        user_layers,
+                        symbol,
+                        client=active_client,
+                        extra_opts=call_opts,
+                    )
                     if not retried:
                         return build_fallback(current_price)
                     result_data = retried
@@ -2594,7 +2652,13 @@ class ComprehensiveAnalystService:
                     {"symbol": symbol, "rawPrefix": raw[:200]},
                     "comprehensiveAnalysis: both Markdown and JSON parse failed",
                 )
-                retried = await self.retry_with_structured_output(system_blocks, user_layers, symbol)
+                retried = await self.retry_with_structured_output(
+                    system_blocks,
+                    user_layers,
+                    symbol,
+                    client=active_client,
+                    extra_opts=call_opts,
+                )
                 if not retried:
                     return build_fallback(current_price)
                 result_data = retried
@@ -2708,6 +2772,7 @@ class ComprehensiveAnalystService:
         if (
             (result.get("arbitration") is not None)
             and options.get("skipTradeAction") is not True
+            and sop_role != "htf_anchor"
             and not is_post_close_role
         ):
             trade_action = await self.decide_trade_action(result["arbitration"], payload, profile)
@@ -2725,6 +2790,12 @@ class ComprehensiveAnalystService:
                 options=options,
             )
 
+        self.last_run_meta[symbol] = {
+            "analysis_started_at": started_wall,
+            "analysis_start_price": float(current_price) if current_price else 0.0,
+            "inference_latency_ms": max(0, int((time.monotonic() - started_mono) * 1000)),
+            "model": active_client.get_model(),
+        }
         return result
 
     async def run_market_insight(

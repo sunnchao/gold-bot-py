@@ -237,6 +237,20 @@ def _entry_bid_ask(state: AnalysisGraphState) -> tuple[float, float]:
     return float(bid), float(ask)
 
 
+def _analysis_timing_meta(state: AnalysisGraphState) -> tuple[str | None, float | None, int | None]:
+    raw_meta = _get(state.get("comprehensiveAnalysis"), "_meta")
+    if not isinstance(raw_meta, dict):
+        return None, None, None
+    started_at = raw_meta.get("analysis_started_at")
+    start_price = raw_meta.get("analysis_start_price")
+    latency = raw_meta.get("inference_latency_ms")
+    return (
+        str(started_at) if isinstance(started_at, str) and started_at else None,
+        float(start_price) if isinstance(start_price, (int, float)) and not isinstance(start_price, bool) else None,
+        int(latency) if isinstance(latency, (int, float)) and not isinstance(latency, bool) else None,
+    )
+
+
 def _expires_at_from(timestamp: str) -> str:
     return _iso_z(_parse_ts(timestamp) + timedelta(milliseconds=TRADE_PLAN_EXPIRY_MS))
 
@@ -289,6 +303,7 @@ def build_trade_plan_from_trade_action(
         expiry_ms = int(_coalesce(expiry_hours, 4)) * 3600 * 1000
 
     timestamp = state.get("timestamp") or _now_iso()
+    started_at, start_price, latency_ms = _analysis_timing_meta(state)
     return TradePlan(
         schema_version=TRADE_PLAN_SCHEMA_VERSION,
         decision_id=decision_id_for(state.get("accountId", ""), state.get("symbol", ""), timestamp, arbitration),
@@ -308,6 +323,9 @@ def build_trade_plan_from_trade_action(
         conflicts=[],
         narrative=_get(action, "reason", ""),
         add_on=bool(_get(state.get("riskAssessment"), "addOn", False)),
+        analysis_started_at=started_at,
+        analysis_start_price=start_price,
+        inference_latency_ms=latency_ms,
     )
 
 
@@ -342,7 +360,8 @@ def build_trade_plan(state: AnalysisGraphState, confidence: float) -> TradePlan 
         and len(take_profit) > 0
         and max_lots > 0
     )
-    missing_execution_fields = is_active_mode(intended_mode) and not has_complete_execution_fields
+    requires_entry_fields = intended_mode in ("approve", "modify")
+    missing_execution_fields = requires_entry_fields and not has_complete_execution_fields
     mode: TradePlanMode = "observe" if missing_execution_fields else intended_mode
     side: TradePlanSide = "none" if missing_execution_fields or mode == "veto" else intended_side
     if missing_execution_fields:
@@ -356,6 +375,7 @@ def build_trade_plan(state: AnalysisGraphState, confidence: float) -> TradePlan 
         return None
 
     isolated = mode in ("observe", "veto")
+    started_at, start_price, latency_ms = _analysis_timing_meta(state)
     return TradePlan(
         schema_version=TRADE_PLAN_SCHEMA_VERSION,
         decision_id=decision_id_for(state.get("accountId", ""), state.get("symbol", ""), timestamp, arbitration),
@@ -375,6 +395,9 @@ def build_trade_plan(state: AnalysisGraphState, confidence: float) -> TradePlan 
         conflicts=_conflicts_for(missing_execution_fields, mode, filters, arbitration),
         narrative=_get(arbitration, "reasoning", ""),
         add_on=bool(_get(state.get("riskAssessment"), "addOn", False)),
+        analysis_started_at=started_at,
+        analysis_start_price=start_price,
+        inference_latency_ms=latency_ms,
     )
 
 
@@ -400,7 +423,8 @@ def build_single_trade_plan(
         and len(take_profit) > 0
         and max_lots > 0
     )
-    missing_execution_fields = is_active_mode(intended_mode) and not has_complete_execution_fields
+    requires_entry_fields = intended_mode in ("approve", "modify")
+    missing_execution_fields = requires_entry_fields and not has_complete_execution_fields
     mode: TradePlanMode = "observe" if missing_execution_fields else intended_mode
     if missing_execution_fields:
         extra_reason_codes = ["execution.incomplete_fields"]
@@ -410,6 +434,7 @@ def build_single_trade_plan(
         extra_reason_codes = []
 
     isolated = mode in ("observe", "veto")
+    started_at, start_price, latency_ms = _analysis_timing_meta(state)
     return TradePlan(
         schema_version=TRADE_PLAN_SCHEMA_VERSION,
         decision_id=decision_id_for(state.get("accountId", ""), state.get("symbol", ""), timestamp, arbitration),
@@ -429,6 +454,9 @@ def build_single_trade_plan(
         conflicts=_conflicts_for(missing_execution_fields, mode, filters, arbitration),
         narrative=_get(arbitration, "reasoning", ""),
         add_on=bool(_get(state.get("riskAssessment"), "addOn", False)),
+        analysis_started_at=started_at,
+        analysis_start_price=start_price,
+        inference_latency_ms=latency_ms,
     )
 
 
@@ -580,7 +608,13 @@ def compose_final_signal(state: AnalysisGraphState) -> AISignalResult | None:
         state if arbitration is state.get("arbitration") else _with_state_arbitration(state, arbitration)
     )
 
-    if resolved_trade_action is not None:
+    analysis_role = state.get("analysisRole")
+    is_non_entry_role = analysis_role in ("htf_anchor", "daily_close_review", "weekly_close_review")
+
+    trade_plan: TradePlan | None
+    if is_non_entry_role:
+        trade_plan = None
+    elif resolved_trade_action is not None:
         trade_plan = build_trade_plan_from_trade_action(
             effective_state,
             cast(OrderPlacingAction, resolved_trade_action),
@@ -590,7 +624,7 @@ def compose_final_signal(state: AnalysisGraphState) -> AISignalResult | None:
     else:
         trade_plan = build_trade_plan(effective_state, confidence)
 
-    if market_first and _get(arbitration, "action") == "open" and trade_plan is None:
+    if not is_non_entry_role and market_first and _get(arbitration, "action") == "open" and trade_plan is None:
         reasoning = _get(arbitration, "reasoning", "")
         arbitration = _with_arbitration(
             arbitration,
@@ -602,16 +636,20 @@ def compose_final_signal(state: AnalysisGraphState) -> AISignalResult | None:
         )
         effective_state = _with_state_arbitration(state, arbitration)
 
-    dual_trade_plan = (
+    dual_trade_plan: DualTradePlan | None = (
         build_dual_trade_plan(effective_state, confidence)
-        if (not market_first and _get(arbitration, "action") == "open")
+        if (not is_non_entry_role and not market_first and _get(arbitration, "action") == "open")
         else None
     )
 
-    levels = _get(state.get("payload"), "breakout_levels") or []
+    levels = [
+        level
+        for level in (_get(state.get("payload"), "breakout_levels") or [])
+        if str(_get(level, "timeframe", "") or "").upper() != "D1"
+    ]
     bid, ask = _entry_bid_ask(state)
     plans = (dual_trade_plan.buy, dual_trade_plan.sell) if dual_trade_plan is not None else (trade_plan,)
-    if any(
+    if not is_non_entry_role and any(
         breakout_entry_rejection(
             levels, plan.side, bid or ask, (plan.entry_zone.min + plan.entry_zone.max) / 2,
             phase=_get(technical, "phase", ""), basis=_get(arbitration, "trigger_basis") or "",
@@ -629,8 +667,6 @@ def compose_final_signal(state: AnalysisGraphState) -> AISignalResult | None:
         trade_plan = dual_trade_plan = None
 
     sop_blocks: list[str] = []
-    analysis_role = state.get("analysisRole")
-    is_post_close_review = analysis_role in ("daily_close_review", "weekly_close_review")
     raw_prev_ledger = state.get("previousLedger")
     prev_ledger: dict[str, Any] | None = raw_prev_ledger if isinstance(raw_prev_ledger, dict) else None
     raw_patrol_ctx = state.get("patrolContext")
@@ -638,7 +674,7 @@ def compose_final_signal(state: AnalysisGraphState) -> AISignalResult | None:
     raw_triggers = patrol_ctx.get("trigger_reasons")
     trigger_reasons = [str(r) for r in raw_triggers] if isinstance(raw_triggers, list) else []
 
-    if is_post_close_review:
+    if is_non_entry_role:
         trade_plan = dual_trade_plan = None
     elif prev_ledger is not None:
         raw_anchor = prev_ledger.get("htf_anchor")
@@ -701,6 +737,22 @@ def compose_final_signal(state: AnalysisGraphState) -> AISignalResult | None:
         )
         trade_plan = dual_trade_plan = None
 
+    raw_positions = _get(state.get("payload"), "positions") or []
+    has_open_positions = any(
+        str(_get(pos, "order_class") or "").strip().lower() != "pending"
+        and str(_get(pos, "type") or _get(pos, "direction") or "").strip().upper() in ("BUY", "SELL")
+        for pos in raw_positions
+    )
+    exit_suggestion_val = _coalesce(_get(technical, "recommendation"), "none")
+    arb_action_val = str(_get(arbitration, "action") or "").strip().lower()
+    plan_mode_val = str(_get(trade_plan, "mode") or "").strip().lower()
+    exit_requested = (
+        exit_suggestion_val in ("close", "partial_close")
+        or arb_action_val == "close"
+        or plan_mode_val in ("close", "reduce")
+    )
+    auto_exit_alert = not is_non_entry_role and exit_requested and confidence >= 60 and has_open_positions
+
     risk_level = _get(risk_assessment, "riskLevel")
     trade_action_type = _get(trade_action, "type")
     risk_blocking = [code for code in filters["blocking"] if code != EVENT_BLACKOUT]
@@ -708,9 +760,10 @@ def compose_final_signal(state: AnalysisGraphState) -> AISignalResult | None:
         risk_alert = (
             any(code in CRITICAL_BLOCKING for code in risk_blocking)
             or risk_level in ("high", "extreme")
+            or auto_exit_alert
         )
     else:
-        risk_alert = bool(risk_blocking) or risk_level in ("high", "extreme")
+        risk_alert = bool(risk_blocking) or risk_level in ("high", "extreme") or auto_exit_alert
 
     alert_reason_parts: list[str] = []
     if market_blocked:
@@ -720,6 +773,8 @@ def compose_final_signal(state: AnalysisGraphState) -> AISignalResult | None:
         alert_reason_parts.append("; ".join(warnings))
     if sop_blocks:
         alert_reason_parts.append("; ".join(sop_blocks))
+    if auto_exit_alert and not alert_reason_parts:
+        alert_reason_parts.append("ai_exit_signal")
     alert_reason = "; ".join(alert_reason_parts) or None
 
     if technical is not None:

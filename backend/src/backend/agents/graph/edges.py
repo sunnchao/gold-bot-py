@@ -66,7 +66,7 @@ def route_after_arbitration(state: AnalysisGraphState) -> Literal["publish", "sk
     """Route after the composeSignal node (mirror of routeAfterArbitration)."""
     if state.get("skipPublish") is True:
         return "skip_publish"
-    if state.get("analysisRole") in ("daily_close_review", "weekly_close_review"):
+    if state.get("analysisRole") in ("htf_anchor", "daily_close_review", "weekly_close_review"):
         return "skip_publish"
 
     final_signal = state.get("finalSignal")

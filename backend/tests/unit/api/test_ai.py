@@ -461,3 +461,293 @@ async def test_ai_result_risk_alert_queues_close_command() -> None:
     assert commands[0]["action"] == "CLOSE_ALL"
     assert commands[0]["source"] == "ai_risk_alert"
     assert commands[0]["reason"] == "AI风险警报(全平): crash"
+
+
+async def test_ai_result_close_and_partial_close_queue_per_ticket_symbol_market_close() -> None:
+    clock = ["2026-04-13T08:00:00.000Z"]
+    store = create_in_memory_store()
+    client = make_app(store=store, now_iso=lambda: clock[0])
+    await store.save_registration({"account_id": ACCOUNT_ID, "leverage": 500})
+    await store.save_heartbeat(
+        {
+            "account_id": ACCOUNT_ID,
+            "equity": 10000,
+            "free_margin": 9500,
+            "market_open": True,
+            "is_trade_allowed": True,
+            "server_time": "2026.04.13 08:00:00",
+        }
+    )
+    await store.save_tick(
+        {
+            "account_id": ACCOUNT_ID,
+            "symbol": "XAUUSD",
+            "bid": 3625.0,
+            "ask": 3625.2,
+            "spread": 0.2,
+            "time": "2026-04-13T07:59:30.000Z",
+        }
+    )
+    await store.save_positions(
+        {
+            "account_id": ACCOUNT_ID,
+            "symbol": "XAUUSD",
+            "positions": [
+                {
+                    "ticket": 1001,
+                    "symbol": "XAUUSD",
+                    "type": "BUY",
+                    "order_class": "market",
+                    "lots": 0.10,
+                    "open_price": 3640.0,
+                    "open_time": 1735689600,
+                    "comment": "",
+                },
+                {
+                    "ticket": 1002,
+                    "symbol": "XAUUSD",
+                    "type": "SELL_LIMIT",
+                    "order_class": "pending",
+                    "lots": 0.10,
+                    "open_price": 3660.0,
+                    "open_time": 1735689600,
+                    "comment": "",
+                },
+                {
+                    "ticket": 2001,
+                    "symbol": "SILVERM#",
+                    "type": "BUY",
+                    "order_class": "market",
+                    "lots": 0.20,
+                    "open_price": 35.0,
+                    "open_time": 1735689600,
+                    "comment": "",
+                },
+            ],
+        }
+    )
+
+    # Low confidence (< 50) must NOT queue close
+    low_conf = client.post(
+        f"/api/v2/ai_result/{ACCOUNT_ID}/XAUUSD",
+        json={"risk_alert": True, "exit_suggestion": "close", "confidence": 35, "alert_reason": "weak"},
+        headers=headers(),
+    )
+    assert low_conf.status_code == 200
+    assert await store.list_commands(ACCOUNT_ID) == []
+
+    # High confidence partial_close + trade_plan(mode="reduce") queues half lots only on XAUUSD market ticket
+    partial_resp = client.post(
+        f"/api/v2/ai_result/{ACCOUNT_ID}/XAUUSD",
+        json={
+            "risk_alert": True,
+            "exit_suggestion": "partial_close",
+            "confidence": 78,
+            "alert_reason": "trim risk",
+            "trade_plan": {
+                "schema_version": "trade_plan.v1",
+                "decision_id": "d-close-1",
+                "account_id": ACCOUNT_ID,
+                "symbol": "XAUUSD",
+                "mode": "reduce",
+                "side": "none",
+                "confidence": 78,
+                "expires_at": "2099-04-13T10:00:00.000Z",
+                "reason_codes": ["risk.trim"],
+                "narrative": "reduce half",
+                "add_on": False,
+                "entry_zone": {"min": 0.0, "max": 0.0},
+                "stop_loss": 0.0,
+                "take_profit": [],
+                "max_lots": 0.0,
+            },
+        },
+        headers=headers(),
+    )
+    assert partial_resp.status_code == 200
+    cmds = await store.list_commands(ACCOUNT_ID)
+    assert len(cmds) == 1
+    assert cmds[0]["action"] == "CLOSE"
+    assert cmds[0]["ticket"] == 1001
+    assert cmds[0]["symbol"] == "XAUUSD"
+    assert cmds[0]["lots"] == 0.05
+
+    # risk_alert=False must NOT queue close even with confidence=85
+    no_alert = client.post(
+        f"/api/v2/ai_result/{ACCOUNT_ID}/XAUUSD",
+        json={"risk_alert": False, "exit_suggestion": "close", "confidence": 85, "alert_reason": "no alert"},
+        headers=headers(),
+    )
+    assert no_alert.status_code == 200
+    assert len(await store.list_commands(ACCOUNT_ID)) == 1
+
+    # Duplicate close for already queued/cooled ticket 1001 must be deduplicated within 240s
+    clock[0] = "2026-04-13T08:00:01.000Z"
+    dedup_resp = client.post(
+        f"/api/v2/ai_result/{ACCOUNT_ID}/XAUUSD",
+        json={
+            "risk_alert": True,
+            "exit_suggestion": "close",
+            "confidence": 82,
+            "alert_reason": "duplicate signal",
+        },
+        headers=headers(),
+    )
+    assert dedup_resp.status_code == 200
+    assert len(await store.list_commands(ACCOUNT_ID)) == 1
+
+    # Non-cooled ticket 1003 receives full-lot CLOSE
+    await store.save_positions(
+        {
+            "account_id": ACCOUNT_ID,
+            "symbol": "XAUUSD",
+            "positions": [
+                {
+                    "ticket": 1003,
+                    "symbol": "XAUUSD",
+                    "type": "SELL",
+                    "order_class": "market",
+                    "lots": 0.08,
+                    "open_price": 3630.0,
+                    "open_time": 1735689600,
+                    "comment": "",
+                }
+            ],
+        }
+    )
+    clock[0] = "2026-04-13T08:00:05.000Z"
+    close_resp = client.post(
+        f"/api/v2/ai_result/{ACCOUNT_ID}/XAUUSD",
+        json={
+            "risk_alert": True,
+            "exit_suggestion": "close",
+            "confidence": 82,
+            "alert_reason": "reversal exit",
+        },
+        headers=headers(),
+    )
+    assert close_resp.status_code == 200
+    cmds_after = await store.list_commands(ACCOUNT_ID)
+    assert len(cmds_after) == 2
+    assert cmds_after[-1]["action"] == "CLOSE"
+    assert cmds_after[-1]["ticket"] == 1003
+    assert cmds_after[-1]["symbol"] == "XAUUSD"
+    assert cmds_after[-1]["lots"] == 0.08
+
+
+async def test_pending_gate_rejection_records_telemetry_and_metrics() -> None:
+    store = create_in_memory_store()
+    client = make_app(store=store, now_iso=lambda: "2026-04-13T08:00:00.000Z")
+    await store.save_registration({"account_id": ACCOUNT_ID, "leverage": 500, "ai_symbols": ["XAUUSD"]})
+    await store.save_heartbeat(
+        {
+            "account_id": ACCOUNT_ID,
+            "equity": 10000,
+            "free_margin": 9500,
+            "market_open": True,
+            "is_trade_allowed": True,
+            "server_time": "2026.04.13 08:00:00",
+        }
+    )
+    await store.save_tick(
+        {
+            "account_id": ACCOUNT_ID,
+            "symbol": "XAUUSD",
+            "bid": 3335.5,
+            "ask": 3335.7,
+            "spread": 0.2,
+            "time": "2026-04-13T07:59:30.000Z",
+        }
+    )
+    await store.save_bars(
+        {
+            "account_id": ACCOUNT_ID,
+            "symbol": "XAUUSD",
+            "timeframe": "H1",
+            "bars": [{"close": 3335, "ema20": 3335, "ema50": 3335, "adx": 10, "atr": 2.0}],
+        }
+    )
+
+    resp = client.post(
+        f"/api/v2/ai_result/{ACCOUNT_ID}/XAUUSD",
+        json={
+            "bias": "bullish",
+            "confidence": 82,
+            "trade_plan": {
+                "schema_version": "trade_plan.v1",
+                "decision_id": "d-telemetry-1",
+                "account_id": ACCOUNT_ID,
+                "symbol": "XAUUSD",
+                "mode": "approve",
+                "side": "buy",
+                "confidence": 82,
+                "execution_type": "market",
+                "requested_order_type": "market",
+                "expires_at": "2099-04-13T10:00:00.000Z",
+                "reason_codes": ["mode.approve", "side.buy"],
+                "narrative": "too far from market",
+                "add_on": False,
+                "entry_zone": {"min": 3320.0, "max": 3320.0},
+                "stop_loss": 3310.0,
+                "take_profit": [3360.0],
+                "max_lots": 0.1,
+            },
+        },
+        headers=headers(),
+    )
+    assert resp.status_code == 200
+    events = await store.list_decision_events({"account_id": ACCOUNT_ID, "symbol": "XAUUSD"})
+    rej = next(
+        e for e in events if e.get("summary", {}).get("pending_gate_reason") == "market_entry_mismatch"
+    )
+    assert rej["summary"]["h1_atr"] == 2.0
+    assert rej["summary"]["signal_entry"] == 3320.0
+    assert rej["summary"]["execution_price"] == 3335.7
+    assert rej["summary"]["slippage"] > 15.0
+    metric_val = client.app.state.metrics.risk_gate_rejections.labels(
+        ACCOUNT_ID, "pending_gate.market_entry_mismatch"
+    )._value.get()
+    assert metric_val >= 1.0
+
+
+async def test_ai_result_zero_confidence_failure_preserves_prior_snapshot() -> None:
+    client, store = await make_app_with_store()
+    await store.save_ai_result(
+        ACCOUNT_ID,
+        "XAUUSD",
+        {"bias": "bearish", "confidence": 75, "suggested_sl": 3660.0, "suggested_tp": 3620.0},
+    )
+    resp = client.post(
+        f"/api/v2/ai_result/{ACCOUNT_ID}/XAUUSD",
+        json={
+            "bias": "neutral",
+            "confidence": 0,
+            "suggested_sl": 0,
+            "suggested_tp": 0,
+            "arbitration": {"contradiction": "analysis_unavailable"},
+        },
+        headers=headers(),
+    )
+    assert resp.status_code == 200
+    results = await store.get_ai_results(ACCOUNT_ID)
+    xau = next(r for r in results if r["symbol"] == "XAUUSD")
+    assert xau["suggested_sl"] == 3660.0
+    assert xau["confidence"] == 75
+
+
+def test_hold_seconds_from_open_time_handles_broker_utc2_offset() -> None:
+    from datetime import UTC, datetime
+
+    from backend.api.routes.ai.index import hold_seconds_from_open_time
+
+    # Simulate broker UTC+2 server: UTC now = 10:00:00Z, server_time = 12:00:00, opened 200s ago
+    utc_now = "2026-11-24T10:00:00Z"
+    open_time_broker_utc2 = int(datetime(2026, 11, 24, 12, 0, 0, tzinfo=UTC).timestamp()) - 200
+    secs = hold_seconds_from_open_time(
+        open_time_broker_utc2,
+        utc_now,
+        heartbeat={"server_time": "2026.11.24 12:00:00"},
+    )
+    assert secs == 200
+    # Without heartbeat when open_time is ahead of UTC now, must clamp to >= 0 instead of returning negative
+    assert hold_seconds_from_open_time(open_time_broker_utc2, utc_now) == 0

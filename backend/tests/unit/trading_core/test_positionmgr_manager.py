@@ -1559,3 +1559,117 @@ class TestPendingVsMarketSeparation:
         )
 
         assert result["advisories"] == [{"action": "CANCEL_PENDING", "ticket": 88, "reason": "pending_tp_reached_3350"}]
+
+    def test_does_not_treat_split_order_a_b_legs_as_addon_reanchor(self) -> None:
+        # 1) Split legs _A / _B entering together must NOT trigger adverse reanchor or favorable add-on BE
+        split_adverse = evaluate_position_manager_commands(
+            {
+                "now": "2026-04-13T08:00:00.000Z",
+                "currentPrice": 3654.2,
+                "currentAtr": 5.0,
+                "avgAtr": 5.0,
+                "equity": 10000,
+                "h1Bars": PENDING_H1_BARS,
+                "positions": [
+                    {
+                        "ticket": 5001,
+                        "type": "SELL",
+                        "lots": 0.18,
+                        "open_price": 3653.52,
+                        "sl": 3667.8,
+                        "tp": 3635.0,
+                        "profit": -12.0,
+                        "comment": "ai_9981_A",
+                    },
+                    {
+                        "ticket": 5002,
+                        "type": "SELL",
+                        "lots": 0.12,
+                        "open_price": 3654.20,
+                        "sl": 3667.8,
+                        "tp": 3630.0,
+                        "profit": 0.0,
+                        "comment": "ai_9981_B",
+                    },
+                ],
+                "states": [
+                    {"ticket": 5001, "openTime": "2026-04-13T07:59:00.000Z", "bestSl": 3667.8},
+                ],
+            }
+        )
+        assert [a for a in split_adverse["advisories"] if "group_" in str(a.get("reason", ""))] == []
+
+        split_favorable = evaluate_position_manager_commands(
+            {
+                "now": "2026-04-13T08:00:00.000Z",
+                "currentPrice": 3651.0,
+                "currentAtr": 5.0,
+                "avgAtr": 5.0,
+                "equity": 10000,
+                "h1Bars": PENDING_H1_BARS,
+                "positions": [
+                    {
+                        "ticket": 5001,
+                        "type": "SELL",
+                        "lots": 0.18,
+                        "open_price": 3653.52,
+                        "sl": 3667.8,
+                        "tp": 3635.0,
+                        "profit": 45.0,
+                        "comment": "ai_9981_A",
+                    },
+                    {
+                        "ticket": 5002,
+                        "type": "SELL",
+                        "lots": 0.12,
+                        "open_price": 3651.0,
+                        "sl": 3667.8,
+                        "tp": 3630.0,
+                        "profit": 0.0,
+                        "comment": "ai_9981_B",
+                    },
+                ],
+                "states": [
+                    {"ticket": 5001, "openTime": "2026-04-13T07:59:00.000Z", "bestSl": 3667.8},
+                ],
+            }
+        )
+        assert [a for a in split_favorable["advisories"] if "group_" in str(a.get("reason", ""))] == []
+
+        # 2) Separate signal add-on (different base comment) still triggers group_adverse_reanchor
+        genuine_addon = evaluate_position_manager_commands(
+            {
+                "now": "2026-04-13T08:00:00.000Z",
+                "currentPrice": 3654.0,
+                "currentAtr": 5.0,
+                "avgAtr": 5.0,
+                "equity": 10000,
+                "h1Bars": PENDING_H1_BARS,
+                "positions": [
+                    {
+                        "ticket": 5001,
+                        "type": "SELL",
+                        "lots": 0.18,
+                        "open_price": 3653.52,
+                        "sl": 3667.8,
+                        "tp": 3635.0,
+                        "profit": -26.0,
+                        "comment": "ai_9981_A",
+                    },
+                    {
+                        "ticket": 5003,
+                        "type": "SELL",
+                        "lots": 0.12,
+                        "open_price": 3656.0,
+                        "sl": 3667.8,
+                        "tp": 3635.0,
+                        "profit": -12.0,
+                        "comment": "ai_9999_A",
+                    },
+                ],
+                "states": [
+                    {"ticket": 5001, "openTime": "2026-04-13T07:59:00.000Z", "bestSl": 3667.8},
+                ],
+            }
+        )
+        assert any(a.get("reason") == "group_adverse_reanchor_SELL" for a in genuine_addon["advisories"])

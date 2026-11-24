@@ -32,6 +32,7 @@ class StubWorkflow:
                 "role": initial_state.get("analysisRole"),
                 "previousLedger": initial_state.get("previousLedger"),
                 "skipFeishu": initial_state.get("skipFeishu"),
+                "skipPublish": initial_state.get("skipPublish"),
                 "patrolContext": initial_state.get("patrolContext"),
             }
         )
@@ -106,6 +107,7 @@ async def test_cold_patrol_stays_silent_and_m15_consumes_htf_anchor() -> None:
     assert res1["m15_ran"] is False
     assert wf.calls[-1]["role"] == "htf_anchor"
     assert wf.calls[-1]["skipFeishu"] is True
+    assert wf.calls[-1]["skipPublish"] is True
     assert len(feishu.messages) == 1
 
     # 2) 15 分钟后价格仍在 4052 (未到观察区、未超波动阈值、HTF未过期) -> 零 LLM 静默
@@ -134,6 +136,7 @@ async def test_cold_patrol_stays_silent_and_m15_consumes_htf_anchor() -> None:
     res3 = await patrol.run_patrol("acc-1", "XAUUSD", trigger_type="m15_close", snapshot=trig_snap)
     assert res3["m15_ran"] is True
     assert wf.calls[-1]["role"] == "m15_entry"
+    assert wf.calls[-1]["skipPublish"] is None
     assert wf.calls[-1]["previousLedger"]["htf_anchor"]["intraday_direction"] == "long"
     assert res3["alert_level"] == "actionable"
     assert await store.list_commands("acc-1") == []  # advisory_only 绝不自动下发 EA 挂单
@@ -698,3 +701,321 @@ async def test_daily_and_weekly_close_reviews_trigger_dedupe_and_skip_inactive()
     assert dup_res["daily_review"]["reason"] == "already_reviewed"
     assert dup_res["weekly_review"]["reason"] == "already_reviewed"
     assert len(feishu.messages) == 3
+
+
+async def test_htf_anchor_never_publishes_live_signal_and_observe_m15_is_not_actionable() -> None:
+    from backend.agents.graph.workflow import WorkflowService
+    from backend.agents.graph.workflow_nodes import WorkflowNodes
+
+    store = InMemoryEaStore()
+    feishu = FakeFeishu()
+    clock = [datetime(2026, 11, 24, 1, 0, tzinfo=UTC)]
+
+    class FakeGoldbotApi:
+        async def fetch_analysis_payload(self, account_id: str, symbol: str) -> dict[str, Any]:
+            return {
+                "account": {"account_id": account_id, "balance": 10000, "equity": 10000},
+                "market": {"symbol": symbol, "bid": 4050.0, "ask": 4050.4, "spread": 0.4},
+                "market_status": {"market_open": True, "is_trade_allowed": True, "tradeable": True},
+                "market_filters": {"blocked": False, "blocking": [], "warnings": []},
+                "bars": {},
+                "indicators": {},
+                "positions": [],
+                "strategy_mapping": {},
+            }
+
+        async def fetch_pending_signal(self, _account_id: str, _symbol: str) -> None:
+            return None
+
+    class FakeAnalyst:
+        def __init__(self) -> None:
+            self.options_log: list[dict[str, Any] | None] = []
+
+        async def run(
+            self,
+            _payload: dict[str, Any],
+            _symbol: str,
+            _pending: Any,
+            _prices: dict[str, float],
+            options: dict[str, Any] | None = None,
+        ) -> dict[str, Any]:
+            self.options_log.append(options)
+            role = (options or {}).get("analysisRole")
+            return {
+                "technical": {
+                    "bias": "bullish",
+                    "confidence": 84,
+                    "phase": "trending",
+                    "indicators_summary": "H1/H4 aligned",
+                    "support_levels": [{"price": 4020.0}],
+                    "resistance_levels": [{"price": 4080.0}, {"price": 4100.0}],
+                    "recommendation": "none",
+                    "rationale": "1H/4H bullish",
+                },
+                "wave": None,
+                "chanlun": None,
+                "risk": {
+                    "riskLevel": "low",
+                    "maxPositionSize": 0.1,
+                    "suggestedSL": 4020.0,
+                    "suggestedTP": 4080.0,
+                    "warnings": [],
+                    "addOn": False,
+                },
+                "arbitration": {
+                    "final_direction": "buy",
+                    "action": "open",
+                    "confidence": 84,
+                    "phase": "markup",
+                    "primary_contradiction": "none",
+                    "united_front_analysis": "bullish",
+                    "reasoning": f"{role} bullish setup",
+                    "trade_recommendation": {
+                        "direction": "buy",
+                        "entry_price": 4050.0,
+                        "stop_loss": 4020.0,
+                        "take_profit_1": 4080.0,
+                        "take_profit_2": 4100.0,
+                    },
+                },
+                "sop_context": {
+                    "analysis_role": role,
+                    "macro_bias": "bullish",
+                    "intraday_direction": "long",
+                    "short_term_targets": [4080.0, 4100.0],
+                    "long_term_targets": [],
+                    "veto_boundary": {"long_invalid_below": 4020.0, "reason": "H4 结构低点"},
+                },
+            }
+
+    class SpyPublisher:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, str, Any, bool | None]] = []
+
+        async def publish(
+            self, account_id: str, symbol: str, result: Any, skip_feishu: bool | None = False
+        ) -> None:
+            self.calls.append((account_id, symbol, result, skip_feishu))
+
+    analyst = FakeAnalyst()
+    publisher = SpyPublisher()
+    workflow = WorkflowService(
+        WorkflowNodes(
+            goldbot_api=FakeGoldbotApi(),
+            comprehensive_analyst=analyst,  # type: ignore[arg-type]
+            publisher=publisher,
+        )
+    )
+    patrol = PatrolService(
+        store=store,
+        workflow_service=workflow,
+        alert_router=AlertRouter(feishu=feishu, now_fn=lambda: clock[0]),
+        now_fn=lambda: clock[0],
+    )
+    snap = {
+        "price": 4050.0,
+        "bars_by_tf": {"M15": [{"close": 4050.0}], "H1": [{"close": 4050.0}]},
+        "market_open": True,
+        "data_stale": False,
+    }
+
+    # 1) htf_anchor 即使仲裁出 open/buy，也不调用 publisher.publish，且能完整更新 WatchLedger 并发送飞书卡片
+    res_htf = await patrol.run_patrol("81124211", "XAUUSD", trigger_type="patrol", snapshot=snap)
+    assert res_htf["htf_ran"] is True
+    assert publisher.calls == []
+    assert analyst.options_log[-1] is not None
+    assert analyst.options_log[-1]["skipTradeAction"] is True
+    assert len(feishu.messages) == 1
+    ledger = await store.get_watch_ledger("81124211", "XAUUSD")
+    assert ledger is not None
+    assert ledger["htf_anchor"]["intraday_direction"] == "long"
+    assert ledger["htf_anchor"]["short_term_targets"] == [4080.0, 4100.0]
+    assert ledger["htf_anchor"]["veto_boundary"]["long_invalid_below"] == 4020.0
+
+    # 2) m15_entry 仍正常发布可执行 trade_plan
+    clock[0] += timedelta(minutes=15)
+    res_m15 = await patrol.run_patrol("81124211", "XAUUSD", trigger_type="manual_m15", snapshot=snap)
+    assert res_m15["m15_ran"] is True
+    assert res_m15["action_taken"] == "m15_entry_signal"
+    assert len(publisher.calls) == 1
+    assert publisher.calls[0][2].trade_plan is not None
+    assert publisher.calls[0][2].trade_plan.mode == "approve"
+
+    # 3) m15_entry 若返回 mode="observe" (即使 trade_recommendation 带方向)，不得误判为入场触发
+    observe_patrol = PatrolService(
+        store=store,
+        workflow_service=StubWorkflow(
+            lambda _a, _s, _st: asyncio.sleep(
+                0,
+                result={
+                    "ai_result": {
+                        "bias": "bearish",
+                        "confidence": 66,
+                        "arbitration": {"action": "hold", "direction": "hold"},
+                        "trade_recommendation": {"direction": "sell"},
+                        "trade_plan": {
+                            "mode": "observe",
+                            "side": "sell",
+                            "entry_zone": {"min": 0.0, "max": 0.0},
+                            "stop_loss": 0.0,
+                            "take_profit": [],
+                        },
+                    }
+                },
+            )
+        ),
+        alert_router=AlertRouter(feishu=feishu, now_fn=lambda: clock[0]),
+        now_fn=lambda: clock[0],
+    )
+    clock[0] += timedelta(minutes=15)
+    res_obs = await observe_patrol.run_patrol("81124211", "XAUUSD", trigger_type="manual_m15", snapshot=snap)
+    assert res_obs["action_taken"] == "m15_wait"
+    assert res_obs["alert_level"] == "notify"
+
+
+async def test_zero_confidence_fallback_preserves_htf_anchor_and_skips_actionable_m15() -> None:
+    store = InMemoryEaStore()
+    feishu = FakeFeishu()
+    clock = [datetime(2026, 11, 24, 2, 0, tzinfo=UTC)]
+
+    responses: list[dict[str, Any]] = [
+        # 1) Initial valid HTF anchor (short)
+        {
+            "ai_result": {
+                "bias": "bearish",
+                "confidence": 78,
+                "suggested_sl": 3665.0,
+                "suggested_tp": 3610.0,
+                "sop_context": {
+                    "macro_bias": "bearish",
+                    "intraday_direction": "short",
+                    "short_term_targets": [3610.0],
+                    "veto_boundary": {"short_invalid_above": 3665.0, "reason": "H1 swing high"},
+                    "playbooks": [
+                        {
+                            "id": "pb-short-1",
+                            "direction": "short",
+                            "entry_price": 3645.0,
+                            "stop_loss": 3665.0,
+                            "targets": [3610.0],
+                            "state": "armed",
+                        }
+                    ],
+                },
+            }
+        },
+        # 2) Simulated Pi runtime timeout fallback (confidence=0, analysis_unavailable) on manual_htf
+        {
+            "ai_result": {
+                "bias": "neutral",
+                "confidence": 0,
+                "suggested_sl": 0,
+                "suggested_tp": 0,
+                "arbitration": {"contradiction": "analysis_unavailable", "action": "hold"},
+            }
+        },
+        # 3) Simulated zero-confidence failure on manual_m15
+        {
+            "ai_result": {
+                "bias": "neutral",
+                "confidence": 0,
+                "suggested_sl": 0,
+                "suggested_tp": 0,
+                "trade_action": "BUY",
+                "arbitration": {"contradiction": "analysis_unavailable", "action": "hold"},
+            }
+        },
+    ]
+
+    async def wf_handler(_acc: str, _sym: str, _st: dict[str, Any]) -> dict[str, Any]:
+        return responses.pop(0)
+
+    patrol = PatrolService(
+        store=store,
+        workflow_service=StubWorkflow(wf_handler),
+        alert_router=AlertRouter(feishu=feishu, now_fn=lambda: clock[0]),
+        now_fn=lambda: clock[0],
+    )
+    snap = {
+        "price": 3640.0,
+        "bars_by_tf": {"M15": [{"close": 3640.0}], "H1": [{"close": 3640.0}]},
+        "market_open": True,
+        "data_stale": False,
+    }
+
+    await patrol.run_patrol("81124211", "GOLDM#", trigger_type="patrol", snapshot=snap)
+    ledger_before = await store.get_watch_ledger("81124211", "GOLDM#")
+    assert ledger_before is not None
+    assert ledger_before["htf_anchor"]["intraday_direction"] == "short"
+
+    clock[0] += timedelta(minutes=15)
+    htf_fail = await patrol.run_patrol("81124211", "GOLDM#", trigger_type="manual_htf", snapshot=snap)
+    assert htf_fail["action_taken"] == "htf_review_failed"
+    ledger_after_htf_fail = await store.get_watch_ledger("81124211", "GOLDM#")
+    assert ledger_after_htf_fail is not None
+    assert ledger_after_htf_fail["htf_anchor"]["intraday_direction"] == "short"
+    assert ledger_after_htf_fail["htf_anchor"]["short_term_targets"] == [3610.0]
+
+    clock[0] += timedelta(minutes=15)
+    m15_fail = await patrol.run_patrol("81124211", "GOLDM#", trigger_type="manual_m15", snapshot=snap)
+    assert m15_fail["action_taken"] == "m15_review_failed"
+    assert m15_fail["alert_level"] != "actionable"
+
+
+async def test_m15_entry_zero_price_plan_is_not_actionable() -> None:
+    store = InMemoryEaStore()
+    feishu = FakeFeishu()
+    clock = [datetime(2026, 11, 24, 3, 0, tzinfo=UTC)]
+
+    responses = [
+        {
+            "ai_result": {
+                "bias": "bearish",
+                "confidence": 75,
+                "suggested_sl": 3660.0,
+                "suggested_tp": 3610.0,
+                "sop_context": {
+                    "macro_bias": "bearish",
+                    "intraday_direction": "short",
+                    "short_term_targets": [3610.0],
+                    "veto_boundary": {"short_invalid_above": 3660.0, "reason": "H1 high"},
+                },
+            }
+        },
+        {
+            "ai_result": {
+                "bias": "bearish",
+                "confidence": 65,
+                "trade_action": "SELL",
+                "arbitration": {"action": "open", "direction": "sell"},
+                "trade_plan": {
+                    "mode": "approve",
+                    "side": "sell",
+                    "entry_price": 0.0,
+                    "stop_loss": 0.0,
+                    "take_profit": [],
+                },
+            }
+        },
+    ]
+
+    async def wf_handler(_acc: str, _sym: str, _st: dict[str, Any]) -> dict[str, Any]:
+        return responses.pop(0)
+
+    patrol = PatrolService(
+        store=store,
+        workflow_service=StubWorkflow(wf_handler),
+        alert_router=AlertRouter(feishu=feishu, now_fn=lambda: clock[0]),
+        now_fn=lambda: clock[0],
+    )
+    snap = {
+        "price": 3640.0,
+        "bars_by_tf": {"M15": [{"close": 3640.0}], "H1": [{"close": 3640.0}]},
+        "market_open": True,
+        "data_stale": False,
+    }
+    await patrol.run_patrol("81124211", "GOLDM#", trigger_type="patrol", snapshot=snap)
+    clock[0] += timedelta(minutes=15)
+    res_m15 = await patrol.run_patrol("81124211", "GOLDM#", trigger_type="manual_m15", snapshot=snap)
+    assert res_m15["action_taken"] == "m15_wait"
+    assert res_m15["alert_level"] == "notify"

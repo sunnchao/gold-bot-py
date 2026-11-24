@@ -377,12 +377,15 @@ class TradePlanSchema(_StrictModel):
     add_on_level: Annotated[Number, AfterValidator(_integer), AfterValidator(_between(1, 3))] | None = None
     max_add_count: Annotated[Number, AfterValidator(_integer), AfterValidator(_between(1, 3))] | None = None
     max_total_lots: Annotated[Finite, AfterValidator(_min(0))] | None = None
+    analysis_started_at: Annotated[str, AfterValidator(_datetime_string)] | None = None
+    analysis_start_price: Annotated[Finite, AfterValidator(_min(0))] | None = None
+    inference_latency_ms: Annotated[Number, AfterValidator(_integer), AfterValidator(_min(0))] | None = None
 
     @model_validator(mode="after")
     def _super_refine(self) -> TradePlanSchema:
-        """镜像 superRefine:observe/veto 模式放行,其余模式强制 buy/sell、正
+        """镜像 superRefine:observe/veto/close/reduce 模式放行,开仓模式强制 buy/sell、正
         entry_zone、正 stop_loss、正 take_profit、正 max_lots。"""
-        if self.mode in ("observe", "veto"):
+        if self.mode in ("observe", "veto", "close", "reduce"):
             return self
 
         if self.side == "none":

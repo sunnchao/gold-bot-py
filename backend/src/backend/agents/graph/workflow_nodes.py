@@ -25,6 +25,28 @@ def _monotonic_ms() -> int:
     return int(time.monotonic() * 1000)
 
 
+def _attach_timing_meta(
+    entry_result: dict[str, Any],
+    analyst: Any,
+    symbol: str,
+    started_wall: str,
+    started_mono: int,
+    start_price: float,
+) -> dict[str, Any]:
+    analyst_meta = getattr(analyst, "last_run_meta", None) if analyst is not None else None
+    meta = analyst_meta.get(symbol) if isinstance(analyst_meta, dict) else None
+    entry_result["_meta"] = (
+        dict(meta)
+        if isinstance(meta, dict)
+        else {
+            "analysis_started_at": started_wall,
+            "analysis_start_price": float(start_price),
+            "inference_latency_ms": max(0, _monotonic_ms() - started_mono),
+        }
+    )
+    return entry_result
+
+
 def _now_iso() -> str:
     from datetime import UTC, datetime
 
@@ -422,7 +444,7 @@ class WorkflowNodes:
             analysis_role = state.get("analysisRole")
             if analysis_role is not None:
                 sop_options["analysisRole"] = analysis_role
-                if analysis_role in ("daily_close_review", "weekly_close_review"):
+                if analysis_role in ("htf_anchor", "daily_close_review", "weekly_close_review"):
                     sop_options["skipTradeAction"] = True
             if state.get("previousLedger") is not None:
                 sop_options["previousLedger"] = state.get("previousLedger")
@@ -442,6 +464,8 @@ class WorkflowNodes:
                 payload = payloads.get(symbol)
                 if payload is None:
                     continue
+                started_wall = _now_iso()
+                started_mono = _monotonic_ms()
                 if sop_options:
                     result = await self.comprehensive_analyst.run(
                         payload,
@@ -457,7 +481,15 @@ class WorkflowNodes:
                         (state.get("pendingSignals") or {}).get(symbol),
                         all_current_prices,
                     )
-                entries.append((symbol, {"result": as_dict_shallow(result)}))
+                entry_result = _attach_timing_meta(
+                    as_dict_shallow(result),
+                    self.comprehensive_analyst,
+                    symbol,
+                    started_wall,
+                    started_mono,
+                    float(all_current_prices.get(symbol, 0.0)),
+                )
+                entries.append((symbol, {"result": entry_result}))
 
             return self._analysis_result_payload(state, entries, market_first=False)
         except Exception as err:  # noqa: BLE001
@@ -504,6 +536,8 @@ class WorkflowNodes:
                     source_account=bar_view.sourceAccount,
                 )
 
+            started_wall = _now_iso()
+            started_mono = _monotonic_ms()
             if bar_view.useShared:
                 cached = await cache.get_or_build(bar_view.canonicalSymbol, build_insight)
             else:
@@ -517,7 +551,14 @@ class WorkflowNodes:
                 self.config.price_deviation_tolerance_atr or 0.25,
             )
             action = actions.get(symbol)
-            result = as_dict_shallow(cached.insight)
+            result = _attach_timing_meta(
+                as_dict_shallow(cached.insight),
+                None,
+                symbol,
+                started_wall,
+                started_mono,
+                float(cached.benchmark_price or 0.0),
+            )
             result["tradeAction"] = action
             entries.append((symbol, {"result": result, "insight": cached.insight, "action": action}))
 

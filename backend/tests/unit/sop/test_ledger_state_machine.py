@@ -8,6 +8,7 @@ from backend.services.sop.ledger import (
     empty_watch_ledger,
     evaluate_ledger_patrol,
     format_ledger_prompt_block,
+    is_failed_review_result,
     is_material_change,
     reconcile_ledger_after_review,
 )
@@ -381,3 +382,192 @@ def test_htf_hold_with_bearish_bias_preserves_short_direction_compact_veto_and_a
     )
     assert "key_level_breakdown" not in repeat_patrol["trigger_reasons"]
     assert repeat_patrol["should_trigger_htf"] is False
+
+
+def test_intraday_direction_and_prompt_do_not_depend_on_d1() -> None:
+    from backend.agents.agents.comprehensive_analyst import _build_sop_context, _format_sop_realtime_section
+
+    neutral_result = {"technical": {"bias": "neutral"}, "risk": {}, "arbitration": {"final_direction": "hold"}}
+    for d1_dir, consensus_dir in (("BULL", "BULL"), ("BEAR", "BEAR")):
+        neutral_intraday_payload = {
+            "market": {"bid": 3620.0, "ask": 3620.5},
+            "trend_context": {
+                "d1_direction": d1_dir,
+                "h4_direction": "NEUTRAL",
+                "h1_direction": "NEUTRAL",
+                "m30_direction": d1_dir,
+                "consensus_direction": consensus_dir,
+                "consensus_strength": 0.4,
+            },
+        }
+        sop_ctx = _build_sop_context(
+            result=neutral_result,
+            payload=neutral_intraday_payload,
+            options={"analysisRole": "htf_anchor"},
+        )
+        assert sop_ctx["intraday_direction"] == "wait"
+        assert sop_ctx["macro_bias"] == "neutral"
+
+    split_payload = {
+        "market": {"bid": 3620.0, "ask": 3620.5},
+        "trend_context": {
+            "d1_direction": "BEAR",
+            "h4_direction": "BULL",
+            "h1_direction": "BEAR",
+            "m30_direction": "BEAR",
+            "consensus_direction": "BEAR",
+            "consensus_strength": 0.5,
+        },
+    }
+    split_ctx = _build_sop_context(
+        result=neutral_result,
+        payload=split_payload,
+        options={"analysisRole": "htf_anchor"},
+    )
+    assert split_ctx["intraday_direction"] == "wait"
+    assert split_ctx["macro_bias"] == "neutral"
+
+    d1_only_prompt = _format_sop_realtime_section(
+        {
+            "confluence_levels": [
+                {"price": 3800.0, "role": "resistance", "tier": "core", "sources": ["D1_PDH_PDL"]},
+            ]
+        },
+        {"analysisRole": "htf_anchor"},
+    )
+    assert "3800.0" not in d1_only_prompt
+    assert "Confluence Key Levels" not in d1_only_prompt
+
+    mixed_prompt = _format_sop_realtime_section(
+        {
+            "confluence_levels": [
+                {"price": 3645.0, "role": "resistance", "tier": "core", "sources": ["D1_PDH_PDL", "H4_SWING"]},
+            ]
+        },
+        {"analysisRole": "htf_anchor"},
+    )
+    assert "3645.0" in mixed_prompt
+    assert "H4_SWING" in mixed_prompt
+    assert "D1_PDH_PDL" not in mixed_prompt
+
+    daily_prompt = _format_sop_realtime_section(
+        {
+            "confluence_levels": [
+                {"price": 3800.0, "role": "resistance", "tier": "core", "sources": ["D1_PDH_PDL"]},
+            ]
+        },
+        {
+            "analysisRole": "daily_close_review",
+            "patrolContext": {"daily_recap": {"status": "ok", "trade_date": "2026-11-23", "close": 3635.6}},
+        },
+    )
+    assert "3800.0" in daily_prompt
+    assert "D1_PDH_PDL" in daily_prompt
+
+
+def test_reconcile_htf_anchor_extracts_reference_levels_when_trade_plan_is_none() -> None:
+    t0 = datetime(2026, 11, 24, 1, 0, tzinfo=UTC)
+    reconciled = reconcile_ledger_after_review(
+        None,
+        account_id="acc-1",
+        symbol="GOLDM#",
+        role="htf_anchor",
+        review_result={
+            "bias": "bearish",
+            "confidence": 76,
+            "suggested_sl": 3655.0,
+            "suggested_tp": 0.0,
+            "trade_plan": None,
+            "trade_recommendation": {
+                "direction": "sell",
+                "entry_price": 3625.0,
+                "stop_loss": 3655.0,
+                "take_profit_1": 3590.0,
+                "take_profit_2": 3570.0,
+            },
+            "sop_context": {
+                "macro_bias": "bearish",
+                "intraday_direction": "short",
+                "short_term_targets": [3590.0, 3570.0],
+            },
+        },
+        current_price=3620.0,
+        now=t0,
+    )
+    anchor = reconciled["htf_anchor"]
+    assert anchor["intraday_direction"] == "short"
+    assert anchor["short_term_targets"] == [3590.0, 3570.0]
+    assert anchor["veto_boundary"]["short_invalid_above"] == 3655.0
+    pb = reconciled["playbooks"][0]
+    assert pb["entry_price"] == 3625.0
+    assert pb["stop_loss"] == 3655.0
+    assert pb["targets"] == [3590.0, 3570.0]
+    assert 0.0 not in pb["targets"]
+
+
+def test_short_playbook_filters_above_market_targets_and_prevents_exhausted_loop() -> None:
+    t0 = datetime(2026, 11, 24, 1, 0, tzinfo=UTC)
+    reconciled = reconcile_ledger_after_review(
+        None,
+        account_id="acc-1",
+        symbol="GOLDM#",
+        role="htf_anchor",
+        review_result={
+            "bias": "bearish",
+            "confidence": 72,
+            "suggested_sl": 3660.0,
+            "suggested_tp": 3620.0,
+            "sop_context": {
+                "macro_bias": "bearish",
+                "intraday_direction": "short",
+                "short_term_targets": [3653.13, 3620.0],
+                "playbooks": [
+                    {
+                        "id": "pb-1",
+                        "direction": "short",
+                        "entry_price": 3640.0,
+                        "stop_loss": 3660.0,
+                        "targets": [3653.13, 3620.0],
+                    }
+                ],
+            },
+        },
+        current_price=3634.4,
+        now=t0,
+    )
+    assert reconciled["htf_anchor"]["short_term_targets"] == [3620.0]
+    assert reconciled["playbooks"][0]["targets"] == [3620.0]
+
+    patrol = evaluate_ledger_patrol(reconciled, current_price=3634.4, now=t0 + timedelta(minutes=5))
+    assert patrol["should_trigger_htf"] is False
+    assert "no_active_playbook" not in patrol["trigger_reasons"]
+    assert patrol["updated_ledger"]["playbooks"][0]["state"] == "armed"
+
+
+def test_wait_direction_does_not_spawn_long_fallback_playbook_or_loop() -> None:
+    t0 = datetime(2026, 11, 24, 1, 0, tzinfo=UTC)
+    reconciled = reconcile_ledger_after_review(
+        None,
+        account_id="acc-1",
+        symbol="GOLDM#",
+        role="htf_anchor",
+        review_result={
+            "bias": "neutral",
+            "confidence": 40,
+            "sop_context": {"macro_bias": "range", "intraday_direction": "wait"},
+        },
+        current_price=3634.4,
+        now=t0,
+    )
+    assert reconciled["htf_anchor"]["intraday_direction"] == "wait"
+    assert reconciled["playbooks"] == []
+
+    patrol = evaluate_ledger_patrol(reconciled, current_price=3634.4, now=t0 + timedelta(minutes=5))
+    assert patrol["should_trigger_htf"] is False
+    assert "no_active_playbook" not in patrol["trigger_reasons"]
+
+
+def test_is_failed_review_result_detects_zero_confidence_fallback() -> None:
+    assert is_failed_review_result({"confidence": 0, "suggested_sl": 0, "suggested_tp": 0}) is True
+    assert is_failed_review_result({"arbitration": {"contradiction": "analysis_unavailable"}}) is True
+    assert is_failed_review_result({"bias": "bullish", "arbitration": {"action": "hold"}}) is False

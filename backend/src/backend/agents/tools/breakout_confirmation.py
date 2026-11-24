@@ -80,7 +80,7 @@ def build_breakout_levels(
     recent_bars = m15[-3:] or h1[-2:]
     levels: list[BreakoutLevel] = []
 
-    for timeframe in ("D1", "H4", "H1", "M30", "M15"):
+    for timeframe in ("H4", "H1", "M30", "M15"):
         series = bars.get(timeframe) or []
         closed = series[:-1]
         swings = find_swing_points(
@@ -110,7 +110,7 @@ def build_breakout_levels(
             direction = 1 if level_side == "resistance" else -1
             last_close = _number(latest_closed.get("close"))
             h1_confirmed = (
-                timeframe in ("D1", "H4", "H1") and len(h1) >= 2
+                timeframe in ("H4", "H1") and len(h1) >= 2
                 and _valid_bar(h1[-2]) and _h1_body_breaks(h1[-2], price, direction, h1_atr)
                 and not (m15_closed_after_h1 and last_close > 0 and direction * (last_close - price) <= 0)
             )

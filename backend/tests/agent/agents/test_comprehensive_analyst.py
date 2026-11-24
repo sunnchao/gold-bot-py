@@ -1169,3 +1169,121 @@ async def test_realtime_prompt_quotes_computed_breakout_and_blocks_second_phase(
     assert result["arbitration"]["confidence"] == 20
     assert result["tradeAction"]["type"] == "do_nothing"
     assert not trade_client.stream_calls
+
+
+async def test_intraday_ignores_d1_breakout_levels_in_prompt_and_validation():
+    response = BUY_SETUP_MARKDOWN.replace("- Trade Entry Price: 4145", "- Trade Entry Price: 4174")
+    client = FakeLlmClient(stream_results=[sr(response)])
+    trade_client = FakeLlmClient(
+        stream_results=[
+            sr_tool(
+                "place_market_order",
+                {
+                    "side": "buy",
+                    "lots": 0.05,
+                    "stop_loss": 4125,
+                    "take_profit_1": 4188,
+                    "reason": "顺日内多头突破入场 (Buy intraday breakout)",
+                },
+            )
+        ]
+    )
+    payload = payload_with_last_bar_close(4174)
+    payload["breakout_levels"] = [
+        {"price": 4173, "side": "resistance", "timeframe": "D1", "state": "intrabar_broken"}
+    ]
+
+    assert ca.payload_breakout_levels(payload, 4174) == []
+    result = await make_service(client, trade_client).run(payload, "XAUUSD")
+
+    realtime_prompt = client.stream_calls[0][1][-1].text
+    assert "intrabar_broken" not in realtime_prompt
+    assert result["arbitration"]["action"] == "open"
+    assert result["tradeAction"]["type"] == "place_market_order"
+
+    # When an H1 closed_confirmed level exists, a closer D1 intrabar_broken level cannot shadow it
+    breakout_response = response + "\n- Trade Trigger Basis: closed_breakout\n"
+    client2 = FakeLlmClient(stream_results=[sr(breakout_response)])
+    trade_client2 = FakeLlmClient(
+        stream_results=[
+            sr_tool(
+                "place_market_order",
+                {
+                    "side": "buy",
+                    "lots": 0.05,
+                    "stop_loss": 4125,
+                    "take_profit_1": 4188,
+                    "reason": "H1 收盘确认突破入场 (H1 closed breakout)",
+                },
+            )
+        ]
+    )
+    payload["breakout_levels"] = [
+        {"price": 4173, "side": "resistance", "timeframe": "D1", "state": "intrabar_broken"},
+        {"price": 4170, "side": "resistance", "timeframe": "H1", "state": "closed_confirmed"},
+    ]
+    result2 = await make_service(client2, trade_client2).run(payload, "XAUUSD")
+    realtime_prompt2 = client2.stream_calls[0][1][-1].text
+    assert "intrabar_broken" not in realtime_prompt2
+    assert "closed_confirmed" in realtime_prompt2
+    assert result2["arbitration"]["action"] == "open"
+    assert result2["tradeAction"]["type"] == "place_market_order"
+
+
+async def test_htf_anchor_skips_trade_action_and_builds_sop_context():
+    client = FakeLlmClient(stream_results=[sr(BUY_SETUP_MARKDOWN)])
+    trade_client = FakeLlmClient()
+    payload = payload_with_last_bar_close(4150)
+
+    result = await make_service(client, trade_client).run(
+        payload,
+        "XAUUSD",
+        options={"analysisRole": "htf_anchor"},
+    )
+
+    assert trade_client.stream_calls == []
+    assert "tradeAction" not in result
+    assert "order entry is delegated strictly to M15 entry timing" in client.stream_calls[0][0][1].text
+    sop_ctx = result["sop_context"]
+    assert sop_ctx["intraday_direction"] == "long"
+    assert sop_ctx["short_term_targets"] == [4188.0, 4205.0]
+    assert sop_ctx["veto_boundary"]["long_invalid_below"] == 4125.0
+
+
+async def test_m15_entry_routes_through_trade_client_with_timeout_and_stamps_meta():
+    client = FakeLlmClient(stream_results=[])
+    trade_client = FakeLlmClient(
+        stream_results=[
+            sr(BUY_SETUP_MARKDOWN),
+            sr_tool("do_nothing", {"reasoning": "wait"}),
+        ]
+    )
+    payload = payload_with_last_bar_close(4150)
+
+    service = make_service(client, trade_client)
+    result = await service.run(
+        payload,
+        "XAUUSD",
+        options={
+            "analysisRole": "m15_entry",
+            "previousLedger": {
+                "htf_anchor": {
+                    "intraday_direction": "long",
+                    "macro_bias": "bullish",
+                    "short_term_targets": [4188.0],
+                    "veto_boundary": {"long_invalid_below": 4125.0},
+                },
+                "playbooks": [],
+            },
+        },
+    )
+
+    assert client.stream_calls == []
+    assert len(trade_client.stream_calls) == 2
+    assert trade_client.stream_calls[0][2] == {"timeoutMs": 35000}
+    assert "pullback_limit" in trade_client.stream_calls[0][0][1].text
+    assert "_meta" not in result
+    meta = service.last_run_meta["XAUUSD"]
+    assert isinstance(meta["analysis_started_at"], str) and meta["analysis_started_at"].endswith("Z")
+    assert meta["analysis_start_price"] == 4150
+    assert isinstance(meta["inference_latency_ms"], int) and meta["inference_latency_ms"] >= 0

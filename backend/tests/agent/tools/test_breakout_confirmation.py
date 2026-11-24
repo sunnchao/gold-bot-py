@@ -76,3 +76,20 @@ def test_arbitration_cannot_override_programmatic_break_state(state, entry, basi
         assert result.fixed_arbitration["confidence"] == 20
         assert result.fixed_trade["direction"] == "hold"
         assert result.warnings == [UNCONFIRMED_BREAKOUT]
+
+
+def test_build_breakout_levels_excludes_d1_levels():
+    d1 = [
+        bar(BOUNDARY - timedelta(days=6 - index), 2330, high, 2328, 2331)
+        for index, high in enumerate((2334, 2336, LEVEL, 2335, 2336, 2338))
+    ] + [
+        bar(BOUNDARY, 2338, 2342, 2337, 2339),
+    ]
+    h1 = [
+        bar(BOUNDARY - timedelta(hours=1), 2338, 2339.2, 2337, 2338.8),
+        bar(BOUNDARY, 2338.8, 2339.4, 2338.2, 2339),
+    ]
+
+    levels = build_breakout_levels({"D1": d1, "H1": h1}, 2339)
+    assert all(level["timeframe"] != "D1" for level in levels)
+    assert levels == []

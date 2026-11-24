@@ -38,7 +38,8 @@ __all__ = [
 
 VALID_TRADE_PLAN_MODES = {"observe", "veto", "approve", "modify", "reduce", "close"}
 VALID_TRADE_PLAN_SIDES = {"buy", "sell", "none"}
-AI_RISK_EXIT_SUGGESTIONS = {"close_partial", "close_all", "close_short"}
+AI_RISK_EXIT_SUGGESTIONS = {"close_partial", "close_all", "close_short", "close", "partial_close"}
+_LEGACY_AI_RISK_EXIT_SUGGESTIONS = {"close_partial", "close_all", "close_short"}
 AI_APPROVE_QUEUE_MIN_CONFIDENCE = 50
 ALLOWED_STRATEGY_MAPPING_KEYS = [
     "20250231",
@@ -220,7 +221,7 @@ def configured_max_spread(latest_tick: dict, heartbeat: dict) -> float | None:
 _MT4_SERVER_TZ = timezone(timedelta(hours=8))
 
 
-def _parse_wall_clock(value: str) -> float | None:
+def _parse_wall_clock(value: str, tz: timezone = _MT4_SERVER_TZ) -> float | None:
     """MT4 服务器墙钟(server_time / time-only tick 的 'YYYY.MM.DD HH:MM:SS')解析为绝对 ms。
 
     镜像 V8 Date.parse 对 '2026.07.07 02:52:52' 宽松格式的接受;Python 侧把墙钟解释为
@@ -235,7 +236,7 @@ def _parse_wall_clock(value: str) -> float | None:
     minute = int(match.group(5)) if match.group(5) is not None else 0
     second = int(match.group(6)) if match.group(6) is not None else 0
     try:
-        return datetime(year, month, day, hour, minute, second, tzinfo=_MT4_SERVER_TZ).timestamp() * 1000
+        return datetime(year, month, day, hour, minute, second, tzinfo=tz).timestamp() * 1000
     except ValueError:
         return None
 
@@ -753,22 +754,34 @@ def pnl_percent(profit: float, entry_price: float, lots: float) -> float:
     return _round4((profit / (entry_price * lots)) * 100)
 
 
-def hold_seconds_from_open_time(open_time: float, timestamp: str) -> int:
+def hold_seconds_from_open_time(
+    open_time: float, timestamp: str, heartbeat: dict | None = None
+) -> int:
     if open_time <= 0:
         return 0
     now_millis = _parse_date_millis(timestamp)
     if now_millis is None:
         return 0
-    return _math_floor(now_millis / 1000) - _math_floor(open_time)
+    raw = _math_floor(now_millis / 1000) - _math_floor(open_time)
+    if raw >= 0:
+        return raw
+    if heartbeat is not None:
+        server_time = _string_field(heartbeat, "server_time")
+        broker_ms = _parse_wall_clock(server_time, tz=UTC) if server_time else None
+        if broker_ms is not None:
+            return max(0, _math_floor(broker_ms / 1000) - _math_floor(open_time))
+    return 0
 
 
-def normalize_analysis_position(position: dict, latest_tick: dict, timestamp: str) -> dict:
+def normalize_analysis_position(
+    position: dict, latest_tick: dict, timestamp: str, heartbeat: dict | None = None
+) -> dict:
     type_text = _string_field(position, "type")
     current_price = number_field(latest_tick, "ask")
     entry_price = number_field(position, "entry_price") or number_field(position, "open_price")
     profit = number_field(position, "profit")
     lots = number_field(position, "lots")
-    hold_seconds = hold_seconds_from_open_time(number_field(position, "open_time"), timestamp)
+    hold_seconds = hold_seconds_from_open_time(number_field(position, "open_time"), timestamp, heartbeat)
     order_class = resolve_order_class_field(position)
     return {
         "comment": _string_field(position, "comment"),
@@ -878,7 +891,7 @@ async def analysis_payload(store: EaStore, account_id: str, symbol: str, timesta
         "bars": payload_bars,
         "harmonic_context": harmonic_context,
         "smc_context": smc_context,
-        "breakout_levels": build_breakout_levels(trend_bars, ref_price, smc_context),
+        "breakout_levels": build_breakout_levels(enriched, ref_price, smc_context),
         "candlestick_patterns": candlestick_patterns,
         "indicators": indicator_packs(enriched),
         "market": {
@@ -907,7 +920,9 @@ async def analysis_payload(store: EaStore, account_id: str, symbol: str, timesta
             "tick_age_ms": market_status["tickAgeMs"],
             "heartbeat_age_ms": market_status["heartbeatAgeMs"],
         },
-        "positions": [normalize_analysis_position(position, latest_tick, timestamp) for position in positions],
+        "positions": [
+            normalize_analysis_position(position, latest_tick, timestamp, heartbeat) for position in positions
+        ],
         "status": "OK",
         "strategy_mapping": strategy_mapping,
         "timestamp": shanghai_timestamp(timestamp),
@@ -1022,7 +1037,7 @@ def validate_trade_plan(trade_plan: dict, expected_account_id: str, expected_sym
         if decoded is not None:
             return decoded
 
-    if mode in ("observe", "veto"):
+    if mode in ("observe", "veto", "close", "reduce"):
         return None
 
     if side == "none":
@@ -1306,9 +1321,26 @@ async def record_ai_decision_timeline(
 
 
 async def record_ai_approve_pending_gate_event(
-    store: EaStore, account_id: str, symbol: str, trade_plan: dict, reason: str, created_at: str
+    store: EaStore,
+    account_id: str,
+    symbol: str,
+    trade_plan: dict,
+    reason: str,
+    created_at: str,
+    telemetry: dict[str, Any] | None = None,
 ) -> None:
     decision_id = _string_field(trade_plan, "decision_id")
+    summary: dict[str, Any] = {
+        "decision_id": decision_id,
+        "mode": _string_field(trade_plan, "mode"),
+        "symbol": _string_field(trade_plan, "symbol") or symbol,
+        "status": "rejected",
+        "pending_gate_reason": reason,
+    }
+    if telemetry:
+        for key, value in telemetry.items():
+            if value is not None:
+                summary[key] = value
     await store.record_decision_event(
         {
             "decision_id": decision_id,
@@ -1317,13 +1349,7 @@ async def record_ai_approve_pending_gate_event(
             "stage": "risk_gate",
             "status": "rejected",
             "reason_codes": [f"pending_gate.{reason}"],
-            "summary": {
-                "decision_id": decision_id,
-                "mode": _string_field(trade_plan, "mode"),
-                "symbol": _string_field(trade_plan, "symbol") or symbol,
-                "status": "rejected",
-                "pending_gate_reason": reason,
-            },
+            "summary": summary,
             "related_command_id": "",
             "created_at": created_at,
         }
@@ -1333,7 +1359,14 @@ async def record_ai_approve_pending_gate_event(
 def should_queue_ai_risk_command(payload: dict) -> bool:
     if payload.get("risk_alert") is not True:
         return False
-    return _string_field(payload, "exit_suggestion").lower() in AI_RISK_EXIT_SUGGESTIONS
+    exit_suggestion = _string_field(payload, "exit_suggestion").lower()
+    if exit_suggestion in _LEGACY_AI_RISK_EXIT_SUGGESTIONS:
+        return True
+    trade_plan = payload.get("trade_plan")
+    plan_mode = _string_field(trade_plan, "mode").lower() if isinstance(trade_plan, dict) else ""
+    if exit_suggestion in ("close", "partial_close") or plan_mode in ("close", "reduce"):
+        return number_field(payload, "confidence") >= AI_APPROVE_QUEUE_MIN_CONFIDENCE
+    return False
 
 
 def ai_risk_gate_allows_command(trade_plan: dict | None, risk_gate: dict | None) -> bool:
@@ -1413,6 +1446,81 @@ async def build_close_short_risk_commands(
     return candidates
 
 
+AI_RISK_CLOSE_COOLDOWN_SECONDS = 240
+
+
+def _ticket_has_recent_or_active_close(
+    existing_commands: list[StoredCommand], ticket: float, now_ms: float | None
+) -> bool:
+    for cmd in existing_commands:
+        if _string_field(cmd, "action") != "CLOSE" or _string_field(cmd, "source") != "ai_risk_alert":
+            continue
+        if number_field(cmd, "ticket") != ticket:
+            continue
+        if _string_field(cmd, "status") in ("pending", "queued", "dispatched"):
+            return True
+        if now_ms is not None:
+            created_ms = _parse_date_millis(_string_field(cmd, "created_at"))
+            if created_ms is not None and 0 <= now_ms - created_ms < AI_RISK_CLOSE_COOLDOWN_SECONDS * 1000:
+                return True
+    return False
+
+
+async def build_symbol_market_close_commands(
+    store: EaStore,
+    account_id: str,
+    symbol: str,
+    timestamp: str,
+    alert_reason: str,
+    confidence: Any,
+    trade_plan: dict | None,
+    risk_gate: dict | None,
+    *,
+    partial: bool = False,
+    now_iso: str = "",
+) -> list[dict]:
+    """Build per-ticket symbol-scoped CLOSE commands for live market positions."""
+    positions = await store.get_positions(account_id, symbol)
+    existing_commands = await store.list_commands(account_id)
+    now_ms = _parse_date_millis(now_iso) if now_iso else None
+    candidates: list[dict] = []
+    target_symbol = symbol.strip().upper()
+    action_label = "减仓" if partial else "平仓"
+    for position in positions:
+        ticket = number_field(position, "ticket")
+        if ticket <= 0:
+            continue
+        position_symbol = _string_field(position, "symbol")
+        if len(position_symbol) > 0 and position_symbol.strip().upper() != target_symbol:
+            continue
+        if resolve_order_class_field(position) != "market":
+            continue
+        if _ticket_has_recent_or_active_close(existing_commands, ticket, now_ms):
+            continue
+        lots = number_field(position, "lots")
+        close_lots: float | None = None
+        if partial and lots >= 0.02:
+            half = _round2(lots * 0.5)
+            if 0 < half < lots:
+                close_lots = half
+        candidate: dict = {
+            "command_id": f"ai_close_{timestamp}_{_js_number_string(ticket)}",
+            "action": "CLOSE",
+            "source": "ai_risk_alert",
+            "ticket": ticket,
+            "symbol": position_symbol or symbol,
+            "reason": f"AI风险警报({action_label}): {alert_reason}",
+            "confidence": confidence,
+        }
+        if close_lots is not None:
+            candidate["lots"] = close_lots
+        elif lots > 0:
+            candidate["lots"] = lots
+        _attach_ai_risk_trade_plan_metadata(candidate, trade_plan, risk_gate)
+        candidates.append(candidate)
+    return candidates
+
+
 async def build_ai_risk_command_candidates(
     store: EaStore,
     account_id: str,
@@ -1423,6 +1531,7 @@ async def build_ai_risk_command_candidates(
     risk_gate: dict | None,
 ) -> list[dict]:
     exit_suggestion = _string_field(payload, "exit_suggestion").lower()
+    plan_mode = _string_field(trade_plan, "mode").lower() if isinstance(trade_plan, dict) else ""
     timestamp = ai_risk_command_timestamp(now_iso)
     timestamp_nanos = ai_risk_command_timestamp_nanos(now_iso)
     confidence = payload.get("confidence")
@@ -1430,6 +1539,24 @@ async def build_ai_risk_command_candidates(
     if exit_suggestion == "close_short":
         return await build_close_short_risk_commands(
             store, account_id, symbol, timestamp_nanos, alert_reason, confidence, trade_plan, risk_gate
+        )
+    if exit_suggestion in ("close", "partial_close") or (
+        exit_suggestion not in ("close_all", "close_partial") and plan_mode in ("close", "reduce")
+    ):
+        partial = exit_suggestion == "partial_close" or (
+            exit_suggestion != "close" and plan_mode == "reduce"
+        )
+        return await build_symbol_market_close_commands(
+            store,
+            account_id,
+            symbol,
+            timestamp_nanos,
+            alert_reason,
+            confidence,
+            trade_plan,
+            risk_gate,
+            partial=partial,
+            now_iso=now_iso,
         )
     action = "CLOSE_ALL" if exit_suggestion == "close_all" else "CLOSE_PARTIAL"
     candidate: dict = {
@@ -1691,6 +1818,27 @@ def dual_trade_plans(dual_trade_plan: dict) -> list[dict]:
     return [plan for plan in [dual_trade_plan.get("buy"), dual_trade_plan.get("sell")] if plan is not None]
 
 
+def _notify_indicator_unavailable(
+    state: dict, account_id: str, symbol: str, telemetry: dict[str, Any]
+) -> None:
+    feishu = state.get("feishu")
+    if feishu is None:
+        return
+    summary = (
+        f"[GOLD-BOT] 指标风控 Fail-Closed 降级告警: account={account_id} symbol={symbol} "
+        f"h1_atr={telemetry.get('h1_atr')} hasIndicatorContext=False，已拒绝开仓"
+    )
+    import asyncio
+
+    async def send() -> None:
+        await feishu.send({"title": "GOLD-BOT 风控降级告警", "content": summary})
+
+    try:
+        asyncio.get_running_loop().create_task(send())
+    except RuntimeError:
+        pass
+
+
 async def queue_ai_approve_pending_commands(
     deps: dict, account_id: str, symbol: str, trade_plans: list[dict], risk_gate: dict, event_timestamp: str,
     *, dual_direction: bool = False,
@@ -1719,6 +1867,7 @@ async def queue_ai_approve_pending_commands(
                 store, account_id, symbol, trade_plan, queue_skip_reason, event_timestamp
             )
             continue
+        telemetry: dict[str, Any] = {}
         pending_gate = await evaluate_ai_approve_pending_gate(
             {
                 "store": store,
@@ -1729,12 +1878,19 @@ async def queue_ai_approve_pending_commands(
                 "cooldown": deps["ai_approve_cooldown"],
                 "positionStates": position_states,
                 "enforceSopLedger": deps.get("sop_execution_mode") == "integrated",
+                "telemetryOut": telemetry,
             }
         )
         if not pending_gate.get("accepted", False):
+            reason = str(pending_gate.get("reason", ""))
             await record_ai_approve_pending_gate_event(
-                store, account_id, symbol, trade_plan, pending_gate.get("reason", ""), event_timestamp
+                store, account_id, symbol, trade_plan, reason, event_timestamp, telemetry=telemetry
             )
+            metrics = deps.get("metrics")
+            if metrics is not None:
+                metrics.risk_gate_rejections.labels(account_id, f"pending_gate.{reason}").inc()
+            if reason == "indicator.context_unavailable":
+                _notify_indicator_unavailable(deps, account_id, symbol, telemetry)
             continue
         # 命令投递给 EA 必须用账户真实注册品种名(tradableSymbol,gate 已按大小写折叠从
         # registration.ai_symbols 解析),而非外层分析名(可能大小写不一致,如 GOLDM# vs GOLDm#)。
@@ -1751,6 +1907,8 @@ async def queue_ai_approve_pending_commands(
                 "positions": positions,
             }
         )
+        if telemetry:
+            candidate["execution_telemetry"] = telemetry
         command = await deps["command_lifecycle"].accept_candidate(account_id, candidate)
         if first_command is None:
             first_command = command
@@ -1765,7 +1923,26 @@ async def handle_ai_result_route(_method: str, account_id: str, symbol: str, raw
         return {"statusCode": 400, "body": {"status": "ERROR", "message": "invalid JSON"}}
 
     store: EaStore = deps["store"]
-    await store.save_ai_result(account_id, symbol, parsed_body)
+    incoming_is_zero_fail = (
+        is_ai_analysis_failure(parsed_body) and number_field(parsed_body, "confidence") <= 0
+    )
+    skip_save = False
+    if incoming_is_zero_fail:
+        target_symbol = symbol.strip().upper()
+        prior = next(
+            (
+                res
+                for res in await store.get_ai_results(account_id)
+                if _string_field(res, "symbol").strip().upper() == target_symbol
+            ),
+            None,
+        )
+        if prior is not None and (
+            number_field(prior, "suggested_sl") > 0 or number_field(prior, "confidence") > 0
+        ):
+            skip_save = True
+    if not skip_save:
+        await store.save_ai_result(account_id, symbol, parsed_body)
     event_timestamp = deps["now_iso"]()
     trade_plan_payload = parse_trade_plan_payload(parsed_body, account_id, symbol)
     trade_plan = trade_plan_payload.get("tradePlan")

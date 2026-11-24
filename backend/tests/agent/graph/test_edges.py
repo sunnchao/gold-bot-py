@@ -120,3 +120,18 @@ class TestRouteAfterArbitration:
             }
         )
         assert route_after_arbitration(state) == "skip_publish"
+
+    def test_skips_publish_for_non_entry_roles_and_publishes_for_m15_entry(self) -> None:
+        signal = AISignalResult(
+            bias="bullish",
+            confidence=80,
+            exit_suggestion="hold",
+            risk_alert=False,
+            arbitration={"direction": "buy", "action": "open", "reasoning": "strong"},
+        )
+        for role in ("htf_anchor", "daily_close_review", "weekly_close_review"):
+            assert (
+                route_after_arbitration(create_state({"analysisRole": role, "finalSignal": signal}))
+                == "skip_publish"
+            )
+        assert route_after_arbitration(create_state({"analysisRole": "m15_entry", "finalSignal": signal})) == "publish"

@@ -285,13 +285,19 @@ class LLMClient:
         stream: bool,
     ) -> CompletionRequest:
         params = self._model_parameters(model)
+        timeout_ms = self._config.timeout
+        raw_override_timeout = opts.get("timeoutMs")
+        if isinstance(raw_override_timeout, (int, float)) and not isinstance(raw_override_timeout, bool):
+            override_val = int(raw_override_timeout)
+            if override_val > 0:
+                timeout_ms = min(timeout_ms, override_val)
         request: CompletionRequest = {
             "model": model,
             "messages": messages,
             "stream": stream,
             "temperature": params["temperature"],
             "maxTokens": params["max_tokens"],
-            "timeoutMs": self._config.timeout,
+            "timeoutMs": timeout_ms,
             "maxRetries": self._config.maxRetries,
             "parameters": params.get("extra_body", {}),
         }
@@ -399,7 +405,7 @@ class LLMClient:
             )
             return await self._run_with_fallback(
                 "invokeLayered",
-                lambda model: self._invoke_once(model, messages, {}),
+                lambda model: self._invoke_once(model, messages, opts),
             )
 
         messages = self._build_layered_messages(

@@ -55,6 +55,7 @@ services:
       GOLDBOT_API_URL: http://gold-bot-backend:8000
       PI_RUNTIME_URL: http://pi-runtime:3000
       LLM_MODEL: ${LLM_MODEL:-kimi-k3.1-pro}
+      LLM_TRADE_TIMEOUT: ${LLM_TRADE_TIMEOUT:-35000}
     ports:
       - "127.0.0.1:8881:8000"
     volumes:

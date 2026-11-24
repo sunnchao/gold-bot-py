@@ -475,11 +475,12 @@ def evaluate_ledger_patrol(
             state_transitions.append(tr)
             _append_event(working, "playbook_transition", tr, ts_iso)
 
-    # 无孤儿剧本保底: 若当前所有剧本均失效或穷尽, 强制触发 HTF 重建
+    # 无孤儿剧本保底: 若已有明确日内方向但当前所有剧本均失效或穷尽, 强制触发 HTF 重建
     has_active_playbook = any(
         str(pb.get("state") or "").lower() in ACTIVE_PLAYBOOK_STATES for pb in working["playbooks"]
     )
-    if not has_active_playbook and has_anchor:
+    anchor_dir = str(anchor.get("intraday_direction") or "wait").lower()
+    if not has_active_playbook and has_anchor and anchor_dir in ("long", "short"):
         should_trigger_htf = True
         add_reason("no_active_playbook")
 
@@ -502,14 +503,23 @@ def _extract_targets(review_result: dict[str, Any], tp_key: str, default_val: fl
     raw_plan = review_result.get("trade_plan")
     plan: dict[str, Any] = raw_plan if isinstance(raw_plan, dict) else {}
     raw_targets = plan.get(tp_key)
+    if raw_targets is None and tp_key == "take_profits":
+        raw_targets = plan.get("take_profit")
     if isinstance(raw_targets, list):
         for item in raw_targets:
             num = _to_float(item)
-            if num is not None:
+            if num is not None and num > 0:
                 out.append(num)
-    elif (single := _to_float(raw_targets)) is not None:
+    elif (single := _to_float(raw_targets)) is not None and single > 0:
         out.append(single)
-    if not out and default_val is not None:
+    if not out:
+        raw_rec = review_result.get("trade_recommendation")
+        rec: dict[str, Any] = raw_rec if isinstance(raw_rec, dict) else {}
+        for rec_key in ("take_profit_1", "take_profit_2"):
+            num = _to_float(rec.get(rec_key))
+            if num is not None and num > 0:
+                out.append(num)
+    if not out and default_val is not None and isfinite(default_val) and default_val > 0:
         out.append(default_val)
     return out
 
@@ -545,6 +555,44 @@ def _is_protective_level(price: float, direction: str, current_price: float | No
     return True
 
 
+def _filter_directional_targets(
+    targets: list[Any], direction: str, current_price: float | None
+) -> list[float]:
+    """Filter target prices to positive values strictly in the directional profit side."""
+    cleaned: list[float] = []
+    for raw in targets:
+        val = _to_float(raw)
+        if val is None or val <= 0:
+            continue
+        if current_price is not None and current_price > 0:
+            if direction == "long" and val <= current_price:
+                continue
+            if direction == "short" and val >= current_price:
+                continue
+        cleaned.append(val)
+    return cleaned
+
+
+def is_failed_review_result(review_result: dict[str, Any] | None) -> bool:
+    """Detect zero-confidence fallback/timeout review results that must not clobber anchors."""
+    if not isinstance(review_result, dict) or not review_result:
+        return False
+    raw_arb = review_result.get("arbitration")
+    arb: dict[str, Any] = raw_arb if isinstance(raw_arb, dict) else {}
+    contradiction = str(arb.get("contradiction") or arb.get("primary_contradiction") or "").strip().lower()
+    if contradiction == "analysis_unavailable":
+        return True
+    raw_conf = review_result.get("confidence")
+    if raw_conf is None:
+        raw_conf = arb.get("confidence")
+    conf = _to_float(raw_conf)
+    if conf is None or conf > 0:
+        return False
+    sl = _to_float(review_result.get("suggested_sl")) or 0.0
+    tp = _to_float(review_result.get("suggested_tp")) or 0.0
+    return sl <= 0 and tp <= 0
+
+
 def reconcile_ledger_after_review(
     existing_ledger: dict[str, Any] | None,
     *,
@@ -566,9 +614,27 @@ def reconcile_ledger_after_review(
     bias = str(review_result.get("bias") or "neutral").lower()
     raw_plan = review_result.get("trade_plan")
     plan: dict[str, Any] = raw_plan if isinstance(raw_plan, dict) else {}
+    raw_rec = review_result.get("trade_recommendation")
+    rec: dict[str, Any] = raw_rec if isinstance(raw_rec, dict) else {}
 
     entry_price = _to_float(plan.get("entry_price"))
-    stop_loss = _to_float(plan.get("stop_loss")) or _to_float(review_result.get("suggested_sl"))
+    if entry_price is None or entry_price <= 0:
+        raw_ez = plan.get("entry_zone")
+        if isinstance(raw_ez, dict):
+            ez_min = _to_float(raw_ez.get("min"))
+            if ez_min is not None and ez_min > 0:
+                entry_price = ez_min
+    if entry_price is None or entry_price <= 0:
+        rec_entry = _to_float(rec.get("entry_price"))
+        entry_price = rec_entry if rec_entry is not None and rec_entry > 0 else None
+
+    stop_loss: float | None = None
+    for sl_cand in (plan.get("stop_loss"), rec.get("stop_loss"), review_result.get("suggested_sl")):
+        sl_num = _to_float(sl_cand)
+        if sl_num is not None and sl_num > 0:
+            stop_loss = sl_num
+            break
+
     suggested_tp = _to_float(review_result.get("suggested_tp"))
     tp_list = _extract_targets(review_result, "take_profits", suggested_tp)
 
@@ -626,9 +692,12 @@ def reconcile_ledger_after_review(
             or _direction_from_bias(macro_bias)
             or "wait"
         )
-        short_targets = [
-            float(x) for x in (sop_ctx.get("short_term_targets") or tp_list) if _to_float(x) is not None
-        ]
+        raw_short_targets = sop_ctx.get("short_term_targets") or tp_list
+        short_targets = (
+            _filter_directional_targets(raw_short_targets, intraday_dir, current_price)
+            if intraday_dir in ("long", "short")
+            else [float(x) for x in raw_short_targets if (_to_float(x) or 0) > 0]
+        )
         if not short_targets and intraday_dir in ("long", "short"):
             tgt_pool: list[float] = []
             for lv in working["key_levels"]:
@@ -740,7 +809,14 @@ def reconcile_ledger_after_review(
                 pb_copy = deepcopy(pb)
                 pb_copy.setdefault("id", f"pb-{idx + 1}")
                 pb_copy.setdefault("role", "primary" if idx == 0 else "backup")
-                pb_copy.setdefault("direction", intraday_dir if intraday_dir in ("long", "short") else "long")
+                if intraday_dir in ("long", "short"):
+                    pb_copy.setdefault("direction", intraday_dir)
+                pb_dir = str(pb_copy.get("direction") or "").lower()
+                if pb_dir in ("long", "short") and isinstance(pb_copy.get("targets"), list):
+                    pb_copy["targets"] = (
+                        _filter_directional_targets(pb_copy["targets"], pb_dir, current_price)
+                        or list(short_targets)
+                    )
                 pb_copy["state"] = "rearmed" if had_inactive and idx == 0 else str(pb_copy.get("state") or "armed")
                 pb_copy["updated_at"] = ts_iso
                 rebuilt.append(pb_copy)
@@ -769,10 +845,13 @@ def reconcile_ledger_after_review(
                             "level": entry_price,
                             "op": ">=" if pb.get("direction") == "long" else "<=",
                         }
-                    if stop_loss is not None:
+                    pb_dir = str(pb.get("direction") or "").lower()
+                    if stop_loss is not None and _is_protective_level(stop_loss, pb_dir, current_price):
                         pb["stop_loss"] = stop_loss
                     if tp_list:
-                        pb["targets"] = tp_list
+                        filtered_tp = _filter_directional_targets(tp_list, pb_dir, current_price)
+                        if filtered_tp:
+                            pb["targets"] = filtered_tp
                     pb["updated_at"] = ts_iso
                     break
         _append_event(
@@ -782,15 +861,14 @@ def reconcile_ledger_after_review(
             ts_iso,
         )
 
-    # 无孤儿剧本保底: 若所有剧本均已失效/穷尽或列表为空, 创建兜底观测剧本
+    # 无孤儿剧本保底: 若存在明确方向但所有剧本均已失效/穷尽或列表为空, 创建兜底观测剧本
     active_pbs = [pb for pb in working["playbooks"] if str(pb.get("state") or "").lower() in ACTIVE_PLAYBOOK_STATES]
-    if not active_pbs:
-        fallback_dir = (
-            _direction_from_bias(working["htf_anchor"].get("intraday_direction"))
-            or _direction_from_bias(bias)
-            or _direction_from_bias(working["htf_anchor"].get("macro_bias"))
-            or "long"
-        )
+    fallback_dir = (
+        _direction_from_bias(working["htf_anchor"].get("intraday_direction"))
+        or _direction_from_bias(bias)
+        or _direction_from_bias(working["htf_anchor"].get("macro_bias"))
+    )
+    if not active_pbs and fallback_dir in ("long", "short"):
         raw_vb = working["htf_anchor"].get("veto_boundary")
         veto_b: dict[str, Any] = raw_vb if isinstance(raw_vb, dict) else {}
         veto_sl = (
@@ -802,7 +880,8 @@ def reconcile_ledger_after_review(
         if safe_sl is None and stop_loss is not None and _is_protective_level(stop_loss, fallback_dir, current_price):
             safe_sl = stop_loss
         anchor_px = entry_price or current_price
-        fallback_targets = tp_list or list(working["htf_anchor"].get("short_term_targets") or [])
+        raw_fb_targets = tp_list or list(working["htf_anchor"].get("short_term_targets") or [])
+        fallback_targets = _filter_directional_targets(raw_fb_targets, fallback_dir, current_price)
         had_prior = bool(working["playbooks"])
         fallback_pb: dict[str, Any] = {
             "id": f"pb-rearmed-{len(working['playbooks']) + 1}" if had_prior else "pb-primary-1",
@@ -942,6 +1021,7 @@ __all__ = [
     "empty_watch_ledger",
     "evaluate_ledger_patrol",
     "format_ledger_prompt_block",
+    "is_failed_review_result",
     "is_material_change",
     "normalize_watch_ledger",
     "reconcile_ledger_after_review",

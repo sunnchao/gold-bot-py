@@ -537,3 +537,53 @@ def test_keeps_single_target_plans_executable_when_the_only_target_qualifies() -
     assert result.get("tp2") == 0
     assert result.get("legacyTakeProfit") == 3329.875
     assert result.get("tpSplit") is False
+
+
+def test_rejects_staged_targets_when_near_tp1_is_below_tp1_floor() -> None:
+    result = resolve_ai_approve_executable_take_profits(
+        {
+            "side": "buy",
+            "entry": 3335.7,
+            "stopLoss": 3330,
+            "takeProfitValues": [3339.0, 3345.0],
+        }
+    )
+    assert result == {"accepted": False, "reason": "rr.below_minimum", "label": "TP1"}
+
+
+def test_rejects_triggered_limit_to_market_when_chase_distance_or_sl_erosion_excessive() -> None:
+    # Drifted > 2.0 * h1_atr beyond BUY_LIMIT entry -> limit.chase_rejected
+    too_far_chase = resolve_ai_approve_order_intent(
+        trade_plan(
+            {
+                "side": "buy",
+                "execution_type": "limit",
+                "requested_order_type": "BUY_LIMIT",
+                "entry_zone": {"min": 3338.0, "max": 3338.0},
+                "stop_loss": 3328.0,
+                "take_profit": [3360.0],
+            }
+        ),
+        3333.5,
+        3338.0,
+        2.0,  # |3333.5 - 3338.0| = 4.5 > 2.0 * 2.0
+    )
+    assert too_far_chase == {"accepted": False, "reason": "limit.chase_rejected"}
+
+    # Left < 25% of original SL distance on SELL_LIMIT -> limit.chase_rejected
+    eroded_sl = resolve_ai_approve_order_intent(
+        trade_plan(
+            {
+                "side": "sell",
+                "execution_type": "limit",
+                "requested_order_type": "SELL_LIMIT",
+                "entry_zone": {"min": 60.00, "max": 60.00},
+                "stop_loss": 61.00,  # orig_sl_dist = 1.00
+                "take_profit": [58.00],
+            }
+        ),
+        60.80,  # rem_sl_dist = 0.20 < 0.25 * 1.00
+        60.00,
+        2.0,
+    )
+    assert eroded_sl == {"accepted": False, "reason": "limit.chase_rejected"}

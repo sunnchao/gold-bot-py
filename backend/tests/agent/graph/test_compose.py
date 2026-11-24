@@ -257,3 +257,132 @@ def test_final_market_plan_cannot_bypass_an_intrabar_breakout() -> None:
     assert signal.arbitration["action"] == "hold"
     assert signal.confidence == 20
     assert signal.trade_plan is None
+
+
+def test_compose_ignores_d1_intrabar_breakout_levels() -> None:
+    state = _base_state()
+    state["payload"] = {
+        **asdict(state["payload"]),
+        "breakout_levels": [
+            {"price": 3335, "side": "resistance", "timeframe": "D1", "state": "intrabar_broken"},
+        ],
+    }
+    signal = compose_final_signal(state)
+
+    assert signal is not None
+    assert signal.arbitration["action"] == "open"
+    assert signal.trade_plan is not None
+    assert signal.trade_plan.mode == "approve"
+
+
+def test_compose_suppresses_trade_plan_for_htf_anchor_but_keeps_m15_entry() -> None:
+    htf_state = _base_state()
+    htf_state["analysisRole"] = "htf_anchor"
+    htf_signal = compose_final_signal(htf_state)
+
+    assert htf_signal is not None
+    assert htf_signal.trade_plan is None
+    assert htf_signal.dual_trade_plan is None
+    assert htf_signal.bias == "bullish"
+    assert htf_signal.confidence == 82
+    assert htf_signal.suggested_sl == 3328
+    assert htf_signal.arbitration is not None
+    assert htf_signal.arbitration["action"] == "open"
+    assert htf_signal.arbitration["direction"] == "buy"
+
+    dual_htf_state = _base_state()
+    dual_htf_state["analysisRole"] = "htf_anchor"
+    dual_htf_state["arbitration"] = ArbitrationResult(
+        final_direction="dual",
+        confidence=75,
+        primary_contradiction="none",
+        phase="consolidation",
+        reasoning="range",
+        action="open",
+        united_front_analysis="range",
+    )
+    dual_htf_signal = compose_final_signal(dual_htf_state)
+    assert dual_htf_signal is not None
+    assert dual_htf_signal.trade_plan is None
+    assert dual_htf_signal.dual_trade_plan is None
+
+    m15_state = _base_state()
+    m15_state["analysisRole"] = "m15_entry"
+    m15_signal = compose_final_signal(m15_state)
+    assert m15_signal is not None
+    assert m15_signal.trade_plan is not None
+    assert m15_signal.trade_plan.mode == "approve"
+
+
+def test_close_and_reduce_plans_keep_mode_and_trigger_auto_risk_alert() -> None:
+    from dataclasses import replace
+
+    from backend.agents.types.goldbot import PositionInfo
+
+    state = _base_state()
+    tech = state["technicalAnalysis"]
+    arb = state["arbitration"]
+    risk = state["riskAssessment"]
+    assert tech is not None and arb is not None and risk is not None
+
+    state["technicalAnalysis"] = replace(tech, recommendation="close")
+    state["arbitration"] = replace(arb, final_direction="hold", action="close", confidence=78)
+    state["riskAssessment"] = replace(risk, riskLevel="medium", suggestedSL=0, maxPositionSize=0, warnings=[])
+    state["payload"] = replace(
+        state["payload"],
+        positions=[
+            PositionInfo(
+                ticket=1001,
+                strategy="ai_signal",
+                direction="BUY",
+                entry_price=3340.0,
+                current_price=3335.5,
+                lots=0.1,
+                profit=-50.0,
+                sl=3320.0,
+                tp=0.0,
+                symbol="XAUUSD",
+            ),
+        ],
+    )
+    signal = compose_final_signal(state)
+    assert signal is not None
+    assert signal.risk_alert is True
+    assert signal.alert_reason == "ai_exit_signal"
+    assert signal.trade_plan is not None
+    assert signal.trade_plan.mode == "close"
+    parsed = TradePlanSchema.model_validate(asdict(signal.trade_plan))
+    assert parsed.mode == "close"
+
+    # reduce (partial_close) similarly preserved
+    state["technicalAnalysis"] = replace(tech, recommendation="partial_close")
+    state["arbitration"] = replace(arb, final_direction="hold", action="hold", confidence=72)
+    reduce_signal = compose_final_signal(state)
+    assert reduce_signal is not None and reduce_signal.trade_plan is not None
+    assert reduce_signal.trade_plan.mode == "reduce"
+    assert reduce_signal.risk_alert is True
+    assert TradePlanSchema.model_validate(asdict(reduce_signal.trade_plan)).mode == "reduce"
+
+    # Without open positions, auto_exit_alert stays False
+    state["payload"] = replace(state["payload"], positions=[])
+    flat_signal = compose_final_signal(state)
+    assert flat_signal is not None
+    assert flat_signal.risk_alert is False
+
+
+def test_compose_propagates_analysis_timing_meta_into_trade_plan() -> None:
+    state = _base_state()
+    state["comprehensiveAnalysis"] = {
+        "_meta": {
+            "analysis_started_at": "2026-06-06T08:59:52.000Z",
+            "analysis_start_price": 3335.4,
+            "inference_latency_ms": 8120,
+        }
+    }
+    signal = compose_final_signal(state)
+    assert signal is not None and signal.trade_plan is not None
+    assert signal.trade_plan.analysis_started_at == "2026-06-06T08:59:52.000Z"
+    assert signal.trade_plan.analysis_start_price == 3335.4
+    assert signal.trade_plan.inference_latency_ms == 8120
+    parsed = TradePlanSchema.model_validate(asdict(signal.trade_plan))
+    assert parsed.inference_latency_ms == 8120

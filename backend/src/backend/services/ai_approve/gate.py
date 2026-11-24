@@ -23,6 +23,9 @@ from backend.services.ai_approve.rules import (
     resolve_ai_approve_order_intent,
     validate_ai_approve_protection_direction,
 )
+from backend.trading_core.indicators import adx as calc_adx
+from backend.trading_core.indicators import atr as calc_atr
+from backend.trading_core.indicators import ema as calc_ema
 
 __all__ = [
     "AI_APPROVE_COOLDOWN_MS",
@@ -34,6 +37,11 @@ __all__ = [
 ]
 
 AI_APPROVE_COOLDOWN_MS = 30 * 60 * 1000
+AI_APPROVE_MAX_MARKET_SIGNAL_AGE_MS = 60 * 1000
+AI_APPROVE_MAX_LIMIT_PROGRESS_RATIO = 0.6
+AI_APPROVE_MAX_ENTRY_DISTANCE_ATR = 2.0
+AI_APPROVE_MIN_SL_ATR = 0.4
+AI_APPROVE_MAX_SL_ATR = 3.5
 
 AIApprovePendingGateInput = dict[str, Any]
 AIApprovePendingGateResult = EaRecord
@@ -90,17 +98,51 @@ async def evaluate_ai_approve_pending_gate(gate_input: AIApprovePendingGateInput
     max_lots = _number_field(trade_plan, "max_lots")
     lots: float = calc_ai_approve_lots(max_lots)
 
+    telemetry_out = gate_input.get("telemetryOut")
+    telemetry: dict[str, Any] | None = telemetry_out if isinstance(telemetry_out, dict) else None
+    if telemetry is not None:
+        telemetry["signal_entry"] = entry
+        telemetry["execution_price"] = execution_price
+        telemetry["slippage"] = round(abs(execution_price - entry), 6)
+        if isinstance(trade_plan.get("inference_latency_ms"), (int, float)):
+            telemetry["inference_latency_ms"] = int(trade_plan["inference_latency_ms"])
+
     h1_bars = await store.get_bars(account_id, tradable_symbol, "H1", limit=300)
     h1_atr = _latest_atr(h1_bars)
+    if telemetry is not None:
+        telemetry["h1_atr"] = round(h1_atr, 6)
     order_intent = resolve_ai_approve_order_intent(trade_plan, execution_price, entry, h1_atr)
     if not order_intent["accepted"]:
         return _reject(str(order_intent["reason"]))
+    if telemetry is not None:
+        telemetry["order_type"] = order_intent["orderType"]
+
+    if order_intent["orderType"] == "market":
+        started_at = _string_field(trade_plan, "analysis_started_at")
+        if started_at:
+            age_ms = _now_millis(now_iso) - _now_millis(started_at)
+            if age_ms > AI_APPROVE_MAX_MARKET_SIGNAL_AGE_MS:
+                return _reject("signal.stale_latency")
+        start_price = _number_field(trade_plan, "analysis_start_price")
+        if start_price > 0:
+            drift = round(abs(execution_price - start_price), 6)
+            if telemetry is not None:
+                telemetry["analysis_drift"] = drift
+            if h1_atr > 0 and drift > h1_atr * 0.3:
+                return _reject("signal.price_drifted")
+
     protection = validate_ai_approve_protection_direction(trade_plan, entry)
     if not protection["accepted"]:
         return _reject(str(protection["reason"]))
+    stop_loss_check = _number_field(trade_plan, "stop_loss")
+    plan_side = _string_field(trade_plan, "side").strip().lower()
+    if order_intent["orderType"] == "market" and stop_loss_check > 0 and (
+        (plan_side == "buy" and stop_loss_check >= execution_price)
+        or (plan_side == "sell" and stop_loss_check <= execution_price)
+    ):
+        return _reject("protection.invalid_direction")
 
     bars = {
-        "D1": await store.get_bars(account_id, tradable_symbol, "D1", limit=300),
         "H4": await store.get_bars(account_id, tradable_symbol, "H4", limit=300),
         "H1": h1_bars,
         "M30": await store.get_bars(account_id, tradable_symbol, "M30", limit=300),
@@ -116,7 +158,21 @@ async def evaluate_ai_approve_pending_gate(gate_input: AIApprovePendingGateInput
             return _reject(reason)
 
     trend = _build_ai_approve_trend_context(bars)
+    if len(h1_bars) >= 50 and (h1_atr <= 0 or not bool(trend["hasIndicatorContext"])):
+        return _reject("indicator.context_unavailable")
+
     signal_direction = "BEAR" if _string_field(trade_plan, "side").strip().lower() == "sell" else "BULL"
+    if (
+        bool(trend.get("h4HasContext"))
+        and bool(trend.get("h1HasContext"))
+        and trend.get("h4Direction") in ("BULL", "BEAR")
+        and trend.get("h4Direction") == trend.get("h1Direction")
+        and float(trend.get("h4Adx") or 0.0) >= 25.0
+        and float(trend.get("h1Adx") or 0.0) >= 25.0
+        and signal_direction != trend.get("h4Direction")
+    ):
+        return _reject("trend.h4_h1_strong_inverse")
+
     if bool(trend["hasIndicatorContext"]):
         if (
             trend["consensusDirection"] != "NEUTRAL"
@@ -126,12 +182,15 @@ async def evaluate_ai_approve_pending_gate(gate_input: AIApprovePendingGateInput
             return _reject("trend.inverse_confidence")
         # 弱趋势不再按手数减半/拒绝:仓位由 EA 决定,服务端只做方向性拦截。
 
+    sop_wait_regime = False
     if gate_input.get("enforceSopLedger") is True:
         watch_ledger = await store.get_watch_ledger(account_id, tradable_symbol)
         if isinstance(watch_ledger, dict):
             htf_anchor = watch_ledger.get("htf_anchor")
             if isinstance(htf_anchor, dict):
                 htf_dir = str(htf_anchor.get("intraday_direction") or "wait").lower()
+                if htf_dir == "wait":
+                    sop_wait_regime = True
                 side_up = _string_field(trade_plan, "side").strip().upper()
                 if (htf_dir == "long" and side_up == "SELL") or (htf_dir == "short" and side_up == "BUY"):
                     return _reject("sop.m15_counter_htf_blocked")
@@ -236,23 +295,52 @@ async def evaluate_ai_approve_pending_gate(gate_input: AIApprovePendingGateInput
     if cooldown is not None and cooldown.active(tradable_symbol, now_iso, AI_APPROVE_COOLDOWN_MS) is True:
         return _reject("cooldown.active")
 
-    if h1_atr > 0 and abs(current_price - entry) > h1_atr * 3:
+    if h1_atr > 0 and abs(current_price - entry) > h1_atr * AI_APPROVE_MAX_ENTRY_DISTANCE_ATR:
         return _reject("entry.too_far_from_market")
 
     # R:R 下限过滤:市价单以当前执行价(bid/ask)计算,限价单以指定入场价计算,两者不同。
     stop_loss = _number_field(trade_plan, "stop_loss")
     take_profit_values = _array_number_field(trade_plan, "take_profit")
     rr_entry = execution_price if order_intent["orderType"] == "market" else entry
-    take_profits = resolve_ai_approve_executable_take_profits(
-        {
-            "side": "buy" if signal_direction == "BULL" else "sell",
-            "entry": rr_entry,
-            "stopLoss": stop_loss,
-            "takeProfitValues": take_profit_values,
-        }
-    )
+    if h1_atr > 0 and stop_loss > 0:
+        sl_dist = abs(rr_entry - stop_loss)
+        if sl_dist < h1_atr * AI_APPROVE_MIN_SL_ATR:
+            return _reject("protection.sl_too_tight")
+        if sl_dist > h1_atr * AI_APPROVE_MAX_SL_ATR:
+            return _reject("protection.sl_too_wide")
+
+    rr_input: dict[str, Any] = {
+        "side": "buy" if signal_direction == "BULL" else "sell",
+        "entry": rr_entry,
+        "stopLoss": stop_loss,
+        "takeProfitValues": take_profit_values,
+    }
+    if sop_wait_regime:
+        rr_input["minRiskReward"] = 1.5
+        rr_input["minTp1RiskReward"] = 1.0
+    take_profits = resolve_ai_approve_executable_take_profits(rr_input)
     if not take_profits["accepted"]:
         return _reject(str(take_profits["reason"]))
+
+    targets = take_profits.get("targets") or []
+    if telemetry is not None and targets:
+        telemetry["tp1_rr"] = round(float(targets[0]["rr"]), 4)
+        if len(targets) > 1:
+            telemetry["tp2_rr"] = round(float(targets[1]["rr"]), 4)
+    if order_intent["orderType"] in ("BUY_LIMIT", "SELL_LIMIT") and targets:
+        tp1 = float(targets[0]["value"])
+        if (order_intent["orderType"] == "BUY_LIMIT" and execution_price >= tp1) or (
+            order_intent["orderType"] == "SELL_LIMIT" and execution_price <= tp1
+        ):
+            return _reject("limit.tp_already_reached")
+        if order_intent["orderType"] == "BUY_LIMIT":
+            total_move = tp1 - entry
+            if total_move > 0 and (execution_price - entry) / total_move >= AI_APPROVE_MAX_LIMIT_PROGRESS_RATIO:
+                return _reject("limit.move_mostly_completed")
+        else:
+            total_move = entry - tp1
+            if total_move > 0 and (entry - execution_price) / total_move >= AI_APPROVE_MAX_LIMIT_PROGRESS_RATIO:
+                return _reject("limit.move_mostly_completed")
 
     return {
         "accepted": True,
@@ -344,13 +432,12 @@ def _execution_price_from_tick(tick: EaRecord, side: str) -> float:
 
 
 def _build_ai_approve_trend_context(bars_by_timeframe: dict[str, list[EaRecord]]) -> dict[str, Any]:
-    """镜像 buildAIApproveTrendContext:D1/H4/H1/M30 加权共识(TS 的 M15 只取不参与权重)。"""
-    d1 = _bar_direction(bars_by_timeframe["D1"])
-    h4 = _bar_direction(bars_by_timeframe["H4"])
-    h1 = _bar_direction(bars_by_timeframe["H1"])
-    m30 = _bar_direction(bars_by_timeframe["M30"])
+    """日内 H4/H1/M30 加权共识（不含 D1；M15 仅用于突破确认，不参与趋势权重）。"""
+    h4 = _bar_direction(bars_by_timeframe.get("H4") or [])
+    h1 = _bar_direction(bars_by_timeframe.get("H1") or [])
+    m30 = _bar_direction(bars_by_timeframe.get("M30") or [])
     weights: list[dict[str, Any]] = []
-    for item, weight in ((d1, 0.05), (h4, 0.25), (h1, 0.35), (m30, 0.35)):
+    for item, weight in ((h4, 0.25), (h1, 0.35), (m30, 0.35)):
         weighted = {**item, "weight": weight}
         if bool(weighted["hasIndicatorContext"]):
             weights.append(weighted)
@@ -373,7 +460,33 @@ def _build_ai_approve_trend_context(bars_by_timeframe: dict[str, list[EaRecord]]
         "consensusDirection": consensus_direction,
         "consensusStrength": consensus_strength,
         "hasIndicatorContext": True,
+        "h4Direction": h4["direction"],
+        "h4Adx": float(h4["adx"]),
+        "h4HasContext": bool(h4["hasIndicatorContext"]),
+        "h1Direction": h1["direction"],
+        "h1Adx": float(h1["adx"]),
+        "h1HasContext": bool(h1["hasIndicatorContext"]),
     }
+
+
+def _extract_ohlc_series(bars: list[EaRecord]) -> tuple[list[float], list[float], list[float]]:
+    """Extract positive (high, low, close) series from bar records."""
+    highs: list[float] = []
+    lows: list[float] = []
+    closes: list[float] = []
+    for bar in bars:
+        high = _number_field(bar, "high") or _number_field(bar, "High")
+        low = _number_field(bar, "low") or _number_field(bar, "Low")
+        close = _number_field(bar, "close") or _number_field(bar, "Close")
+        if high > 0 and low > 0 and close > 0:
+            highs.append(high)
+            lows.append(low)
+            closes.append(close)
+    return highs, lows, closes
+
+
+def _is_valid_positive(value: float) -> bool:
+    return isinstance(value, (int, float)) and value == value and value != float("inf") and value > 0
 
 
 def _bar_direction(bars: list[EaRecord]) -> dict[str, Any]:
@@ -384,6 +497,23 @@ def _bar_direction(bars: list[EaRecord]) -> dict[str, Any]:
     ema50 = _number_field(last, "ema50") or _number_field(last, "EMA50")
     close = _number_field(last, "close") or _number_field(last, "Close")
     adx = _number_field(last, "adx") or _number_field(last, "ADX")
+    if not (ema20 > 0 and ema50 > 0 and close > 0 and adx > 0):
+        highs, lows, closes = _extract_ohlc_series(bars)
+        if len(closes) >= 50:
+            if not (ema20 > 0):
+                ema20_series = calc_ema(closes, 20)
+                if ema20_series and _is_valid_positive(ema20_series[-1]):
+                    ema20 = float(ema20_series[-1])
+            if not (ema50 > 0):
+                ema50_series = calc_ema(closes, 50)
+                if ema50_series and _is_valid_positive(ema50_series[-1]):
+                    ema50 = float(ema50_series[-1])
+            if not (adx > 0):
+                adx_series = calc_adx(highs, lows, closes, 14)
+                if adx_series and _is_valid_positive(adx_series[-1]):
+                    adx = float(adx_series[-1])
+            if not (close > 0):
+                close = closes[-1]
     has_indicator_context = ema20 > 0 and ema50 > 0 and close > 0 and adx > 0
     if not has_indicator_context:
         return {"direction": "NEUTRAL", "adx": adx, "hasIndicatorContext": False}
@@ -451,7 +581,17 @@ def _latest_atr(bars: list[EaRecord]) -> float:
     if len(bars) == 0:
         return 0.0
     last = bars[-1]
-    return _number_field(last, "atr") or _number_field(last, "ATR")
+    explicit = _number_field(last, "atr") or _number_field(last, "ATR")
+    if explicit > 0:
+        return explicit
+    highs, lows, closes = _extract_ohlc_series(bars)
+    if len(closes) < 14:
+        return 0.0
+    atr_series = calc_atr(highs, lows, closes, 14)
+    if not atr_series:
+        return 0.0
+    val = float(atr_series[-1])
+    return val if _is_valid_positive(val) else 0.0
 
 
 def _normalize_symbol_for_match(symbol: str) -> str:

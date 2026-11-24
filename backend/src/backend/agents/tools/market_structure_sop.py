@@ -114,8 +114,9 @@ def analyze_daily_vacuum(
     )
     computed_atr = atr_d1 if atr_d1 is not None and atr_d1 > 0 else (_compute_atr(valid_bars) or 0.0)
 
-    # 在排除最近 2 根 K 线的历史窗口中提取结构前高与前低
-    lookback = valid_bars[:-2] if len(valid_bars) > 6 else valid_bars[:-1]
+    # 仅使用近 120 根日线窗口提取结构高低点与均价斜率, 避免远期极端极值拉伸 span 导致向下投射负数目标
+    window_bars = valid_bars[-120:] if len(valid_bars) > 120 else valid_bars
+    lookback = window_bars[:-2] if len(window_bars) > 6 else window_bars[:-1]
     prior_high = max(float(b["high"]) for b in lookback)
     prior_low = min(float(b["low"]) for b in lookback)
     midpoint = (prior_high + prior_low) / 2.0
@@ -125,10 +126,10 @@ def analyze_daily_vacuum(
     significant_low = swing_lows[-1][1] if swing_lows else prior_low
 
     # 近端斜率: 最近 5 日收盘均价 vs 前 10 日收盘均价
-    recent_avg = sum(float(b["close"]) for b in valid_bars[-min(5, len(valid_bars)) :]) / min(
-        5, len(valid_bars)
+    recent_avg = sum(float(b["close"]) for b in window_bars[-min(5, len(window_bars)) :]) / min(
+        5, len(window_bars)
     )
-    prev_slice = valid_bars[-min(15, len(valid_bars)) : -min(5, len(valid_bars))] or valid_bars[:1]
+    prev_slice = window_bars[-min(15, len(window_bars)) : -min(5, len(window_bars))] or window_bars[:1]
     prev_avg = sum(float(b["close"]) for b in prev_slice) / len(prev_slice)
 
     breakout_buffer = max(computed_atr * 0.05, ref_price * 0.0005)
@@ -191,6 +192,8 @@ def analyze_daily_vacuum(
             (2.0, ext_vals[2.0]),
             (2.618, ext_vals[2.618]),
         ]:
+            if not isfinite(raw_target) or raw_target <= 0:
+                continue
             hit = ref_price >= raw_target if is_bullish else ref_price <= raw_target
             measured_targets.append(
                 {

@@ -340,6 +340,7 @@ async def test_returns_accepted_order_type_for_explicit_market_buy_limit_and_sel
     )
     assert_match(result, {"accepted": True, "orderType": "BUY_LIMIT"})
 
+    await seed_strong_trend_state(store, trend="bear")
     result = await evaluate(
         store,
         trade_plan_=trade_plan(
@@ -1048,3 +1049,354 @@ async def test_adverse_addon_rejects_when_account_drawdown_gte_5_percent() -> No
         ),
     )
     assert result == {"accepted": False, "reason": "position.adverse_add_account_drawdown_exceeded"}
+
+
+async def test_d1_bear_trend_does_not_reject_intraday_buy_when_intraday_neutral_or_split() -> None:
+    store = create_in_memory_store()
+    await seed_strong_trend_state(store, trend="neutral")
+    bear_bar: EaRecord = {"close": 3334, "ema20": 3335, "ema50": 3340, "adx": 35, "atr": 2, "rsi": 40}
+    await store.save_bars({"account_id": ACCOUNT_ID, "symbol": SYMBOL, "timeframe": "D1", "bars": [bear_bar]})
+
+    neutral_result = await evaluate(store, trade_plan_=trade_plan({"confidence": 65}))
+    assert_match(neutral_result, {"accepted": True, "orderType": "market"})
+
+    bull_bar: EaRecord = {"close": 3336, "ema20": 3335, "ema50": 3330, "adx": 35, "atr": 2, "rsi": 60}
+    await store.save_bars({"account_id": ACCOUNT_ID, "symbol": SYMBOL, "timeframe": "H1", "bars": [bull_bar]})
+    await store.save_bars({"account_id": ACCOUNT_ID, "symbol": SYMBOL, "timeframe": "M30", "bars": [bear_bar]})
+
+    split_result = await evaluate(store, trade_plan_=trade_plan({"confidence": 65}))
+    assert_match(split_result, {"accepted": True, "orderType": "market"})
+
+
+async def test_d1_swing_level_does_not_reject_market_buy_as_unconfirmed_breakout() -> None:
+    store = create_in_memory_store()
+    await seed_strong_trend_state(store, trend="neutral")
+    d1_bars = [
+        {"open": 3328, "high": 3330, "low": 3326, "close": 3329, "atr": 20},
+        {"open": 3329, "high": 3332, "low": 3327, "close": 3331, "atr": 20},
+        {"open": 3331, "high": 3335.0, "low": 3329, "close": 3332, "atr": 20},
+        {"open": 3332, "high": 3333, "low": 3328, "close": 3330, "atr": 20},
+        {"open": 3330, "high": 3334, "low": 3329, "close": 3333, "atr": 20},
+        {"open": 3333, "high": 3336.5, "low": 3332, "close": 3335.5, "atr": 20},
+    ]
+    await store.save_bars({"account_id": ACCOUNT_ID, "symbol": SYMBOL, "timeframe": "D1", "bars": d1_bars})
+
+    result = await evaluate(store, trade_plan_=trade_plan({"confidence": 80}))
+    assert_match(result, {"accepted": True, "orderType": "market"})
+
+
+def _make_raw_ohlcv_bars(count: int, *, start_price: float, step: float, spread_hl: float = 2.0) -> list[EaRecord]:
+    bars: list[EaRecord] = []
+    for idx in range(count):
+        open_p = start_price + idx * step
+        close_p = open_p + step * 0.8
+        high_p = max(open_p, close_p) + spread_hl
+        low_p = min(open_p, close_p) - spread_hl
+        bars.append(
+            {
+                "time": f"2026-04-{(idx // 24) + 1:02d}T{idx % 24:02d}:00:00Z",
+                "open": open_p,
+                "high": high_p,
+                "low": low_p,
+                "close": close_p,
+                "volume": 1000,
+            }
+        )
+    return bars
+
+
+async def test_raw_ohlcv_bars_trigger_market_entry_mismatch() -> None:
+    store = create_in_memory_store()
+    await seed_strong_trend_state(store, trend="neutral")
+    raw_bars = _make_raw_ohlcv_bars(60, start_price=3330.0, step=0.1, spread_hl=1.0)
+    await store.save_bars({"account_id": ACCOUNT_ID, "symbol": SYMBOL, "timeframe": "H1", "bars": raw_bars})
+
+    result = await evaluate(
+        store,
+        trade_plan_=trade_plan(
+            {
+                "confidence": 80,
+                "entry_zone": {"min": 3320.0, "max": 3320.2},
+                "stop_loss": 3310.0,
+                "take_profit": [3360.0],
+            }
+        ),
+    )
+    assert result == {"accepted": False, "reason": "market_entry_mismatch"}
+
+
+async def test_raw_ohlcv_bars_trigger_inverse_trend_confidence() -> None:
+    store = create_in_memory_store()
+    await seed_strong_trend_state(store, trend="neutral")
+    bear_bars = _make_raw_ohlcv_bars(60, start_price=3420.0, step=-1.4, spread_hl=1.0)
+    await store.save_bars({"account_id": ACCOUNT_ID, "symbol": SYMBOL, "timeframe": "H1", "bars": bear_bars})
+    await store.save_bars({"account_id": ACCOUNT_ID, "symbol": SYMBOL, "timeframe": "M30", "bars": bear_bars})
+
+    result = await evaluate(
+        store,
+        trade_plan_=trade_plan(
+            {
+                "confidence": 66,
+                "entry_zone": {"min": 3335.6, "max": 3335.8},
+                "stop_loss": 3328.0,
+                "take_profit": [3350.0],
+            }
+        ),
+    )
+    assert result == {"accepted": False, "reason": "trend.inverse_confidence"}
+
+
+async def test_market_order_validates_protection_against_live_execution_price() -> None:
+    store = create_in_memory_store()
+    await seed_strong_trend_state(store, trend="neutral")
+    wide_atr_bar: EaRecord = {"close": 3340, "ema20": 3340, "ema50": 3340, "adx": 10, "atr": 20.0, "rsi": 50}
+    await store.save_bars({"account_id": ACCOUNT_ID, "symbol": SYMBOL, "timeframe": "H1", "bars": [wide_atr_bar]})
+    await store.save_tick(
+        {
+            "account_id": ACCOUNT_ID,
+            "symbol": SYMBOL,
+            "bid": 3346.0,
+            "ask": 3346.2,
+            "spread": 0.2,
+            "time": "2026-04-13T07:59:30.000Z",
+        }
+    )
+
+    result = await evaluate(
+        store,
+        trade_plan_=trade_plan(
+            {
+                "side": "sell",
+                "confidence": 80,
+                "entry_zone": {"min": 3340.0, "max": 3340.2},
+                "stop_loss": 3345.0,
+                "take_profit": [3310.0],
+            }
+        ),
+    )
+    assert result == {"accepted": False, "reason": "protection.invalid_direction"}
+
+
+async def test_rejects_limit_order_when_market_has_already_reached_tp1() -> None:
+    store = create_in_memory_store()
+    await seed_strong_trend_state(store, trend="neutral")
+    wide_atr_bar: EaRecord = {"close": 3335, "ema20": 3335, "ema50": 3335, "adx": 10, "atr": 20.0, "rsi": 50}
+    await store.save_bars({"account_id": ACCOUNT_ID, "symbol": SYMBOL, "timeframe": "H1", "bars": [wide_atr_bar]})
+
+    sell_res = await evaluate(
+        store,
+        trade_plan_=trade_plan(
+            {
+                "side": "sell",
+                "confidence": 80,
+                "execution_type": "limit",
+                "requested_order_type": "SELL_LIMIT",
+                "entry_zone": {"min": 3345.0, "max": 3346.0},
+                "stop_loss": 3355.0,
+                "take_profit": [3336.0, 3325.0],
+            }
+        ),
+    )
+    assert sell_res == {"accepted": False, "reason": "limit.tp_already_reached"}
+
+    buy_res = await evaluate(
+        store,
+        trade_plan_=trade_plan(
+            {
+                "side": "buy",
+                "confidence": 80,
+                "execution_type": "limit",
+                "requested_order_type": "BUY_LIMIT",
+                "entry_zone": {"min": 3325.0, "max": 3326.0},
+                "stop_loss": 3315.0,
+                "take_profit": [3335.0, 3350.0],
+            }
+        ),
+    )
+    assert buy_res == {"accepted": False, "reason": "limit.tp_already_reached"}
+
+
+async def test_rejects_limit_order_when_move_is_mostly_completed() -> None:
+    store = create_in_memory_store()
+    await seed_strong_trend_state(store, trend="neutral")
+    wide_atr: EaRecord = {"close": 3335, "ema20": 3335, "ema50": 3335, "adx": 10, "atr": 20.0}
+    await store.save_bars({"account_id": ACCOUNT_ID, "symbol": SYMBOL, "timeframe": "H1", "bars": [wide_atr]})
+
+    # BUY_LIMIT entry=3330, TP1=3339 (distance=9), live ask=3335.7 -> (3335.7-3330)/9 = 63.3% >= 60%
+    buy_res = await evaluate(
+        store,
+        trade_plan_=trade_plan(
+            {
+                "side": "buy",
+                "confidence": 80,
+                "execution_type": "limit",
+                "requested_order_type": "BUY_LIMIT",
+                "entry_zone": {"min": 3330.0, "max": 3330.0},
+                "stop_loss": 3320.0,
+                "take_profit": [3339.0, 3350.0],
+            }
+        ),
+    )
+    assert buy_res == {"accepted": False, "reason": "limit.move_mostly_completed"}
+
+    # SELL_LIMIT entry=3340, TP1=3333 (risk=8 -> rr=0.875 >= 0.75), live bid=3335.5 -> 64.3% >= 60%
+    sell_res = await evaluate(
+        store,
+        trade_plan_=trade_plan(
+            {
+                "side": "sell",
+                "confidence": 80,
+                "execution_type": "limit",
+                "requested_order_type": "SELL_LIMIT",
+                "entry_zone": {"min": 3340.0, "max": 3340.0},
+                "stop_loss": 3348.0,
+                "take_profit": [3333.0, 3320.0],
+            }
+        ),
+    )
+    assert sell_res == {"accepted": False, "reason": "limit.move_mostly_completed"}
+
+
+async def test_rejects_far_entry_at_2x_h1_atr_and_sl_bandwidth_limits() -> None:
+    store = create_in_memory_store()
+    await seed_strong_trend_state(store, trend="neutral")  # h1_atr = 2.0
+
+    # Distance = 5.0 > 2.0 * atr (4.0)
+    far_res = await evaluate(
+        store,
+        trade_plan_=trade_plan(
+            {
+                "execution_type": "limit",
+                "requested_order_type": "BUY_LIMIT",
+                "entry_zone": {"min": 3330.6, "max": 3330.6},
+                "stop_loss": 3327.0,
+                "take_profit": [3340.0],
+            }
+        ),
+    )
+    assert far_res == {"accepted": False, "reason": "entry.too_far_from_market"}
+
+    # Tight SL = 0.5 < 0.4 * atr (0.8)
+    tight_res = await evaluate(
+        store,
+        trade_plan_=trade_plan(
+            {
+                "stop_loss": 3335.2,
+                "take_profit": [3337.0],
+            }
+        ),
+    )
+    assert tight_res == {"accepted": False, "reason": "protection.sl_too_tight"}
+
+    # Wide SL = 8.7 > 3.5 * atr (7.0)
+    wide_res = await evaluate(
+        store,
+        trade_plan_=trade_plan(
+            {
+                "stop_loss": 3327.0,
+                "take_profit": [3350.0],
+            }
+        ),
+    )
+    assert wide_res == {"accepted": False, "reason": "protection.sl_too_wide"}
+
+
+async def test_rejects_stale_or_drifted_market_signal() -> None:
+    store = create_in_memory_store()
+    await seed_strong_trend_state(store, trend="neutral")
+
+    stale_res = await evaluate(
+        store,
+        trade_plan_=trade_plan(
+            {
+                "analysis_started_at": "2026-04-13T07:58:50.000Z",  # 70s before NOW_ISO
+                "analysis_start_price": 3335.6,
+            }
+        ),
+    )
+    assert stale_res == {"accepted": False, "reason": "signal.stale_latency"}
+
+    drifted_res = await evaluate(
+        store,
+        trade_plan_=trade_plan(
+            {
+                "analysis_started_at": "2026-04-13T07:59:45.000Z",  # 15s fresh
+                "analysis_start_price": 3334.9,  # |3335.7 - 3334.9| = 0.8 > 0.3 * 2.0 = 0.6
+            }
+        ),
+    )
+    assert drifted_res == {"accepted": False, "reason": "signal.price_drifted"}
+
+
+async def test_rejects_strong_h4_h1_aligned_inverse_trade_regardless_of_confidence() -> None:
+    store = create_in_memory_store()
+    await seed_strong_trend_state(store, trend="bull")  # H4 & H1 both BULL, adx=35
+
+    result = await evaluate(
+        store,
+        trade_plan_=trade_plan(
+            {
+                "side": "sell",
+                "confidence": 92,
+                "entry_zone": {"min": 3335.4, "max": 3335.6},
+                "stop_loss": 3339.0,
+                "take_profit": [3328.0],
+            }
+        ),
+    )
+    assert result == {"accepted": False, "reason": "trend.h4_h1_strong_inverse"}
+
+
+async def test_sop_wait_regime_requires_higher_rr() -> None:
+    store = create_in_memory_store()
+    await seed_strong_trend_state(store, trend="neutral")
+    await store.save_watch_ledger(
+        ACCOUNT_ID,
+        SYMBOL,
+        {"htf_anchor": {"intraday_direction": "wait", "macro_bias": "range"}},
+    )
+
+    # TP1 R:R = 0.85 < 1.0, TP2 R:R = 1.35 < 1.5 -> rejected under wait regime
+    gate_input = {
+        "store": store,
+        "accountId": ACCOUNT_ID,
+        "symbol": SYMBOL,
+        "tradePlan": trade_plan(
+            {
+                "stop_loss": 3333.7,  # risk vs ask 3335.7 = 2.0
+                "take_profit": [3337.4, 3338.4],  # rewards = 1.7 (0.85R), 2.7 (1.35R)
+            }
+        ),
+        "nowIso": NOW_ISO,
+        "enforceSopLedger": True,
+    }
+    rejected = await evaluate_ai_approve_pending_gate(gate_input)
+    assert rejected == {"accepted": False, "reason": "rr.below_minimum"}
+
+    telemetry: dict[str, Any] = {}
+    accepted = await evaluate_ai_approve_pending_gate(
+        {
+            **gate_input,
+            "tradePlan": trade_plan(
+                {
+                    "stop_loss": 3333.7,
+                    "take_profit": [3337.9, 3339.0],  # 1.1R & 1.65R
+                }
+            ),
+            "telemetryOut": telemetry,
+        }
+    )
+    assert accepted["accepted"] is True
+    assert telemetry["tp1_rr"] == 1.1
+    assert telemetry["tp2_rr"] == 1.65
+    assert telemetry["h1_atr"] == 2.0
+
+
+async def test_fails_closed_when_50_plus_bars_lack_indicator_context() -> None:
+    store = create_in_memory_store()
+    await seed_strong_trend_state(store, trend="neutral")
+    degenerate_bars = [{"open": 0, "high": 0, "low": 0, "close": 0, "volume": 0} for _ in range(55)]
+    await store.save_bars({"account_id": ACCOUNT_ID, "symbol": SYMBOL, "timeframe": "H1", "bars": degenerate_bars})
+
+    result = await evaluate(store)
+    assert result == {"accepted": False, "reason": "indicator.context_unavailable"}
